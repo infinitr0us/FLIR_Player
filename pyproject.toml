@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flir-thermal-player"
+version = "0.1.0"
+description = "A modern Windows desktop player for FLIR radiometric recordings (.seq/.ats/.sfmov/.csq)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Yuchuan Li", email = "Yuchuan.Li@outlook.com" }]
+keywords = ["FLIR", "thermal", "infrared", "radiometric", "seq", "ats", "csq", "player"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Multimedia :: Video :: Display",
+]
+
+# NOTE: The FLIR File SDK (the `fnv` / `FileSDK` package) is a REQUIRED runtime
+# prerequisite but is intentionally NOT listed here. It is proprietary to
+# FLIR/Teledyne and export-controlled (EAR99); obtain it from FLIR and install
+# it into your environment separately. See the README "Prerequisites" section.
+dependencies = [
+    "PySide6>=6.8,<7",
+    "QtAwesome>=1.3,<2",
+    "numpy>=1.26,<2",
+    "matplotlib>=3.8,<4",
+    "Pillow>=10,<13",
+    "imageio>=2.34,<3",
+    "imageio-ffmpeg>=0.5,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.urls]
+Homepage = "https://github.com/infinitr0us/FLIR_Player"
+Issues = "https://github.com/infinitr0us/FLIR_Player/issues"
+
+[project.gui-scripts]
+flir-thermal-player = "flir_player.__main__:main"
+
+[tool.setuptools]
+packages = ["flir_player"]

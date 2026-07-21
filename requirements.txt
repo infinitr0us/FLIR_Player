@@ -1,0 +1,14 @@
+# NOTE: The FLIR File SDK ("FileSDK" / the `fnv` package) is a REQUIRED
+# prerequisite but is NOT listed here and NOT distributed with this project.
+# It is proprietary to FLIR/Teledyne and export-controlled (EAR99). Obtain the
+# matching wheel from FLIR and install it into your environment separately,
+# e.g.:  pip install FileSDK-5.0.1-cp311-cp311-win_amd64.whl
+# See the "Prerequisites" section of README.md.
+PySide6>=6.8,<7
+QtAwesome>=1.3,<2
+numpy>=1.26,<2
+matplotlib>=3.8,<4
+Pillow>=10,<13
+imageio>=2.34,<3
+imageio-ffmpeg>=0.5,<1
+pytest>=8,<10

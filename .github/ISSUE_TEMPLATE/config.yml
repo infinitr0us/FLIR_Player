@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: FLIR File SDK questions
+    url: https://www.flir.com/
+    about: Questions about obtaining or licensing the FLIR File SDK should go to FLIR/Teledyne, not this project.

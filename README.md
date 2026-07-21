@@ -1,0 +1,212 @@
+# FLIR Thermal Player
+
+[![CI](https://github.com/infinitr0us/FLIR_Player/actions/workflows/ci.yml/badge.svg)](https://github.com/infinitr0us/FLIR_Player/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
+A modern Windows desktop player for FLIR radiometric recordings. It opens
+`.seq`, `.ats`, `.sfmov`, and `.csq` files through FLIR File SDK while keeping
+all decoding work off the GUI thread.
+
+![Current interface](design/current-ui.png)
+
+## What the new player supports
+
+- Recorded-timestamp playback rather than a hard-coded frame interval.
+- Play, pause, single-frame stepping, timeline scrubbing, and 0.25×–4× speed.
+- Counts, object signal, factory/user temperature (°C, °F, K, °R), and radiance
+  modes, driven by the units the file actually supports.
+- Editable measurement (object) parameters — emissivity, reflected and
+  atmosphere temperature, atmospheric transmission, distance, relative
+  humidity, and external optics — with one-click reset to the file defaults.
+- Analysis ROIs: box, ellipse, line, and pinned spot meters drawn directly on
+  the image, with selection, move, resize, and per-ROI color coding.
+- A tabbed analysis panel with: per-ROI statistics (min/max/mean/std-dev/
+  pixel-count plus a whole-image column, pause, CSV export), temporal plot of
+  ROI statistics versus time, line-profile plot, histogram plot, per-frame
+  header metadata (with entry picker), and static source information (camera,
+  lens, calibration ranges).
+- Scale-from-ROI range mode alongside dynamic and fixed scaling.
+- Overlay toggles: clipping indicators for out-of-calibration pixels and
+  min/max location markers for the image and each ROI.
+- NUC / bad-pixel apply toggles when the recording carries embedded corrections.
+- Extract: trim a recording to a frame range (with optional decimation) into a
+  new ATS file, with progress and cancel. Note: the File SDK only extracts
+  from ATS sources.
+- Zoom (fixed levels ¼×–4× plus mouse-wheel zoom), pan (middle-drag or drag on
+  empty space), and an overlay minimap with viewport rectangle.
+- Play-range start/end markers on the timeline (`I` / `O` to set, `X` to
+  clear, draggable on the slider) that constrain playback and seed the
+  Extract dialog; optional loop playback (`L`).
+- Eleven built-in color maps with invert, plus a custom gradient palette
+  editor (draggable color stops, persisted across sessions).
+- Plateau-equalization AGC with an aggressiveness control, alongside linear.
+- Isotherms (Above / Below / Interval) with limits editable in the inspector
+  or by dragging directly on the color bar.
+- Segmentation: user-defined valid range with blue/red out-of-range display
+  and auto-scale restricted to valid pixels.
+- Software image flip, horizontal and vertical.
+- File operation: add / subtract / multiply / divide by a reference frame
+  (any frame of the open file or of another same-size recording).
+- Point (gain, offset, exp, ln, sqrt), spatial (gaussian, window average,
+  median), and temporal (min, max, frame average, sliding subtraction)
+  filters, applied in a pipeline inside the decoder thread.
+- Open Recent on the Open button (last 8 recordings, persisted) and wider
+  format support: SEQ, ATS, SFMOV, CSQ plus FFF, PTW, and radiometric TIFF.
+- Still-image export with composition options (color bar, ROIs and names,
+  min/max markers, timestamp burn-in, border) to PNG, BMP, JPEG, TIFF 16-bit,
+  or TIFF 32-bit float, with an optional statistics sidecar CSV.
+- Movie export to MP4 (H.264) or WMV with frame range, skip pattern, frame
+  rate, and the same composition options.
+- Numbered image-series export with a frame-skip pattern and an optional
+  per-frame statistics CSV.
+- ROI bitmask export (one PNG mask per ROI, via the File SDK).
+- Batch extract of multiple ATS recordings into a folder, with an honest
+  per-file report (the SDK extracts from ATS sources only).
+- Dynamic per-frame scaling or a user-defined fixed range.
+- Live cursor coordinates and radiometric value inspection.
+- PNG display export plus raw NumPy and CSV export.
+- Drag-and-drop opening, full-screen inspection, tooltips, and keyboard shortcuts.
+- A bounded frame cache; the application never loads the full recording into RAM.
+
+The application entry point is `flir_player_app.py`, which launches the
+`flir_player/` package.
+
+## Prerequisites: the FLIR File SDK
+
+This player is a front end for the **FLIR File SDK** (the `fnv` / `FileSDK`
+Python package). The SDK is **not distributed with this project**: it is
+proprietary to FLIR/Teledyne and is marked export-controlled (EAR99). You must
+obtain it from FLIR yourself and install it into your Python environment before
+running the player.
+
+- Download the `FileSDK` wheel matching your platform and Python version
+  (this project targets **64-bit Python 3.11 on Windows**).
+- Install it into your environment, for example:
+
+  ```powershell
+  pip install FileSDK-5.0.1-cp311-cp311-win_amd64.whl
+  ```
+
+Everything else the player needs is in `requirements.txt`.
+
+## Run it
+
+With the FLIR File SDK already installed (see above), install the remaining
+dependencies and launch the app. For example, in a Python 3.11 environment
+(a Conda env named `FLIR` is used here — adjust the interpreter path to yours):
+
+```powershell
+python -m pip install -r requirements.txt
+python flir_player_app.py
+```
+
+You can also double-click `run_modern.bat`, or open a recording directly:
+
+```powershell
+python flir_player_app.py fire2.seq
+```
+
+## Standalone Windows release
+
+You can build a single-file 64-bit Windows GUI executable that does not require
+Python, Conda, or PySide6 on the target computer. **The prebuilt `.exe` is not
+included in this repository**, because a one-file bundle embeds the FLIR File
+SDK's native components, which are proprietary and export-controlled and are not
+ours to redistribute. Build it locally instead, and only share the resulting
+binary with users your FLIR SDK license permits.
+
+To build the executable from this checkout, double-click `build_exe.bat` or
+run it from a terminal. The script installs/verifies the Python dependencies,
+runs PyInstaller (the specification explicitly includes the FLIR native DLLs
+and the imageio-ffmpeg encoder binary, and excludes Anaconda's incompatible
+legacy ICU shadow DLL), then regenerates `release/BUILD_INFO.txt`,
+`release/SHA256SUMS.txt`, and `release/README.txt` via
+`packaging/finalize_release.py`, and finally smoke-tests the built executable
+against `2.seq`. A build that fails the smoke test exits with code 2.
+
+The executable contains FLIR File SDK components. Check the FLIR SDK license
+and the EAR notice in the installed `fnv` package before redistributing it
+outside your permitted users or organization.
+
+## Controls
+
+| Action | Control |
+| --- | --- |
+| Open recording | `Ctrl+O` or drag a file onto the window |
+| Reopen a recent recording | arrow next to the Open button |
+| Play / pause | `Space` |
+| Previous / next frame | `Left` / `Right` |
+| Jump 10 frames | `Shift+Left` / `Shift+Right` |
+| First / last frame | `Home` / `End` |
+| Export rendered frame | `Ctrl+E` |
+| Draw ROI | left toolbar: box, ellipse, line, or spot; drag on the image (click for spot) |
+| Edit ROI | select tool: drag body to move, drag handles to resize |
+| Delete selected ROI | `Del` or the toolbar trash button |
+| Show / hide analysis panel | toolbar table button (Statistics, Temporal, Profile, Histogram, Metadata, Source tabs) |
+| Zoom in / out | `+` / `-`, mouse wheel, or the toolbar magnifier buttons |
+| Fit to window / 100 % | `0` / `1` |
+| Pan | middle-drag, or drag empty space with the select tool while zoomed |
+| Set play-range start / end | `I` / `O` (drag the markers on the timeline to adjust) |
+| Clear play range | `X` |
+| Loop playback | `L` or the transport repeat button |
+| Full-screen inspection | `F` or double-click the thermal image |
+| Leave full screen | `Esc` |
+
+## Architecture
+
+`DecoderThread` is the sole owner of the FLIR File SDK object. It returns
+detached NumPy frames to the main thread and caches only a few recent frames.
+Playback uses an absolute media clock anchored to each recording's frame
+timestamps, so decode and render overhead do not accumulate into timing drift.
+
+## Verification
+
+Run the automated suite with:
+
+```powershell
+python -m pytest -q
+```
+
+Note: a large part of the suite opens real FLIR recordings (referenced as
+`1.ats` and `2.seq` in the repository root) and requires both the FLIR File SDK
+and those sample files to run. Because neither the SDK nor the recordings are
+distributed here, those tests will error on a bare clone. Provide your own
+recordings under those names, or supply your own to exercise the suite.
+
+The tests cover rendering/range utilities, both supplied FLIR recordings, Qt
+opening and playback, seeking, unit switching, object-parameter round-trips,
+ROI statistics against NumPy references, canvas ROI interaction, the
+statistics table, and extraction (success, unsupported-source, and abort
+paths), plus the Tier-3 additions: plateau equalization, isotherm and
+segmentation overlays, palette LUTs and custom-palette persistence, flip
+coordinate mapping, zoom/pan/minimap geometry, the play-range slider and loop
+playback, and the processing pipeline (file operation, point/spatial/temporal
+filters, app-side ROI statistics, temporal-buffer windowing), plus the Tier-4
+export paths: export composition, TIFF 16-bit/float round-trips, MP4/WMV
+writing, decoder-driven series/movie export, batch extract reporting, ROI
+bitmasks, and recent-file tracking, plus the main interaction states.
+
+## License
+
+Copyright (C) 2026 Yuchuan Li &lt;Yuchuan.Li@outlook.com&gt;
+
+The FLIR Thermal Player application code in this repository (the `flir_player`
+package, `flir_player_app.py`, the tests, and the packaging scripts) is licensed
+under the **GNU General Public License v3.0 or later**. See the [LICENSE](LICENSE)
+file for the full text.
+
+This license covers **only** the code written for this project. It does **not**
+cover, and this project does **not** grant any rights to:
+
+- **The FLIR File SDK** (`FileSDK` / the `fnv` package and its native
+  binaries). This is proprietary to FLIR/Teledyne, is marked export-controlled
+  (EAR99), and is **not** included in this repository. Obtain it from FLIR under
+  their own license terms.
+- **FLIR ResearchIR** and its documentation, referenced here only as a feature
+  benchmark. "FLIR" and "ResearchIR" are trademarks of their respective owners;
+  this is an independent project and is not affiliated with or endorsed by FLIR
+  or Teledyne.
+
+Because the packaged Windows executable embeds proprietary, export-controlled
+FLIR components, do not redistribute a built `.exe` outside the users your FLIR
+SDK license permits.
