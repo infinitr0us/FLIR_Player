@@ -5,4 +5,4 @@
 from .models import FramePacket, UnitOption, VideoMetadata
 
 __all__ = ["FramePacket", "UnitOption", "VideoMetadata"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

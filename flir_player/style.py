@@ -13,7 +13,7 @@ def install_ui_fonts() -> None:
     """Load Windows UI font faces explicitly, including in Qt offscreen mode."""
 
     fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    for filename in ("segoeui.ttf", "seguisb.ttf", "segoeuib.ttf"):
+    for filename in ("segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "consola.ttf"):
         path = fonts_dir / filename
         if path.is_file():
             QFontDatabase.addApplicationFont(str(path))
@@ -50,6 +50,18 @@ TOKENS = {
     "R_PANEL": "8px",
     "R_CTRL": "6px",
 }
+
+# Small SVG glyphs referenced by the stylesheet (checkbox tick, combo chevron).
+# Resolved relative to this module so the QSS works both from source and from
+# the PyInstaller bundle (data files land next to the packaged module).
+_ICONS_DIR = Path(__file__).resolve().parent / "icons"
+TOKENS.update(
+    {
+        "CHECK_ICON": (_ICONS_DIR / "check.svg").as_posix(),
+        "CHEVRON_ICON": (_ICONS_DIR / "chevron-down.svg").as_posix(),
+        "CHEVRON_DISABLED_ICON": (_ICONS_DIR / "chevron-down-disabled.svg").as_posix(),
+    }
+)
 
 _APP_STYLESHEET = Template(r"""
 * {
@@ -88,8 +100,8 @@ QWidget#TransportBar {
 
 QLabel#AppTitle {
     font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 1.6px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
     color: $TEXT;
 }
 
@@ -153,6 +165,21 @@ QToolButton:disabled {
     border-color: transparent;
 }
 
+/* Drop-down affordance for MenuButtonPopup buttons (title bar open/export).
+   The default style primitive renders as an unstyled slab; replace it with a
+   small chevron glyph and give it a slim, borderless click zone. */
+QToolButton::menu-button {
+    background: transparent;
+    border: none;
+    width: 18px;
+}
+
+QToolButton::menu-arrow {
+    image: url("$CHEVRON_ICON");
+    width: 10px;
+    height: 10px;
+}
+
 /* Filled button (title bar open action) */
 QToolButton#FilledButton {
     background: $CONTROL;
@@ -166,6 +193,10 @@ QToolButton#FilledButton:hover {
 
 QToolButton#FilledButton:pressed {
     background: $CONTROL_PRESSED;
+}
+
+QToolButton#FilledButton:focus {
+    border-color: $ACCENT;
 }
 
 /* Accent outline button (export) */
@@ -193,6 +224,10 @@ QToolButton#ExportButton:disabled {
     color: $FAINT;
     background: transparent;
     border-color: $BORDER;
+}
+
+QToolButton#ExportButton:focus {
+    border-color: $ACCENT;
 }
 
 /* Generic push buttons (dialogs, message boxes) */
@@ -224,35 +259,81 @@ QPushButton:disabled {
     border-color: $BORDER;
 }
 
-/* Segmented control (range mode) */
-QPushButton#SegmentButton {
+/* Filled accent primary action (e.g. dialog OK). The 1px border is always
+   present (transparent) so the focus ring does not shift the layout. */
+QPushButton[accent="true"] {
+    background: $ACCENT;
+    color: $ON_ACCENT;
+    border: 1px solid transparent;
+    font-weight: 600;
+}
+
+QPushButton[accent="true"]:hover {
+    background: $ACCENT_HOVER;
+}
+
+QPushButton[accent="true"]:pressed {
+    background: $ACCENT_PRESSED;
+}
+
+/* Explicit variant states: they must follow the variant base rules above,
+   otherwise the base would override the generic :disabled/:focus styles. */
+QPushButton[accent="true"]:focus {
+    border-color: $ON_ACCENT;
+}
+
+QPushButton[accent="true"]:disabled {
     background: $CONTROL;
-    border: 1px solid $BORDER_CTRL;
-    border-radius: 0;
+    color: $FAINT;
+    border-color: transparent;
+}
+
+/* Quiet text button (dialog secondary actions) */
+QPushButton[variant="ghost"] {
+    background: transparent;
+    border-color: transparent;
+    color: $MUTED;
+    min-width: 56px;
+    min-height: 28px;
+}
+
+QPushButton[variant="ghost"]:hover {
+    background: $CONTROL_HOVER;
+    color: $TEXT;
+}
+
+QPushButton[variant="ghost"]:pressed {
+    background: $CONTROL_PRESSED;
+}
+
+QPushButton[variant="ghost"]:focus {
+    border-color: $ACCENT;
+}
+
+QPushButton[variant="ghost"]:disabled {
+    background: transparent;
+    color: $FAINT;
+    border-color: transparent;
+}
+
+/* Segmented control (range mode): a fill band holding borderless segments */
+QFrame#Segmented {
+    background: $CARD;
+    border-radius: $R_PANEL;
+}
+
+QPushButton#SegmentButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: $R_CTRL;
     min-width: 0;
-    min-height: 36px;
+    min-height: 32px;
     padding: 0 14px;
     color: $MUTED;
     font-weight: 600;
 }
 
-QPushButton#SegmentButton[segment="left"] {
-    border-top-left-radius: $R_CTRL;
-    border-bottom-left-radius: $R_CTRL;
-}
-
-QPushButton#SegmentButton[segment="center"] {
-    border-left: none;
-}
-
-QPushButton#SegmentButton[segment="right"] {
-    border-left: none;
-    border-top-right-radius: $R_CTRL;
-    border-bottom-right-radius: $R_CTRL;
-}
-
 QPushButton#SegmentButton:hover {
-    background: $CONTROL_HOVER;
     color: $TEXT;
 }
 
@@ -268,20 +349,18 @@ QPushButton#SegmentButton:checked:hover {
 
 QPushButton#SegmentButton:disabled {
     color: $FAINT;
-    background: $CARD;
-    border-color: $BORDER;
 }
 
 QPushButton#SegmentButton:disabled:checked {
     color: $FAINT;
     background: $CONTROL_PRESSED;
-    border-color: $BORDER_CTRL;
+    border-color: transparent;
 }
 
-/* Transport buttons */
+/* Transport buttons: ghost at rest so the filled play button stays dominant */
 QToolButton#TransportButton {
-    background: $CONTROL;
-    border: 1px solid $BORDER_CTRL;
+    background: transparent;
+    border: 1px solid transparent;
     border-radius: $R_PANEL;
     min-width: 40px;
     min-height: 40px;
@@ -289,16 +368,30 @@ QToolButton#TransportButton {
 
 QToolButton#TransportButton:hover {
     background: $CONTROL_HOVER;
-    border-color: $BORDER_HOVER;
 }
 
 QToolButton#TransportButton:pressed {
     background: $CONTROL_PRESSED;
 }
 
+QToolButton#TransportButton:checked {
+    background: $ACCENT_TINT;
+    border-color: $ACCENT;
+}
+
 QToolButton#TransportButton:disabled {
-    background: $CARD;
-    border-color: $BORDER;
+    background: transparent;
+    border-color: transparent;
+}
+
+QToolButton#TransportButton:focus {
+    border-color: $ACCENT;
+}
+
+/* Secondary transport actions (loop, fullscreen) are one step smaller */
+QToolButton#TransportButton[small="true"] {
+    min-width: 36px;
+    min-height: 36px;
 }
 
 /* Compact close button in the bottom tab bar corner (must not overlap tabs) */
@@ -345,6 +438,11 @@ QToolButton#PlayButton:disabled {
     border-color: $BORDER;
 }
 
+/* The resting border is amber-on-amber, so focus needs a contrasting ring */
+QToolButton#PlayButton:focus {
+    border-color: $ON_ACCENT;
+}
+
 /* ---------------- Inspector ---------------- */
 
 QLabel#SectionTitle {
@@ -359,9 +457,11 @@ QLabel#FieldLabel {
     font-weight: 600;
 }
 
+/* Inputs are fill-only at rest; a border appears on hover and focus. The 1px
+   border is always present (transparent) so text does not shift on hover. */
 QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit {
     background: $CONTROL;
-    border: 1px solid $BORDER_CTRL;
+    border: 1px solid transparent;
     border-radius: $R_CTRL;
     min-height: 36px;
     padding: 0 10px;
@@ -374,7 +474,7 @@ QComboBox {
 
 QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover, QLineEdit:hover {
     background: $CONTROL_HOVER;
-    border-color: $BORDER_HOVER;
+    border-color: $BORDER_CTRL;
 }
 
 QComboBox:focus, QComboBox:on, QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus {
@@ -384,7 +484,7 @@ QComboBox:focus, QComboBox:on, QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:f
 QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled, QLineEdit:disabled {
     color: $FAINT;
     background: $CARD;
-    border-color: $BORDER;
+    border-color: transparent;
 }
 
 QComboBox::drop-down {
@@ -393,8 +493,13 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    width: 0;
-    height: 0;
+    image: url("$CHEVRON_ICON");
+    width: 10px;
+    height: 10px;
+}
+
+QComboBox::down-arrow:disabled {
+    image: url("$CHEVRON_DISABLED_ICON");
 }
 
 QComboBox QAbstractItemView {
@@ -413,9 +518,10 @@ QComboBox QAbstractItemView::item {
     border-radius: 4px;
 }
 
+/* Cards group controls through fill steps only, not nested borders */
 QFrame#RangePanel, QFrame#InfoPanel {
     background: $CARD;
-    border: 1px solid $BORDER;
+    border: none;
     border-radius: $R_PANEL;
 }
 
@@ -427,9 +533,47 @@ QFrame#RangePanel:disabled QLabel {
     color: $FAINT;
 }
 
+/* 1px section separator inside the inspector */
+QFrame#Hairline {
+    background: $BORDER;
+    max-height: 1px;
+    border: none;
+}
+
 QLabel#InfoValue {
     color: $TEXT_SECONDARY;
-    font-size: 13px;
+}
+
+/* Numeric readouts use a tabular font so columns and timecodes do not jitter */
+QLabel#TimeCurrent, QLabel#TimeLabel, QLabel#FrameLabel, QLabel#InfoValue,
+QDoubleSpinBox, QSpinBox {
+    font-family: "Consolas";
+}
+
+QLabel#InfoValue {
+    font-size: 12px;
+}
+
+/* Small tertiary caption (grid labels, input captions) */
+QLabel#Caption {
+    color: $FAINT;
+    font-size: 11px;
+}
+
+/* Disclosure row (collapsible inspector sub-groups) */
+QToolButton#DisclosureButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: $R_CTRL;
+    min-height: 26px;
+    color: $MUTED;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+QToolButton#DisclosureButton:hover {
+    background: $CONTROL_HOVER;
+    color: $TEXT;
 }
 
 /* ---------------- Transport ---------------- */
@@ -475,8 +619,8 @@ QSlider::handle:horizontal:disabled {
 
 QFrame#TransportBadge {
     background: $CARD;
-    border: 1px solid $BORDER;
-    border-radius: 20px;
+    border: none;
+    border-radius: 10px;
 }
 
 QLabel#TimeLabel {
@@ -539,8 +683,8 @@ QSizeGrip {
 /* ---------------- Analysis toolbar (ROI tools) ---------------- */
 
 QToolButton#AnalysisButton {
-    background: $CONTROL;
-    border: 1px solid $BORDER_CTRL;
+    background: transparent;
+    border: 1px solid transparent;
     border-radius: $R_PANEL;
     min-width: 32px;
     min-height: 32px;
@@ -550,7 +694,6 @@ QToolButton#AnalysisButton {
 
 QToolButton#AnalysisButton:hover {
     background: $CONTROL_HOVER;
-    border-color: $BORDER_HOVER;
 }
 
 QToolButton#AnalysisButton:pressed {
@@ -563,8 +706,12 @@ QToolButton#AnalysisButton:checked {
 }
 
 QToolButton#AnalysisButton:disabled {
-    background: $CARD;
-    border-color: $BORDER;
+    background: transparent;
+    border-color: transparent;
+}
+
+QToolButton#AnalysisButton:focus {
+    border-color: $ACCENT;
 }
 
 /* ---------------- Statistics table ---------------- */
@@ -678,6 +825,7 @@ QCheckBox::indicator:hover {
 QCheckBox::indicator:checked {
     background: $ACCENT;
     border-color: $ACCENT;
+    image: url("$CHECK_ICON");
 }
 
 QCheckBox:disabled {
@@ -699,16 +847,13 @@ QTabWidget#BottomTabs QTabBar::tab {
     font-weight: 600;
     padding: 6px 16px;
     margin-right: 2px;
-    border: 1px solid transparent;
-    border-bottom: none;
-    border-top-left-radius: $R_CTRL;
-    border-top-right-radius: $R_CTRL;
+    border: none;
+    border-bottom: 2px solid transparent;
 }
 
 QTabWidget#BottomTabs QTabBar::tab:selected {
-    background: $CARD;
     color: $TEXT;
-    border-color: $BORDER;
+    border-bottom-color: $ACCENT;
 }
 
 QTabWidget#BottomTabs QTabBar::tab:hover:!selected {
@@ -724,6 +869,18 @@ QDialog {
 
 QDialog QLabel {
     color: $TEXT_SECONDARY;
+}
+
+/* Frameless dialog title row (replaces the native light title bar) */
+QWidget#DialogTitleBar {
+    background: transparent;
+    border-bottom: 1px solid $BORDER;
+}
+
+QLabel#DialogTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: $TEXT;
 }
 
 QProgressBar {

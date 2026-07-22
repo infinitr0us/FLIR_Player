@@ -6,9 +6,12 @@ from pathlib import Path
 
 from conftest import wait_until
 
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QPushButton, QSizeGrip
 
+from flir_player.export_dialogs import BatchExtractDialog
 from flir_player.main_window import MainWindow
+from flir_player.style import APP_STYLESHEET, TOKENS
+from flir_player.widgets import ElidingLabel, MetadataPickerDialog
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,4 +93,78 @@ def test_object_parameters_panel_edits_apply(qapp) -> None:
         )
     finally:
         window.close()
+        qapp.processEvents()
+
+
+def test_stylesheet_icon_assets_exist() -> None:
+    """The QSS references SVG glyphs that must ship with the package."""
+    for key in ("CHECK_ICON", "CHEVRON_ICON", "CHEVRON_DISABLED_ICON"):
+        assert Path(TOKENS[key]).is_file(), f"missing icon for {key}"
+
+
+def test_button_variant_states_follow_variant_base_rules() -> None:
+    """Variant :focus/:disabled rules must come after the variant base rules,
+    or Qt's equal-specificity last-one-wins cascade makes a disabled accent or
+    ghost button look enabled and hides its focus ring."""
+    for variant in ('[accent="true"]', '[variant="ghost"]'):
+        base = APP_STYLESHEET.index(f"QPushButton{variant} {{")
+        for state in (":focus", ":disabled"):
+            rule = APP_STYLESHEET.index(f"QPushButton{variant}{state} {{")
+            assert rule > base, f"QPushButton{variant}{state} precedes its base rule"
+
+
+def test_eliding_label_elides_long_text_with_tooltip(qapp) -> None:
+    label = ElidingLabel()
+    label.resize(80, 20)
+    label.show()
+    try:
+        long_text = "FLIR A655sc · 63901234-and-a-very-long-serial"
+        label.setText(long_text)
+        qapp.processEvents()
+        assert label.text() != long_text
+        assert label.fontMetrics().horizontalAdvance(label.text()) <= label.width()
+        assert label.toolTip() == long_text
+
+        label.setText("A655")
+        qapp.processEvents()
+        assert label.text() == "A655"
+        assert label.toolTip() == ""
+    finally:
+        label.close()
+        qapp.processEvents()
+
+
+def test_list_dialogs_have_size_grip(qapp) -> None:
+    """Frameless dialogs with expanding content stay user-resizable."""
+    picker = MetadataPickerDialog(["Time", "Trigger"], set())
+    assert picker.findChild(QSizeGrip) is not None
+    picker.close()
+    batch = BatchExtractDialog()
+    assert batch.findChild(QSizeGrip) is not None
+    batch.close()
+    qapp.processEvents()
+
+
+def test_accent_button_disabled_state_renders_distinctly(qapp) -> None:
+    """Rendered probe: a disabled accent button must not keep the enabled fill."""
+    enabled = QPushButton("Export")
+    enabled.setProperty("accent", True)
+    disabled = QPushButton("Export")
+    disabled.setProperty("accent", True)
+    disabled.setEnabled(False)
+    try:
+        enabled.show()
+        disabled.show()
+        qapp.processEvents()
+
+        def background(button: QPushButton) -> str:
+            image = button.grab().toImage()
+            # inside the border, left of the label text (padding is 14px)
+            return image.pixelColor(10, image.height() // 2).name().upper()
+
+        assert background(enabled) == TOKENS["ACCENT"].upper()
+        assert background(disabled) == TOKENS["CONTROL"].upper()
+    finally:
+        enabled.close()
+        disabled.close()
         qapp.processEvents()

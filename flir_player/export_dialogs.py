@@ -8,7 +8,6 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -28,7 +27,7 @@ from PySide6.QtWidgets import (
 from .compose import ExportOptions
 from .export import EXTENSIONS, MOVIE_FORMATS, STILL_FORMATS
 from .models import VideoMetadata
-from .widgets import ChevronComboBox
+from .widgets import ChevronComboBox, FramelessDialog
 
 
 class _CompositionBox(QFrame):
@@ -88,16 +87,13 @@ def _path_row(browse_tooltip: str) -> tuple[QHBoxLayout, QLineEdit, QToolButton]
     return row, edit, browse
 
 
-class ExportImageDialog(QDialog):
+class ExportImageDialog(FramelessDialog):
     """Still-image export with format and composition options (§4.9.1.1)."""
 
     def __init__(self, metadata: VideoMetadata, frame_index: int, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Export Image")
-        self.setModal(True)
+        super().__init__("Export Image", parent)
         self.setMinimumWidth(480)
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -126,7 +122,9 @@ class ExportImageDialog(QDialog):
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Export")
+        ok_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Export")
+        ok_button.setProperty("accent", True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -158,7 +156,7 @@ class ExportImageDialog(QDialog):
         }
 
 
-class ExportSeriesDialog(QDialog):
+class ExportSeriesDialog(FramelessDialog):
     """Export a numbered series of frames with a skip pattern (§4.9.1.1, p. 60)."""
 
     def __init__(
@@ -167,9 +165,7 @@ class ExportSeriesDialog(QDialog):
         parent=None,
         default_range: tuple[int, int] | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Export Image Series")
-        self.setModal(True)
+        super().__init__("Export Image Series", parent)
         self.setMinimumWidth(480)
         total = metadata.num_frames
         first, last = 1, total
@@ -177,8 +173,7 @@ class ExportSeriesDialog(QDialog):
             first = max(1, min(default_range[0] + 1, total))
             last = max(first, min(default_range[1] + 1, total))
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
         form = QFormLayout()
         form.setSpacing(8)
 
@@ -216,7 +211,9 @@ class ExportSeriesDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Export")
+        ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Export")
+        ok_button.setProperty("accent", True)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
@@ -250,7 +247,7 @@ class ExportSeriesDialog(QDialog):
         }
 
 
-class ExportMovieDialog(QDialog):
+class ExportMovieDialog(FramelessDialog):
     """Movie export to MP4/WMV (§4.9.1.1, p. 59)."""
 
     def __init__(
@@ -259,9 +256,7 @@ class ExportMovieDialog(QDialog):
         parent=None,
         default_range: tuple[int, int] | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Export Movie")
-        self.setModal(True)
+        super().__init__("Export Movie", parent)
         self.setMinimumWidth(480)
         total = metadata.num_frames
         first, last = 1, total
@@ -269,8 +264,7 @@ class ExportMovieDialog(QDialog):
             first = max(1, min(default_range[0] + 1, total))
             last = max(first, min(default_range[1] + 1, total))
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
         form = QFormLayout()
         form.setSpacing(8)
 
@@ -312,7 +306,9 @@ class ExportMovieDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Export")
+        ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Export")
+        ok_button.setProperty("accent", True)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
@@ -355,17 +351,14 @@ class ExportMovieDialog(QDialog):
         }
 
 
-class BatchExtractDialog(QDialog):
+class BatchExtractDialog(FramelessDialog):
     """Trim a list of ATS recordings in one go (§4.9.1.3, p. 62)."""
 
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Batch Extract")
-        self.setModal(True)
+        super().__init__("Batch Extract", parent)
         self.setMinimumWidth(520)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
 
         files_label = QLabel("Recordings (ATS only — the File SDK extracts no other format)")
         files_label.setObjectName("FieldLabel")
@@ -400,10 +393,13 @@ class BatchExtractDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Extract")
+        ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Extract")
+        ok_button.setProperty("accent", True)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
+        self._add_size_grip()
         self.file_list.model().rowsInserted.connect(self._validate)
         self.file_list.model().rowsRemoved.connect(self._validate)
         self._validate()

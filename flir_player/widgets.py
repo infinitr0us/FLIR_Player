@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -89,20 +90,20 @@ def awesome_icon(name: str, color: str = ICON_TEXT) -> QIcon:
     return qta.icon(name, color=color, color_disabled=ICON_DISABLED, scale_factor=0.88)
 
 
+def value_table_item(text: str) -> QTableWidgetItem:
+    """Table value cell: tabular font, full text on tooltip when long."""
+    item = QTableWidgetItem(text)
+    item.setFont(QFont("Consolas", 10))
+    if len(text) > 60:
+        item.setToolTip(text)
+    return item
+
+
 class ChevronComboBox(QComboBox):
-    """QComboBox with a consistent icon-library chevron in every Qt platform plugin."""
+    """QComboBox whose drop-down chevron is drawn by the central stylesheet.
 
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._chevron = awesome_icon("fa6s.chevron-down", ICON_MUTED).pixmap(12, 12)
-        self._chevron_disabled = awesome_icon("fa6s.chevron-down", ICON_DISABLED).pixmap(12, 12)
-
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        pixmap = self._chevron if self.isEnabled() else self._chevron_disabled
-        painter = QPainter(self)
-        painter.drawPixmap(self.width() - 23, (self.height() - 12) // 2, pixmap)
-        painter.end()
+    Kept as a named alias for the call sites that predate the QSS arrow.
+    """
 
 
 class TitleBar(QWidget):
@@ -264,6 +265,10 @@ class AnalysisToolbar(QFrame):
             self._buttons[tool] = button
         self._buttons["select"].setChecked(True)
 
+        layout.addSpacing(4)
+        layout.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addSpacing(4)
+
         self.stats_button = QToolButton()
         self.stats_button.setObjectName("AnalysisButton")
         self.stats_button.setIcon(awesome_icon("fa6s.table", ICON_TEXT))
@@ -281,7 +286,9 @@ class AnalysisToolbar(QFrame):
         self.delete_button.clicked.connect(self.delete_requested)
         layout.addWidget(self.delete_button)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
+        layout.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addSpacing(4)
         self.zoom_in_button = self._zoom_button(
             "fa6s.magnifying-glass-plus", "Zoom in (+)", self.zoom_in_requested
         )
@@ -305,6 +312,13 @@ class AnalysisToolbar(QFrame):
         button.setToolTip(tooltip)
         button.clicked.connect(signal)
         return button
+
+    @staticmethod
+    def _separator() -> QFrame:
+        line = QFrame()
+        line.setObjectName("Hairline")
+        line.setFixedSize(24, 1)
+        return line
 
     def set_enabled(self, enabled: bool) -> None:
         for button in self._buttons.values():
@@ -405,7 +419,7 @@ class StatisticsPanel(QFrame):
                 format_value(value, suffix) if value is not None else "—",
             )
             for row, text in enumerate(cells):
-                item = QTableWidgetItem(text)
+                item = value_table_item(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, column, item)
 
@@ -759,14 +773,14 @@ class ThermalCanvas(QWidget):
 
     def _paint_zoom_indicator(self, painter: QPainter) -> None:
         text = f"{round(self._current_zoom() * 100)}%"
-        painter.setFont(QFont("Segoe UI", 10))
+        painter.setFont(QFont("Consolas", 10))
         metrics = painter.fontMetrics()
         text_rect = metrics.boundingRect(text).adjusted(-8, -4, 8, 4)
         text_rect.moveTopRight(QPoint(self.width() - 14, 12))
         path = QPainterPath()
         path.addRoundedRect(QRectF(text_rect), 5, 5)
         painter.fillPath(path, QColor(9, 13, 15, 200))
-        painter.setPen(QPen(QColor("#333E4D"), 1))
+        painter.setPen(QPen(QColor("#242D3A"), 1))
         painter.drawPath(path)
         painter.setPen(QColor("#C7CED8"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
@@ -830,14 +844,14 @@ class ThermalCanvas(QWidget):
         painter.setPen(QPen(QColor(ICON_ACCENT), 2))
         painter.drawEllipse(QPoint(screen_x, screen_y), 7, 7)
         text = f"x {px}  y {py}  ·  {format_value(value, self._suffix)}"
-        painter.setFont(QFont("Segoe UI", 11))
+        painter.setFont(QFont("Consolas", 10))
         metrics = painter.fontMetrics()
         text_rect = metrics.boundingRect(text).adjusted(-10, -6, 10, 6)
         text_rect.moveTopLeft(QPoint(self._image_rect.left() + 14, self._image_rect.top() + 14))
         path = QPainterPath()
         path.addRoundedRect(QRectF(text_rect), 6, 6)
         painter.fillPath(path, QColor(9, 13, 15, 225))
-        painter.setPen(QPen(QColor("#333E4D"), 1))
+        painter.setPen(QPen(QColor("#242D3A"), 1))
         painter.drawPath(path)
         painter.setPen(QColor("#F4F6F7"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
@@ -1209,6 +1223,7 @@ class ColorScaleWidget(QWidget):
         self._maximum = 1.0
         self._active = False
         self._invert = False
+        self._unit = ""
         self._bar_rect = QRect()
         self._iso_mode = "off"
         self._iso_limit1 = 0.0
@@ -1216,12 +1231,18 @@ class ColorScaleWidget(QWidget):
         self._dragging: str | None = None
 
     def set_scale(
-        self, palette: str, minimum: float, maximum: float, invert: bool = False
+        self,
+        palette: str,
+        minimum: float,
+        maximum: float,
+        invert: bool = False,
+        unit: str = "",
     ) -> None:
         self._palette = palette
         self._minimum = float(minimum)
         self._maximum = float(maximum)
         self._invert = bool(invert)
+        self._unit = unit
         self._active = True
         self.update()
 
@@ -1278,7 +1299,7 @@ class ColorScaleWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#06080B"))
-        bar = QRect(16, 24, 26, max(40, self.height() - 48))
+        bar = QRect(16, 24, 16, max(40, self.height() - 48))
         self._bar_rect = bar
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if not self._active:
@@ -1286,6 +1307,18 @@ class ColorScaleWidget(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(bar, 4, 4)
             return
+
+        if self._unit:
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.setPen(QColor("#5F6B7A"))
+            caption_rect = QRectF(bar.left() - 2, 2, self.width() - bar.left() - 2, 16)
+            painter.drawText(
+                caption_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                painter.fontMetrics().elidedText(
+                    self._unit, Qt.TextElideMode.ElideRight, int(caption_rect.width())
+                ),
+            )
 
         lut = np.ascontiguousarray(palette_lut(self._palette, self._invert)[::-1]).reshape(256, 1, 3)
         image = QImage(
@@ -1309,12 +1342,12 @@ class ColorScaleWidget(QWidget):
             )
         painter.setClipping(False)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(QPen(QColor("#333E4D"), 1))
+        painter.setPen(QPen(QColor("#242D3A"), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(bar, 4, 4)
-        painter.setFont(QFont("Segoe UI", 10))
-        for step in range(7):
-            fraction = step / 6.0
+        painter.setFont(QFont("Consolas", 10))
+        for step in range(6):
+            fraction = step / 5.0
             y = bar.bottom() - int(fraction * bar.height())
             value = self._minimum + fraction * (self._maximum - self._minimum)
             painter.setPen(QPen(QColor("#49586C"), 1))
@@ -1412,32 +1445,74 @@ class ObjectParametersPanel(QFrame):
 
         self._spins: dict[str, QDoubleSpinBox] = {}
         self._scales: dict[str, float] = {}
-        for key, label, minimum, maximum, decimals, scale in self.FIELDS:
-            row = QHBoxLayout()
-            row.setSpacing(8)
-            text = QLabel(label)
-            text.setObjectName("FieldLabel")
-            row.addWidget(text, 1)
-            spin = QDoubleSpinBox()
-            spin.setRange(minimum, maximum)
-            spin.setDecimals(decimals)
-            spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-            spin.setFixedWidth(88)  # uniform field length regardless of value width
-            spin.setProperty("compact", True)
-            spin.editingFinished.connect(self._emit_applied)
-            row.addWidget(spin)
-            layout.addLayout(row)
-            self._spins[key] = spin
-            self._scales[key] = scale
+        # Core rows stay visible; the atmosphere/optics rows fold away (§P8).
+        for key, label, minimum, maximum, decimals, scale in self.FIELDS[:2]:
+            layout.addLayout(self._field_row(key, label, minimum, maximum, decimals, scale))
+
+        disc_row = QHBoxLayout()
+        self.advanced_button = QToolButton()
+        self.advanced_button.setObjectName("DisclosureButton")
+        self.advanced_button.setText("Atmosphere && Optics")
+        self.advanced_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_button.setIcon(awesome_icon("fa6s.chevron-right", ICON_MUTED))
+        self.advanced_button.setIconSize(QSize(11, 11))
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.toggled.connect(self._toggle_advanced)
+        disc_row.addWidget(self.advanced_button)
+        disc_row.addStretch(1)
+        layout.addLayout(disc_row)
+
+        self._advanced = QWidget()
+        advanced_layout = QVBoxLayout(self._advanced)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(4)
+        for key, label, minimum, maximum, decimals, scale in self.FIELDS[2:]:
+            advanced_layout.addLayout(
+                self._field_row(key, label, minimum, maximum, decimals, scale)
+            )
+        self._advanced.setVisible(False)
+        layout.addWidget(self._advanced)
 
         self._spins["est_atmospheric_transmission"].setToolTip(
             "Estimated atmospheric transmission (0 = compute automatically)"
         )
 
         self.reset_button = QPushButton("Reset to File Values")
+        self.reset_button.setProperty("variant", "ghost")
         self.reset_button.setToolTip("Restore the object parameters stored in the recording")
         self.reset_button.clicked.connect(self.reset_requested)
         layout.addWidget(self.reset_button)
+
+    def _field_row(
+        self,
+        key: str,
+        label: str,
+        minimum: float,
+        maximum: float,
+        decimals: int,
+        scale: float,
+    ) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        text = QLabel(label)
+        text.setObjectName("FieldLabel")
+        row.addWidget(text, 1)
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(decimals)
+        spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        spin.setFixedWidth(88)  # uniform field length regardless of value width
+        spin.setProperty("compact", True)
+        spin.editingFinished.connect(self._emit_applied)
+        row.addWidget(spin)
+        self._spins[key] = spin
+        self._scales[key] = scale
+        return row
+
+    def _toggle_advanced(self, checked: bool) -> None:
+        self._advanced.setVisible(checked)
+        icon = "fa6s.chevron-down" if checked else "fa6s.chevron-right"
+        self.advanced_button.setIcon(awesome_icon(icon, ICON_MUTED))
 
     def set_parameters(self, snapshot: dict) -> None:
         for key, spin in self._spins.items():
@@ -1451,6 +1526,41 @@ class ObjectParametersPanel(QFrame):
         self.applied.emit(
             {key: spin.value() * self._scales[key] for key, spin in self._spins.items()}
         )
+
+
+class ElidingLabel(QLabel):
+    """QLabel that elides overflowing text and shows the full text as a tooltip.
+
+    Used for unconstrained SDK strings (camera model/serial, unit labels)
+    inside the fixed-width inspector, where wrapping is not an option and the
+    horizontal scrollbar is disabled. The Ignored horizontal size policy keeps
+    long content from stretching the layout; the text is re-elided on resize.
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
+        self._full_text = text
+        self._apply_elide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        width = self.width()
+        if width <= 0:
+            super().setText(self._full_text)
+            return
+        elided = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, width
+        )
+        super().setText(elided)
+        self.setToolTip(self._full_text if elided != self._full_text else "")
 
 
 class InspectorPanel(QWidget):
@@ -1536,18 +1646,16 @@ class InspectorPanel(QWidget):
         layout.addSpacing(12)
 
         layout.addWidget(self._field_label("Range Mode"))
-        range_row = QHBoxLayout()
-        range_row.setSpacing(0)
+        segmented = QFrame()
+        segmented.setObjectName("Segmented")
+        range_row = QHBoxLayout(segmented)
+        range_row.setContentsMargins(2, 2, 2, 2)
+        range_row.setSpacing(2)
         self.dynamic_button = QPushButton("Dynamic")
         self.roi_button = QPushButton("ROI")
         self.fixed_button = QPushButton("Fixed")
-        for button, segment in (
-            (self.dynamic_button, "left"),
-            (self.roi_button, "center"),
-            (self.fixed_button, "right"),
-        ):
+        for button in (self.dynamic_button, self.roi_button, self.fixed_button):
             button.setObjectName("SegmentButton")
-            button.setProperty("segment", segment)
             button.setCheckable(True)
         self.range_group = QButtonGroup(self)
         self.range_group.setExclusive(True)
@@ -1561,7 +1669,7 @@ class InspectorPanel(QWidget):
         range_row.addWidget(self.dynamic_button)
         range_row.addWidget(self.roi_button)
         range_row.addWidget(self.fixed_button)
-        layout.addLayout(range_row)
+        layout.addWidget(segmented)
         layout.addSpacing(4)
 
         self.range_panel = QFrame()
@@ -1620,25 +1728,25 @@ class InspectorPanel(QWidget):
         self.pe_row.setVisible(False)
 
         layout.addWidget(self._field_label("Segmentation"))
-        seg_row = QHBoxLayout()
-        seg_row.setSpacing(8)
         self.segmentation_check = QCheckBox("Enable")
         self.segmentation_check.setToolTip(
             "Limit the valid value range; out-of-range pixels are painted blue/red"
         )
-        seg_row.addWidget(self.segmentation_check, 1)
+        layout.addWidget(self.segmentation_check)
+        seg_row = QHBoxLayout()
+        seg_row.setSpacing(8)
         self.seg_min_spin = self._compact_spin()
         self.seg_max_spin = self._compact_spin()
-        seg_row.addWidget(self.seg_min_spin)
-        seg_row.addWidget(self.seg_max_spin)
+        _, seg_min_box = self._captioned("Min", self.seg_min_spin)
+        _, seg_max_box = self._captioned("Max", self.seg_max_spin)
+        seg_row.addLayout(seg_min_box, 1)
+        seg_row.addLayout(seg_max_box, 1)
         self.segmentation_check.toggled.connect(self._segmentation_changed)
         self.seg_min_spin.editingFinished.connect(self._segmentation_changed)
         self.seg_max_spin.editingFinished.connect(self._segmentation_changed)
         layout.addLayout(seg_row)
 
         layout.addWidget(self._field_label("Isotherm"))
-        iso_row = QHBoxLayout()
-        iso_row.setSpacing(8)
         self.isotherm_combo = ChevronComboBox()
         for label, mode in (
             ("Off", "off"),
@@ -1648,14 +1756,20 @@ class InspectorPanel(QWidget):
         ):
             self.isotherm_combo.addItem(label, mode)
         self.isotherm_combo.setToolTip("Highlight pixels above/below/within value limits")
-        iso_row.addWidget(self.isotherm_combo, 1)
+        layout.addWidget(self.isotherm_combo)
+        iso_row = QHBoxLayout()
+        iso_row.setSpacing(8)
         self.iso_limit1_spin = self._compact_spin()
         self.iso_limit2_spin = self._compact_spin()
-        iso_row.addWidget(self.iso_limit1_spin)
-        iso_row.addWidget(self.iso_limit2_spin)
+        self._iso_caption1, iso_box1 = self._captioned("Threshold", self.iso_limit1_spin)
+        self._iso_caption2, iso_box2 = self._captioned("High", self.iso_limit2_spin)
+        iso_row.addLayout(iso_box1, 1)
+        iso_row.addLayout(iso_box2, 1)
         self.isotherm_combo.currentIndexChanged.connect(self._isotherm_changed)
         self.iso_limit1_spin.editingFinished.connect(self._isotherm_changed)
         self.iso_limit2_spin.editingFinished.connect(self._isotherm_changed)
+        self._iso_caption1.setVisible(False)
+        self._iso_caption2.setVisible(False)
         self.iso_limit1_spin.setVisible(False)
         self.iso_limit2_spin.setVisible(False)
         layout.addLayout(iso_row)
@@ -1716,6 +1830,8 @@ class InspectorPanel(QWidget):
         self.corrections_heading.hide()
         self.corrections_row.hide()
 
+        layout.addSpacing(8)
+        layout.addWidget(self._hairline())
         layout.addSpacing(12)
 
         self.params_heading = QLabel("Measurement")
@@ -1727,6 +1843,8 @@ class InspectorPanel(QWidget):
         self.params_panel.reset_requested.connect(self.object_parameters_reset)
         layout.addWidget(self.params_panel)
 
+        layout.addSpacing(8)
+        layout.addWidget(self._hairline())
         layout.addSpacing(12)
 
         self.processing_heading = QLabel("Processing")
@@ -1806,6 +1924,9 @@ class InspectorPanel(QWidget):
         self.processing_panel = processing_panel
 
         layout.addStretch(1)
+        layout.addSpacing(8)
+        layout.addWidget(self._hairline())
+        layout.addSpacing(12)
 
         self.info_heading = QLabel("Frame Info")
         self.info_heading.setObjectName("SectionTitle")
@@ -1813,17 +1934,21 @@ class InspectorPanel(QWidget):
         layout.addSpacing(2)
         self.info_panel = QFrame()
         self.info_panel.setObjectName("InfoPanel")
-        info_layout = QVBoxLayout(self.info_panel)
+        info_layout = QGridLayout(self.info_panel)
         info_layout.setContentsMargins(14, 12, 14, 12)
-        info_layout.setSpacing(6)
-        self.frame_info = QLabel("No recording loaded")
-        self.frame_info.setObjectName("InfoValue")
-        self.frame_info.setWordWrap(True)
-        self.probe_info = QLabel("Cursor: —")
-        self.probe_info.setObjectName("InfoValue")
-        self.probe_info.setWordWrap(True)
-        info_layout.addWidget(self.frame_info)
-        info_layout.addWidget(self.probe_info)
+        info_layout.setHorizontalSpacing(12)
+        info_layout.setVerticalSpacing(4)
+        info_layout.setColumnStretch(1, 1)
+        self._info_values: dict[str, QLabel] = {}
+        for row, key in enumerate(("Frame", "Unit", "Range", "Resolution", "Camera", "Cursor")):
+            caption = QLabel(key)
+            caption.setObjectName("Caption")
+            value = ElidingLabel("—")
+            value.setObjectName("InfoValue")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            info_layout.addWidget(caption, row, 0)
+            info_layout.addWidget(value, row, 1)
+            self._info_values[key] = value
         layout.addWidget(self.info_panel)
         self._refresh_enabled_state()
 
@@ -1832,6 +1957,24 @@ class InspectorPanel(QWidget):
         label = QLabel(text)
         label.setObjectName("FieldLabel")
         return label
+
+    @staticmethod
+    def _hairline() -> QFrame:
+        line = QFrame()
+        line.setObjectName("Hairline")
+        line.setFixedHeight(1)
+        return line
+
+    @staticmethod
+    def _captioned(caption: str, widget) -> tuple[QLabel, QVBoxLayout]:
+        """Small tertiary caption above an input (Min/Max, Threshold, …)."""
+        label = QLabel(caption)
+        label.setObjectName("Caption")
+        box = QVBoxLayout()
+        box.setSpacing(2)
+        box.addWidget(label)
+        box.addWidget(widget)
+        return label, box
 
     def _filter_row(
         self,
@@ -2031,24 +2174,25 @@ class InspectorPanel(QWidget):
         unit: UnitOption,
         range_mode: str,
     ) -> None:
-        camera = ""
-        if metadata.camera_model:
-            camera = f"\nCamera: {metadata.camera_model}"
-            if metadata.camera_serial:
-                camera += f" · {metadata.camera_serial}"
-        self.frame_info.setText(
-            f"Frame {frame_index + 1} / {metadata.num_frames}\n"
-            f"Unit: {unit.label}\n"
-            f"Range: {range_mode.title()}\n"
-            f"Resolution: {metadata.width}×{metadata.height}{camera}"
-        )
+        camera = metadata.camera_model or ""
+        if camera and metadata.camera_serial:
+            camera = f"{camera} · {metadata.camera_serial}"
+        values = {
+            "Frame": f"{frame_index + 1} / {metadata.num_frames}",
+            "Unit": unit.label,
+            "Range": range_mode.title(),
+            "Resolution": f"{metadata.width}×{metadata.height}",
+            "Camera": camera or "—",
+        }
+        for key, text in values.items():
+            self._info_values[key].setText(text)
 
     def set_probe(self, probe, suffix: str) -> None:
         if probe is None:
-            self.probe_info.setText("Cursor: —")
+            self._info_values["Cursor"].setText("—")
             return
         x, y, value = probe
-        self.probe_info.setText(f"Cursor: x {x}, y {y}\n{format_value(value, suffix)}")
+        self._info_values["Cursor"].setText(f"x {x}, y {y} · {format_value(value, suffix)}")
 
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
@@ -2091,10 +2235,14 @@ class InspectorPanel(QWidget):
     def _isotherm_changed(self) -> None:
         mode = str(self.isotherm_combo.currentData())
         active = mode != "off" and self._data_available and not self._busy
+        interval = mode == "interval"
+        self._iso_caption1.setText("Low" if interval else "Threshold")
+        self._iso_caption1.setVisible(mode != "off")
+        self._iso_caption2.setVisible(interval)
         self.iso_limit1_spin.setVisible(mode != "off")
-        self.iso_limit2_spin.setVisible(mode == "interval")
+        self.iso_limit2_spin.setVisible(interval)
         self.iso_limit1_spin.setEnabled(active)
-        self.iso_limit2_spin.setEnabled(active and mode == "interval")
+        self.iso_limit2_spin.setEnabled(active and interval)
         self.isotherm_changed.emit(
             mode, self.iso_limit1_spin.value(), self.iso_limit2_spin.value()
         )
@@ -2173,25 +2321,89 @@ class SourceInfoPanel(QFrame):
             key_item = QTableWidgetItem(key)
             key_item.setForeground(QColor("#97A1AF"))
             self.table.setItem(row, 0, key_item)
-            self.table.setItem(row, 1, QTableWidgetItem(value))
+            self.table.setItem(row, 1, value_table_item(value))
 
 
-class MetadataPickerDialog(QDialog):
+class FramelessDialog(QDialog):
+    """Modal dialog with a themed title row instead of the native title bar.
+
+    Windows keeps native title bars light even for dark apps, so dialogs draw
+    their own: title on the left, close button on the right. Dragging the row
+    moves the dialog; the close button and Esc reject it. Subclasses build
+    their content in ``self.body`` (a QVBoxLayout below the title row).
+    """
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.setWindowTitle(title)
+
+        self.body = QVBoxLayout(self)
+        self.body.setContentsMargins(16, 10, 16, 16)
+        self.body.setSpacing(10)
+
+        title_bar = QWidget(self)
+        title_bar.setObjectName("DialogTitleBar")
+        title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row = QHBoxLayout(title_bar)
+        row.setContentsMargins(0, 0, 0, 6)
+        row.setSpacing(8)
+        label = QLabel(title, title_bar)
+        label.setObjectName("DialogTitle")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        close = QToolButton(title_bar)
+        close.setObjectName("TabCloseButton")
+        close.setIcon(awesome_icon("fa6s.xmark", ICON_SECONDARY))
+        close.setIconSize(QSize(13, 13))
+        close.setToolTip("Close")
+        close.clicked.connect(self.reject)
+        row.addWidget(label, 1)
+        row.addWidget(close)
+        self._title_bar = title_bar
+        self.body.addWidget(title_bar)
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._title_bar.geometry().contains(event.position().toPoint())
+        ):
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def _add_size_grip(self) -> None:
+        """Bottom-right grip restoring the resizing lost with the native frame.
+
+        For dialogs with expanding content (scroll areas, file lists); call at
+        the end of the subclass constructor so the grip stays at the bottom.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        row.addWidget(QSizeGrip(self))
+        self.body.addLayout(row)
+
+
+class MetadataPickerDialog(FramelessDialog):
     """Checkbox list selecting which frame metadata entries are displayed."""
 
     def __init__(self, names: list[str], hidden: set[str], parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Choose Metadata Entries")
-        self.setModal(True)
-        self.setMinimumWidth(320)
-        layout = QVBoxLayout(self)
+        super().__init__("Choose Metadata Entries", parent)
+        self.setMinimumWidth(360)
+        layout = self.body
 
         buttons_row = QHBoxLayout()
         all_button = QPushButton("All")
+        all_button.setProperty("variant", "ghost")
         none_button = QPushButton("None")
+        none_button.setProperty("variant", "ghost")
+        buttons_row.addStretch(1)
         buttons_row.addWidget(all_button)
         buttons_row.addWidget(none_button)
-        buttons_row.addStretch(1)
         layout.addLayout(buttons_row)
 
         scroll = QScrollArea()
@@ -2201,10 +2413,11 @@ class MetadataPickerDialog(QDialog):
         content = QWidget()
         content.setObjectName("PickerContent")
         content_layout = QVBoxLayout(content)
-        content_layout.setSpacing(4)
+        content_layout.setSpacing(2)
         self._boxes: dict[str, QCheckBox] = {}
         for name in names:
             box = QCheckBox(name)
+            box.setMinimumHeight(26)
             box.setChecked(name not in hidden)
             content_layout.addWidget(box)
             self._boxes[name] = box
@@ -2218,9 +2431,11 @@ class MetadataPickerDialog(QDialog):
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setProperty("accent", True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+        self._add_size_grip()
 
     def _set_all(self, checked: bool) -> None:
         for box in self._boxes.values():
@@ -2392,7 +2607,7 @@ class GradientStripWidget(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class PaletteEditorDialog(QDialog):
+class PaletteEditorDialog(FramelessDialog):
     """Create or edit a custom gradient palette (ResearchIR §4.9.4.3)."""
 
     def __init__(
@@ -2402,14 +2617,11 @@ class PaletteEditorDialog(QDialog):
         stops=None,
         existing: bool = False,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Edit Palette" if existing else "New Palette")
-        self.setModal(True)
+        super().__init__("Edit Palette" if existing else "New Palette", parent)
         self.setMinimumWidth(420)
         self.deleted = False
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
 
         name_row = QHBoxLayout()
         name_row.setSpacing(8)
@@ -2451,6 +2663,7 @@ class PaletteEditorDialog(QDialog):
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setProperty("accent", True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -2476,7 +2689,7 @@ class PaletteEditorDialog(QDialog):
         return self.strip.stops()
 
 
-class ReferenceDialog(QDialog):
+class ReferenceDialog(FramelessDialog):
     """Choose a reference frame and operation for File Operation (§4.9.5.3)."""
 
     OPERATIONS: tuple[tuple[str, str], ...] = (
@@ -2487,13 +2700,10 @@ class ReferenceDialog(QDialog):
     )
 
     def __init__(self, metadata: VideoMetadata, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Reference Frame")
-        self.setModal(True)
+        super().__init__("Reference Frame", parent)
         self.setMinimumWidth(420)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
 
         file_label = QLabel("Reference source")
         file_label.setObjectName("FieldLabel")
@@ -2542,6 +2752,7 @@ class ReferenceDialog(QDialog):
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setProperty("accent", True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -2616,7 +2827,7 @@ class MetadataPanel(QFrame):
             name_item = QTableWidgetItem(name)
             name_item.setForeground(QColor("#97A1AF"))
             self.table.setItem(row, 0, name_item)
-            self.table.setItem(row, 1, QTableWidgetItem(value))
+            self.table.setItem(row, 1, value_table_item(value))
 
     def _choose(self) -> None:
         if not self._known:
@@ -2908,12 +3119,14 @@ class TransportBar(QWidget):
         layout.addWidget(self.speed_combo)
 
         self.loop_button = self._transport_button("fa6s.repeat")
+        self.loop_button.setProperty("small", True)
         self.loop_button.setToolTip("Loop playback (L)")
         self.loop_button.setCheckable(True)
         self.loop_button.toggled.connect(self.loop_toggled)
         layout.addWidget(self.loop_button)
 
         self.fullscreen_button = self._transport_button("fa6s.expand")
+        self.fullscreen_button.setProperty("small", True)
         self.fullscreen_button.setToolTip("Full screen (F)")
         self.fullscreen_button.clicked.connect(self.fullscreen_requested)
         layout.addWidget(self.fullscreen_button)

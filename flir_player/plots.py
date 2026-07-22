@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 SURFACE = "#182029"
 INK = "#C7CED8"
-GRID = "#333E4D"
+GRID = "#242D3A"
 MUTED = "#97A1AF"
 
 
@@ -48,27 +48,35 @@ class PlotCanvas(FigureCanvasQTAgg):
 
 
 class _PlotPanel(QFrame):
-    """Base: header row (title + controls) above a PlotCanvas."""
+    """Base: PlotCanvas with an optional header row (title + controls).
 
-    def __init__(self, title: str, parent=None) -> None:
+    Panels whose tab name and in-plot title already say what they are pass
+    title=None and skip the header to avoid a redundant heading.
+    """
+
+    def __init__(self, title: str | None = None, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 6, 12, 8)
         layout.setSpacing(4)
 
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("FieldLabel")
-        header.addWidget(self.title_label)
-        header.addStretch(1)
-        self._header = header
-        layout.addLayout(header)
+        self._header = QHBoxLayout()
+        self._header.setSpacing(8)
+        self._header_added = title is not None
+        if title is not None:
+            self.title_label = QLabel(title)
+            self.title_label.setObjectName("FieldLabel")
+            self._header.addWidget(self.title_label)
+            self._header.addStretch(1)
+            layout.addLayout(self._header)
 
         self.canvas = PlotCanvas()
         layout.addWidget(self.canvas)
 
     def add_header_widget(self, widget) -> None:
+        if not self._header_added:
+            self.layout().insertLayout(0, self._header)
+            self._header_added = True
         self._header.addWidget(widget)
 
     def show_message(self, text: str) -> None:
@@ -85,13 +93,13 @@ class ProfilePlotPanel(_PlotPanel):
     """Values along a line ROI (§4.7.1.2)."""
 
     def __init__(self, parent=None) -> None:
-        super().__init__("Line profile", parent)
+        super().__init__(None, parent)
 
     def set_profile(self, distances: np.ndarray, values: np.ndarray, label: str, suffix: str) -> None:
         ax = self.canvas.ax
         ax.clear()
         _style_axes(ax)
-        ax.plot(distances, values, color="#F5A524", linewidth=1.4)
+        ax.plot(distances, values, color="#F5A524", linewidth=2.0)
         ax.set_xlabel("Distance along line (px)", fontsize=8)
         ax.set_ylabel(suffix or "value", fontsize=8)
         ax.set_title(label, fontsize=9)
@@ -104,7 +112,7 @@ class HistogramPlotPanel(_PlotPanel):
     BINS = 128
 
     def __init__(self, parent=None) -> None:
-        super().__init__("Histogram", parent)
+        super().__init__(None, parent)
 
     def set_values(self, values: np.ndarray, label: str, suffix: str) -> None:
         values = values[np.isfinite(values)]

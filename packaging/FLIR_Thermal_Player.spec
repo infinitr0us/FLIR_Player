@@ -23,6 +23,9 @@ for package in ("fnv", "qtawesome", "imageio_ffmpeg"):
 for distribution in ("imageio", "imageio-ffmpeg"):
     datas += copy_metadata(distribution)
 
+# SVG glyphs referenced by the stylesheet (checkbox tick, combo chevron)
+datas.append((str(PROJECT_ROOT / "flir_player" / "icons"), "flir_player/icons"))
+
 conda_ffi = Path(sys.prefix) / "Library" / "bin" / "ffi.dll"
 if conda_ffi.is_file():
     binaries.append((str(conda_ffi), "."))

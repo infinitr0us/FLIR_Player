@@ -6,7 +6,6 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
@@ -15,14 +14,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QSpinBox,
     QToolButton,
-    QVBoxLayout,
     QWidget,
 )
 
 from .models import VideoMetadata
+from .widgets import FramelessDialog
 
 
-class ExtractDialog(QDialog):
+class ExtractDialog(FramelessDialog):
     """Collect extract (trim/decimate) parameters — ResearchIR §4.9.1.2.
 
     The FLIR File SDK only produces output for ATS sources written to an
@@ -36,14 +35,11 @@ class ExtractDialog(QDialog):
         parent: QWidget | None = None,
         default_range: tuple[int, int] | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Extract Clip")
-        self.setModal(True)
+        super().__init__("Extract Clip", parent)
         self.setMinimumWidth(460)
         self._metadata = metadata
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout = self.body
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -106,7 +102,9 @@ class ExtractDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Extract")
+        ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Extract")
+        ok_button.setProperty("accent", True)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)

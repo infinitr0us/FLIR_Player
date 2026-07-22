@@ -1199,7 +1199,13 @@ class MainWindow(QMainWindow):
         self.canvas.set_overlay_data(
             packet.min_position, packet.max_position, packet.roi_stats
         )
-        self.color_scale.set_scale(self.current_palette, low, high, invert=self.palette_inverted)
+        self.color_scale.set_scale(
+            self.current_palette,
+            low,
+            high,
+            invert=self.palette_inverted,
+            unit=packet.unit.suffix or packet.unit.label,
+        )
         self.color_scale.set_isotherm(self.isotherm_mode, self.iso_limit1, self.iso_limit2)
         seconds = frame_seconds(packet.timestamp, self.metadata, packet.index)
         self.transport.set_frame(packet.index, self.metadata.num_frames, seconds)

@@ -102,6 +102,17 @@ def _position(point: Any) -> tuple[int, int] | None:
         return None
 
 
+def _pretty_value(value: Any) -> str:
+    """Compact rendering for SDK values that would otherwise repr() as raw blobs."""
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {_pretty_value(item)}" for key, item in value.items())
+    if isinstance(value, (bytes, bytearray)):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_pretty_value(item) for item in value) + "]"
+    return str(value)
+
+
 def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
     """Static per-recording property rows for the Source Information panel (§4.8.3)."""
     info = im.source_info
@@ -150,7 +161,7 @@ def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
             )
         )
     rows.append(("Image size", f"{int(im.width)} × {int(im.height)}"))
-    add("Pixel type", getattr(info, "pixel_type", ""))
+    add("Pixel type", _pretty_value(getattr(info, "pixel_type", "")))
     ad_bits = getattr(info, "ad_bits", 0)
     if ad_bits:
         rows.append(("A/D bits", str(ad_bits)))
