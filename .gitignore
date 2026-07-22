@@ -32,6 +32,14 @@ artifacts/
 # --- Local-only GUI design/polish scratch (not for redistribution) ----------
 GUI_polish/
 
+# --- Internal design-QA docs and one-off check scripts (local-only) ----------
+design-qa.md
+design/option-1-reference.png
+scripts/tier3_check.py
+scripts/tier4_check.py
+scripts/ui_fix_check.py
+scripts/polish_check.py
+
 # --- Python ------------------------------------------------------------------
 __pycache__/
 *.py[cod]
