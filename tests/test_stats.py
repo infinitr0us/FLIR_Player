@@ -12,14 +12,14 @@ from flir_player.main_window import MainWindow
 from flir_player.widgets import MetadataPanel, MetadataPickerDialog
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def test_statistics_panel_tracks_rois_and_saves_csv(qapp, tmp_path, monkeypatch) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         panel = window.bottom_panel.statistics
         assert not window.bottom_panel.isVisible()
@@ -87,7 +87,7 @@ def test_source_and_metadata_tabs(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
 
         # source tab is populated once per file

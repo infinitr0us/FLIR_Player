@@ -44,7 +44,7 @@ not required on the target computer. Initial startup may take a few seconds
 while the bundled runtime is extracted.
 
 Verified on {build_date} with the bundled smoke test:
-  FLIR_Thermal_Player.exe 2.seq --smoke-test  (playback advances, exit 0)
+  FLIR_Thermal_Player.exe <recording>.seq --smoke-test  (playback advances, exit 0)
 
 The executable is unsigned, so Windows SmartScreen may show an unknown
 publisher warning. For wider distribution, sign it with your organization's

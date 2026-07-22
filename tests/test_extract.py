@@ -16,13 +16,13 @@ from flir_player.models import VideoMetadata
 from flir_player.source import FlirVideoSource
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def test_extract_ats_range_and_decimation(tmp_path) -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "1.ats")
+        source.open(SAMPLES / "1.ats")
         dest = tmp_path / "clip.ats"
         ok, message = source.extract(dest, start_frame=0, end_frame=9)
         assert ok, message
@@ -45,7 +45,7 @@ def test_extract_ats_range_and_decimation(tmp_path) -> None:
 def test_extract_seq_reports_unsupported(tmp_path) -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "2.seq")
+        source.open(SAMPLES / "2.seq")
         dest = tmp_path / "seq_clip.ats"
         ok, message = source.extract(dest, start_frame=0, end_frame=4)
         assert not ok
@@ -58,7 +58,7 @@ def test_extract_seq_reports_unsupported(tmp_path) -> None:
 def test_extract_abort_cleans_up(tmp_path) -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "1.ats")
+        source.open(SAMPLES / "1.ats")
         dest = tmp_path / "aborted.ats"
         calls = []
 
@@ -114,7 +114,7 @@ def test_main_window_extracts_clip(qapp, tmp_path, monkeypatch) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "1.ats")
+        window.open_path(SAMPLES / "1.ats")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
 
         dest = tmp_path / "ui_clip.ats"

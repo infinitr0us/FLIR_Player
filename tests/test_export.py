@@ -28,7 +28,7 @@ from flir_player.main_window import MainWindow
 from flir_player.models import RoiShape
 from flir_player.render import DisplayState, render_frame_rgb
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def _gradient_rgb(width: int = 64, height: int = 48) -> np.ndarray:
@@ -134,7 +134,7 @@ def test_stats_csv_rows(qapp, tmp_path) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -156,7 +156,7 @@ def test_frame_burn_label_contains_frame_and_time(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -189,7 +189,7 @@ def test_series_export_end_to_end(qapp, tmp_path) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -229,7 +229,7 @@ def test_movie_export_end_to_end(qapp, tmp_path) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -262,7 +262,7 @@ def test_batch_extract_reports_non_ats_honestly(qapp, tmp_path) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -270,7 +270,7 @@ def test_batch_extract_reports_non_ats_honestly(qapp, tmp_path) -> None:
         window.decoder.export_finished.connect(lambda ok, msg: finished.append((ok, msg)))
         window.decoder.request_batch_extract(
             {
-                "files": [str(ROOT / "1.ats"), str(ROOT / "2.seq")],
+                "files": [str(SAMPLES / "1.ats"), str(SAMPLES / "2.seq")],
                 "folder": str(tmp_path),
                 "decimation": 10,
             }
@@ -290,7 +290,7 @@ def test_roi_bitmask_export(qapp, tmp_path) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -320,7 +320,7 @@ def test_render_frame_rgb_matches_window_pipeline(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -348,7 +348,7 @@ def test_recent_files_roundtrip(qapp) -> None:
     window.show()
     try:
         assert window._recent_files() == []
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -356,7 +356,7 @@ def test_recent_files_roundtrip(qapp) -> None:
         assert len(recents) == 1
         assert recents[0].endswith("2.seq")
         # opening the same file again must not duplicate the entry
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: not window._busy)
         assert len(window._recent_files()) == 1
         # menu contains the entry + clear action

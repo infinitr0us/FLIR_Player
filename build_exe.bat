@@ -20,8 +20,8 @@ rem Regenerate SHA256SUMS.txt, BUILD_INFO.txt and README.txt for the release
 python packaging\finalize_release.py
 if errorlevel 1 goto :error
 
-rem Smoke-test the built executable: open 2.seq, verify playback advances
-release\FLIR_Thermal_Player.exe 2.seq --smoke-test
+rem Smoke-test the built executable: open local\data\2.seq, verify playback advances
+release\FLIR_Thermal_Player.exe local\data\2.seq --smoke-test
 if errorlevel 1 goto :smoke_error
 
 echo.

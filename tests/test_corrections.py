@@ -10,13 +10,13 @@ from flir_player.main_window import MainWindow
 from flir_player.source import FlirVideoSource
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def test_corrections_state_and_safe_toggle() -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "2.seq")
+        source.open(SAMPLES / "2.seq")
         state = source.read_corrections()
         # this recording carries no embedded corrections (apply flags are inert defaults)
         assert state["has_nuc"] is False
@@ -33,7 +33,7 @@ def test_corrections_toggles_hidden_without_embedded_data(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         assert not window.inspector.corrections_row.isVisible()
         assert not window.inspector.nuc_check.isVisible()

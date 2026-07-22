@@ -9,7 +9,7 @@ import pytest
 from flir_player.source import OBJECT_PARAMETER_FIELDS, FlirVideoSource
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 @pytest.mark.parametrize(
@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_supplied_recordings_open_and_decode(filename, shape, frames) -> None:
     source = FlirVideoSource()
     try:
-        metadata = source.open(ROOT / filename)
+        metadata = source.open(SAMPLES / filename)
         packet = source.read_frame(0, request_id=42)
         assert metadata.num_frames == frames
         assert packet.data.shape == shape
@@ -34,7 +34,7 @@ def test_supplied_recordings_open_and_decode(filename, shape, frames) -> None:
 def test_temperature_switch_when_supported() -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "2.seq")
+        source.open(SAMPLES / "2.seq")
         keys = {option.key for option in source.available_units}
         assert "temperature_factory_c" in keys
         source.set_unit("temperature_factory_c")
@@ -48,7 +48,7 @@ def test_temperature_switch_when_supported() -> None:
 def test_extended_units_object_signal_and_fahrenheit() -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "2.seq")
+        source.open(SAMPLES / "2.seq")
         keys = {option.key for option in source.available_units}
         assert "object_signal" in keys
         assert "temperature_factory_f" in keys
@@ -72,7 +72,7 @@ def test_extended_units_object_signal_and_fahrenheit() -> None:
 def test_ats_exposes_counts_only() -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "1.ats")
+        source.open(SAMPLES / "1.ats")
         assert [option.key for option in source.available_units] == ["counts"]
     finally:
         source.close()
@@ -81,7 +81,7 @@ def test_ats_exposes_counts_only() -> None:
 def test_object_parameters_apply_and_reset() -> None:
     source = FlirVideoSource()
     try:
-        source.open(ROOT / "2.seq")
+        source.open(SAMPLES / "2.seq")
         source.set_unit("temperature_factory_c")
         baseline = source.read_frame(10).mean
 

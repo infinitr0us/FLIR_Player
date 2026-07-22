@@ -23,7 +23,7 @@ from flir_player.processing import (
     state_from_dict,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 # --- state ------------------------------------------------------------------
@@ -204,12 +204,12 @@ def test_reference_subtract_end_to_end(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
         window._reference_params = {
-            "path": str(ROOT / "2.seq"),
+            "path": str(SAMPLES / "2.seq"),
             "frame_index": 0,
             "op": "subtract",
         }
@@ -255,7 +255,7 @@ def test_filters_end_to_end_offset(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )

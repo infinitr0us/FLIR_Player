@@ -30,7 +30,7 @@ from flir_player.render import (
     unregister_custom_palette,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 # --- plateau equalization (§4.3.2) ----------------------------------------------
@@ -208,7 +208,7 @@ def test_flip_state_roundtrips_into_render(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -234,7 +234,7 @@ def test_isotherm_seeds_limits_and_paints(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -258,7 +258,7 @@ def test_segmentation_enable_seeds_frame_range(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
@@ -281,7 +281,7 @@ def test_enhancement_toggle_updates_state(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )

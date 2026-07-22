@@ -13,7 +13,7 @@ from flir_player.models import RoiShape
 from flir_player.plots import line_profile_values, roi_values
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 GRID = np.arange(100, dtype=float).reshape(10, 10)
 
@@ -45,7 +45,7 @@ def test_roi_values_shapes() -> None:
 def _open_window(qapp):
     window = MainWindow()
     window.show()
-    window.open_path(ROOT / "2.seq")
+    window.open_path(SAMPLES / "2.seq")
     assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
     return window
 

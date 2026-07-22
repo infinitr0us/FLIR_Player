@@ -15,7 +15,7 @@ from flir_player.main_window import MainWindow
 from flir_player.models import VideoMetadata
 from flir_player.widgets import TimelineSlider
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 # --- TimelineSlider model ----------------------------------------------------------
@@ -90,7 +90,7 @@ def loop_setting_preserved():
 def _loaded_window(qapp) -> MainWindow:
     window = MainWindow()
     window.show()
-    window.open_path(ROOT / "2.seq")
+    window.open_path(SAMPLES / "2.seq")
     assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
     return window
 

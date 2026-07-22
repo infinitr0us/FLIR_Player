@@ -16,14 +16,14 @@ from flir_player.models import RoiShape
 from flir_player.source import FlirVideoSource
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 RECT = ((100.0, 100.0), (150.0, 140.0))
 
 
 def _open_seq_source() -> FlirVideoSource:
     source = FlirVideoSource()
-    source.open(ROOT / "2.seq")
+    source.open(SAMPLES / "2.seq")
     return source
 
 
@@ -112,7 +112,7 @@ def test_canvas_draw_select_move_and_delete_roi(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         canvas = window.canvas
         canvas.repaint()  # offscreen: force paintEvent so the image rect is computed

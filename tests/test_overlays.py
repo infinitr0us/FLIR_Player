@@ -12,14 +12,14 @@ from flir_player.main_window import MainWindow
 from flir_player.render import CLIP_COLOR
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def test_scale_from_active_roi(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
 
         window._add_roi("rect", ((100.0, 100.0), (150.0, 140.0)))
@@ -45,7 +45,7 @@ def test_clipping_overlay_marks_out_of_range_pixels(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         window._change_unit("temperature_factory_c")
         assert wait_until(qapp, lambda: window.current_packet.unit.key == "temperature_factory_c")
@@ -69,7 +69,7 @@ def test_minmax_markers_toggle(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         assert not window.canvas._show_markers
 

@@ -14,14 +14,14 @@ from flir_player.style import APP_STYLESHEET, TOKENS
 from flir_player.widgets import ElidingLabel, MetadataPickerDialog
 
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def test_main_window_opens_plays_seeks_switches_units_and_exports(qapp, tmp_path, monkeypatch) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         assert window.metadata is not None
         assert window.current_packet.index == 0
@@ -73,7 +73,7 @@ def test_object_parameters_panel_edits_apply(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         assert window.inspector.params_panel.isEnabled()
 

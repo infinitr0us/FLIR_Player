@@ -40,9 +40,10 @@ python -m pytest -q
 ```
 
 The suite is data-aware: tests that need the FLIR File SDK or a real recording
-(`1.ats` / `2.seq` in the repository root) are **skipped automatically** when
-those are absent, so `pytest` runs cleanly on a bare clone. To exercise the full
-suite, install the SDK and place your own recordings at those two paths.
+(`local/data/1.ats` / `local/data/2.seq`, in a git-ignored folder) are
+**skipped automatically** when those are absent, so `pytest` runs cleanly on a
+bare clone. To exercise the full suite, install the SDK and place your own
+recordings at those two paths.
 
 ## Pull requests
 

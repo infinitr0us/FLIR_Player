@@ -14,7 +14,7 @@ from PySide6.QtCore import QPointF
 from flir_player.main_window import MainWindow
 from flir_player.widgets import ThermalCanvas
 
-ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 
 
 def _canvas_with_frame(qapp, width: int = 200, height: int = 100) -> ThermalCanvas:
@@ -127,13 +127,13 @@ def test_zoom_resets_on_new_file(qapp) -> None:
     window = MainWindow()
     window.show()
     try:
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy
         )
         window.canvas.set_zoom_level(2.0)
         assert window.canvas._zoom is not None
-        window.open_path(ROOT / "2.seq")
+        window.open_path(SAMPLES / "2.seq")
         assert window.canvas._zoom is None
         assert wait_until(
             qapp, lambda: window.current_packet is not None and not window._busy

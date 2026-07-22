@@ -122,7 +122,8 @@ and the imageio-ffmpeg encoder binary, and excludes Anaconda's incompatible
 legacy ICU shadow DLL), then regenerates `release/BUILD_INFO.txt`,
 `release/SHA256SUMS.txt`, and `release/README.txt` via
 `packaging/finalize_release.py`, and finally smoke-tests the built executable
-against `2.seq`. A build that fails the smoke test exits with code 2.
+against the sample recording `local/data/2.seq`. A build that fails the smoke
+test exits with code 2.
 
 The executable contains FLIR File SDK components. Check the FLIR SDK license
 and the EAR notice in the installed `fnv` package before redistributing it
@@ -168,10 +169,11 @@ python -m pytest -q
 ```
 
 Note: a large part of the suite opens real FLIR recordings (referenced as
-`1.ats` and `2.seq` in the repository root) and requires both the FLIR File SDK
-and those sample files to run. Because neither the SDK nor the recordings are
-distributed here, those tests will error on a bare clone. Provide your own
-recordings under those names, or supply your own to exercise the suite.
+`local/data/1.ats` and `local/data/2.seq`, in a git-ignored folder) and
+requires both the FLIR File SDK and those sample files to run. Because neither
+the SDK nor the recordings are distributed here, those tests are skipped on a
+bare clone. Provide your own recordings at those two paths to exercise the
+full suite.
 
 The tests cover rendering/range utilities, both supplied FLIR recordings, Qt
 opening and playback, seeking, unit switching, object-parameter round-trips,
