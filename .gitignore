@@ -29,6 +29,9 @@ dist/
 # --- Internal dev / QA screenshots ------------------------------------------
 artifacts/
 
+# --- Local-only GUI design/polish scratch (not for redistribution) ----------
+GUI_polish/
+
 # --- Python ------------------------------------------------------------------
 __pycache__/
 *.py[cod]
