@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flir-thermal-player"
-version = "0.2.0"
+version = "0.3.0"
 description = "A modern Windows desktop player for FLIR radiometric recordings (.seq/.ats/.sfmov/.csq)."
 readme = "README.md"
 requires-python = ">=3.11"

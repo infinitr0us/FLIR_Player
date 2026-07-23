@@ -22,9 +22,10 @@ all decoding work off the GUI thread.
   the image, with selection, move, resize, and per-ROI color coding.
 - A tabbed analysis panel with: per-ROI statistics (min/max/mean/std-dev/
   pixel-count plus a whole-image column, pause, CSV export), temporal plot of
-  ROI statistics versus time, line-profile plot, histogram plot, per-frame
-  header metadata (with entry picker), and static source information (camera,
-  lens, calibration ranges).
+  ROI statistics versus time (history bounded per ROI, downsampled for
+  display without losing short excursions), line-profile plot, histogram
+  plot, per-frame header metadata (with entry picker), and static source
+  information (camera, lens, calibration ranges).
 - Scale-from-ROI range mode alongside dynamic and fixed scaling.
 - Overlay toggles: clipping indicators for out-of-calibration pixels and
   min/max location markers for the image and each ROI.
@@ -49,7 +50,9 @@ all decoding work off the GUI thread.
   (any frame of the open file or of another same-size recording).
 - Point (gain, offset, exp, ln, sqrt), spatial (gaussian, window average,
   median), and temporal (min, max, frame average, sliding subtraction)
-  filters, applied in a pipeline inside the decoder thread.
+  filters, applied in a pipeline inside the decoder thread. The median kernel
+  size is capped per resolution to bound memory, and the inspector always
+  shows the kernel actually applied.
 - Open Recent on the Open button (last 8 recordings, persisted) and wider
   format support: SEQ, ATS, SFMOV, CSQ plus FFF, PTW, and radiometric TIFF.
 - Still-image export with composition options (color bar, ROIs and names,
@@ -66,7 +69,9 @@ all decoding work off the GUI thread.
 - Live cursor coordinates and radiometric value inspection.
 - PNG display export plus raw NumPy and CSV export.
 - Drag-and-drop opening, full-screen inspection, tooltips, and keyboard shortcuts.
-- A bounded frame cache; the application never loads the full recording into RAM.
+- A byte-budgeted frame cache (64 MiB by default); the application never loads
+  the full recording into RAM, and long temporal-plot sessions are bounded per
+  ROI with excursion-preserving downsampling.
 
 The application entry point is `flir_player_app.py`, which launches the
 `flir_player/` package.
@@ -156,9 +161,25 @@ outside your permitted users or organization.
 ## Architecture
 
 `DecoderThread` is the sole owner of the FLIR File SDK object. It returns
-detached NumPy frames to the main thread and caches only a few recent frames.
+detached NumPy frames to the main thread and keeps a byte-budgeted LRU cache
+(64 MiB by default) of recent packets. Interactive frame requests are
+latest-wins — stale queued seek/scrub work is coalesced away before the SDK
+touches it — while state changes (unit, parameters, corrections, filters,
+exports) keep strict FIFO order.
+
 Playback uses an absolute media clock anchored to each recording's frame
-timestamps, so decode and render overhead do not accumulate into timing drift.
+timestamps. Decoding runs ahead of presentation through a small bounded
+queue, so decode, processing, and rendering overlap the presentation wait
+instead of serializing. If the player falls behind, it drops or skips forward
+to stay on the media clock, which keeps the 0.25×–4× speed multipliers
+wall-clock accurate; while a temporal filter is active every frame is still
+decoded (only presentation drops), so filter state stays correct. Whole-image
+statistics reuse the SDK's built-in image ROI when no processing is active,
+and colorization runs in float32 with reusable scratch buffers and fused
+overlay passes.
+
+Set `FLIR_PERF_DEBUG=1` to print per-second playback counters (presented
+fps, drops, skips, media-clock lateness) to stderr.
 
 ## Verification
 
@@ -187,6 +208,14 @@ filters, app-side ROI statistics, temporal-buffer windowing), plus the Tier-4
 export paths: export composition, TIFF 16-bit/float round-trips, MP4/WMV
 writing, decoder-driven series/movie export, batch extract reporting, ROI
 bitmasks, and recent-file tracking, plus the main interaction states.
+
+The performance work is guarded by its own parity suite
+(`tests/test_perf_parity.py`): SDK-vs-NumPy whole-image statistics across
+units and edge cases, float32 colorization tolerance parity against the
+float64 reference, request coalescing, prefetch and end-of-range
+presentation (including loop wraps), cache byte accounting and payload
+completeness, bounded temporal history and envelope downsampling, and
+filter-kernel parity.
 
 ## License
 
