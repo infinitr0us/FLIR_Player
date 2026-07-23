@@ -119,10 +119,10 @@ def test_loop_wrap_requests_range_start(qapp, loop_setting_preserved) -> None:
 
         requested: list[int] = []
         original = window.decoder.request_frame
-        window.decoder.request_frame = lambda index, rid: requested.append(index)
+        window.decoder.request_frame = lambda index, rid, **kwargs: requested.append(index)
         window.playing = True
         try:
-            window._request_next_playback_frame()
+            window._request_next_playback_frame(window.current_packet)
         finally:
             window.decoder.request_frame = original
             window.playing = False
@@ -142,7 +142,7 @@ def test_no_loop_pauses_at_range_end(qapp, loop_setting_preserved) -> None:
         window.seek_to(20)
         assert wait_until(qapp, lambda: window.current_packet.index == 20)
         window.playing = True
-        window._request_next_playback_frame()
+        window._request_next_playback_frame(window.current_packet)
         assert not window.playing
         assert not window._wrap_pending
     finally:

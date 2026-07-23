@@ -102,3 +102,8 @@ class FramePacket:
     max_position: tuple[int, int] | None = None
     clip_mask: np.ndarray | None = None
     metadata_entries: tuple[tuple[str, str], ...] = ()
+    # True when the corresponding optional payload was evaluated during decode.
+    # ``clip_mask is None`` / empty entries are then valid full results, not
+    # "not loaded" — the packet cache keys its sufficiency check off these.
+    clip_loaded: bool = True
+    metadata_loaded: bool = True

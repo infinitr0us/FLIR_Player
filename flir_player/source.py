@@ -10,6 +10,7 @@ from typing import Any
 try:  # The FLIR File SDK is a proprietary, user-supplied optional dependency.
     import fnv
     import fnv.file
+    import fnv.reduce
 
     _SDK_AVAILABLE = True
 except ModuleNotFoundError:  # Let this module import without the SDK present.
@@ -209,6 +210,8 @@ class FlirVideoSource:
         self._available_units: tuple[UnitOption, ...] = ()
         self._unit_spec: _UnitSpec | None = None
         self._roi_handles: list[tuple[int, RoiShape, Any]] = []
+        self._image_roi: Any | None = None  # built-in whole-image ROI handle
+        self._first_packet: FramePacket | None = None  # decoded during open()
         self._processing = ProcessingState()
         self._reference: np.ndarray | None = None
         self._reference_label = ""
@@ -259,10 +262,13 @@ class FlirVideoSource:
                 else self._available_units[0].key
             )
             self.set_unit(preferred_key)
+            self._image_roi = self._find_builtin_image_roi()
 
-            first_time = self._timestamp_for_frame(0)
+            first_packet = self.read_frame(0, request_id=0)
+            first_time = first_packet.timestamp
             last_index = int(self._im.num_frames) - 1
             last_time = self._timestamp_for_frame(last_index) if last_index else first_time
+            self._first_packet = first_packet
             duration = self._duration(first_time, last_time)
             nominal_fps = (last_index / duration) if last_index > 0 and duration > 0 else 30.0
 
@@ -300,36 +306,51 @@ class FlirVideoSource:
         self._unit_spec = spec
         return spec.option
 
-    def read_frame(self, index: int, request_id: int = 0) -> FramePacket:
+    def read_frame(
+        self,
+        index: int,
+        request_id: int = 0,
+        need_clip: bool = True,
+        need_metadata: bool = True,
+    ) -> FramePacket:
         if self._im is None or self._unit_spec is None:
             raise RuntimeError("No FLIR recording is open")
         frame_index = max(0, min(int(index), int(self._im.num_frames) - 1))
         self._im.get_frame(frame_index)
+        return self._packet_from_current(
+            frame_index, request_id, need_clip, need_metadata
+        )
+
+    def _packet_from_current(
+        self,
+        frame_index: int,
+        request_id: int,
+        need_clip: bool = True,
+        need_metadata: bool = True,
+    ) -> FramePacket:
+        """Build a FramePacket for the frame the SDK is currently positioned on.
+
+        ``need_clip``/``need_metadata`` skip SDK work the caller will not
+        consume (the status-bit scan and the frame-header string conversions);
+        interactive requests pass False when those views are hidden, exports
+        always keep the defaults.
+        """
         data = np.array(self._im.final, copy=True).reshape(
             (int(self._im.height), int(self._im.width))
         )
         data = self._process_frame(data, frame_index)
-        finite = data[np.isfinite(data)]
-        min_position = max_position = None
-        if finite.size:
-            minimum = float(np.min(finite))
-            maximum = float(np.max(finite))
-            mean = float(np.mean(finite))
-            std_dev = float(np.std(finite))
-            finite_mask = np.isfinite(data)
-            low_index = np.unravel_index(
-                int(np.argmin(np.where(finite_mask, data, np.inf))), data.shape
-            )
-            high_index = np.unravel_index(
-                int(np.argmax(np.where(finite_mask, data, -np.inf))), data.shape
-            )
-            min_position = (int(low_index[1]), int(low_index[0]))
-            max_position = (int(high_index[1]), int(high_index[0]))
-        else:
-            minimum = maximum = mean = std_dev = 0.0
+        (
+            minimum,
+            maximum,
+            mean,
+            std_dev,
+            num_pixels,
+            min_position,
+            max_position,
+        ) = self._whole_image_stats(data)
 
-        clip_mask = self._clip_mask(data.shape)
-        metadata_entries = self._frame_metadata_entries()
+        clip_mask = self._clip_mask(data.shape) if need_clip else None
+        metadata_entries = self._frame_metadata_entries() if need_metadata else ()
 
         return FramePacket(
             index=frame_index,
@@ -342,11 +363,58 @@ class FlirVideoSource:
             request_id=request_id,
             roi_stats=self._frame_roi_stats(data),
             std_dev=std_dev,
-            num_pixels=int(finite.size),
+            num_pixels=num_pixels,
             min_position=min_position,
             max_position=max_position,
             clip_mask=clip_mask,
             metadata_entries=metadata_entries,
+            clip_loaded=need_clip,
+            metadata_loaded=need_metadata,
+        )
+
+    def _whole_image_stats(self, data: np.ndarray):
+        """Whole-image statistics for one (possibly processed) frame.
+
+        When the processing pipeline is inactive, the SDK's built-in whole-image
+        ``Image`` ROI already carries min/max/mean/std-dev/pixel count/extrema
+        positions for the current frame — reading them costs microseconds, while
+        the NumPy reduction costs several milliseconds per frame. The SDK only
+        sees pre-processing data, so the app-side reduction is kept for the
+        processing-active case.
+        """
+        if not self._processing.is_active and self._image_roi is not None:
+            try:
+                roi = self._image_roi
+                return (
+                    float(roi.min_value),
+                    float(roi.max_value),
+                    float(roi.mean),
+                    float(roi.std_dev),
+                    int(roi.num_pixels),
+                    _position(roi.min_position),
+                    _position(roi.max_position),
+                )
+            except Exception:
+                pass  # fall through to the NumPy reduction below
+        finite_mask = np.isfinite(data)
+        num_pixels = int(finite_mask.sum())
+        if not num_pixels:
+            return (0.0, 0.0, 0.0, 0.0, 0, None, None)
+        finite = data[finite_mask]
+        low_index = np.unravel_index(
+            int(np.argmin(np.where(finite_mask, data, np.inf))), data.shape
+        )
+        high_index = np.unravel_index(
+            int(np.argmax(np.where(finite_mask, data, -np.inf))), data.shape
+        )
+        return (
+            float(np.min(finite)),
+            float(np.max(finite)),
+            float(np.mean(finite)),
+            float(np.std(finite)),
+            num_pixels,
+            (int(low_index[1]), int(low_index[0])),
+            (int(high_index[1]), int(high_index[0])),
         )
 
     def _process_frame(self, data: np.ndarray, frame_index: int) -> np.ndarray:
@@ -412,6 +480,8 @@ class FlirVideoSource:
         self._available_units = ()
         self._unit_spec = None
         self._roi_handles = []
+        self._image_roi = None
+        self._first_packet = None
         self._processing = ProcessingState()
         self._reference = None
         self._reference_label = ""
@@ -565,6 +635,28 @@ class FlirVideoSource:
                 )
             )
         return tuple(stats)
+
+    def _find_builtin_image_roi(self) -> Any | None:
+        """Handle of the recording's built-in whole-image ROI, if present.
+
+        Matched by name and type — never assumed to sit at index zero. Returns
+        None when the recording has none (the NumPy reduction is then used).
+        """
+        if self._im is None:
+            return None
+        try:
+            image_type = fnv.reduce.RoiType.IMAGE
+            for roi in self._im.rois:
+                if getattr(roi, "name", "") == "Image" and roi.type == image_type:
+                    return roi
+        except Exception:
+            pass
+        return None
+
+    def take_first_packet(self) -> FramePacket | None:
+        """Hand out the frame-0 packet decoded during open() (consumed once)."""
+        packet, self._first_packet = self._first_packet, None
+        return packet
 
     def extract(
         self,

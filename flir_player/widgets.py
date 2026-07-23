@@ -1905,6 +1905,8 @@ class InspectorPanel(QWidget):
             minimum=3,
             maximum=15,
         )
+        # resolution-dependent median cap (memory budget); set on recording open
+        self._median_size_cap: int | None = None
         self.temporal_combo, self.temporal_spin = self._filter_row(
             processing_layout,
             "Temporal Filter",
@@ -2037,6 +2039,7 @@ class InspectorPanel(QWidget):
         self.point_spin.setVisible(point_key in {"gain", "offset"})
         self.spatial_spin.setVisible(str(self.spatial_combo.currentData()) != "none")
         self.temporal_spin.setVisible(str(self.temporal_combo.currentData()) != "none")
+        self._apply_spatial_size_cap()
         if update_only:
             return
         self.filters_changed.emit(
@@ -2052,6 +2055,32 @@ class InspectorPanel(QWidget):
                 ),
             }
         )
+
+    def set_median_size_cap(self, cap: int | None) -> None:
+        """Set the resolution-dependent median kernel cap (memory budget).
+
+        The processing layer clamps oversized median kernels; the spinner
+        must never offer a kernel different from the one applied (R5)."""
+        self._median_size_cap = cap
+        self._apply_spatial_size_cap()
+
+    def _apply_spatial_size_cap(self) -> None:
+        """Cap the spatial spinner only while Median is selected — Gaussian
+        and window-average share the row and do not need the budget clamp."""
+        is_median = str(self.spatial_combo.currentData()) == "median"
+        cap = self._median_size_cap if is_median else None
+        maximum = 15 if cap is None else max(3, min(15, int(cap)))
+        if self.spatial_spin.maximum() != maximum:
+            # setMaximum clamps an out-of-range value, emitting valueChanged →
+            # the corrected state is dispatched to the processing layer
+            self.spatial_spin.setMaximum(maximum)
+        if is_median and maximum < 15:
+            self.spatial_spin.setToolTip(
+                f"Median kernel is capped at {maximum}×{maximum} for this "
+                f"resolution (memory budget)"
+            )
+        else:
+            self.spatial_spin.setToolTip("")
 
     @staticmethod
     def _range_spin() -> QDoubleSpinBox:
@@ -2185,7 +2214,9 @@ class InspectorPanel(QWidget):
             "Camera": camera or "—",
         }
         for key, text in values.items():
-            self._info_values[key].setText(text)
+            label = self._info_values[key]
+            if label.text() != text:  # only the frame number changes per frame
+                label.setText(text)
 
     def set_probe(self, probe, suffix: str) -> None:
         if probe is None:

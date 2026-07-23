@@ -10,7 +10,7 @@ app-side from the processed array (the SDK only sees pre-processing data).
 
 from __future__ import annotations
 
-from collections import deque
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -112,11 +112,18 @@ def _moving_sum_axis(data: np.ndarray, size: int, axis: int) -> np.ndarray:
 
 
 def box_mean(data: np.ndarray, size: int) -> np.ndarray:
-    """NaN-aware box (window) average via the cumsum integral — O(N) per axis."""
+    """NaN-aware box (window) average via the cumsum integral — O(N) per axis.
+
+    The value integral stays float64 on purpose: window sums of counts-scale
+    data exceed float32's exact-integer range (2^24), which would band. The
+    0/1 weight integral is float32-safe (max count < 2^24 pixels) and halves
+    its memory bandwidth.
+    """
     size = _odd_size(size)
     valid = np.isfinite(data)
-    values = np.where(valid, data, 0.0).astype(np.float64)
-    weights = valid.astype(np.float64)
+    values = data.astype(np.float64)
+    values[~valid] = 0.0
+    weights = valid.astype(np.float32)
     sums = _moving_sum_axis(_moving_sum_axis(values, size, 0), size, 1)
     counts = _moving_sum_axis(_moving_sum_axis(weights, size, 0), size, 1)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -131,8 +138,36 @@ def gaussian_blur(data: np.ndarray, size: int) -> np.ndarray:
     return result
 
 
-def median_filter(data: np.ndarray, size: int) -> np.ndarray:
+# A sliding-window median exposes HxWxKxK elements to np.nanmedian, which
+# materializes them internally (~791 MiB for 15x15 at 1280x720). Until a
+# compiled kernel is selected (dependency decision: see the performance
+# review note), the kernel is clamped to this budget and the user is warned.
+_MEDIAN_ELEMENT_BUDGET = 100_000_000
+
+
+def median_max_size(num_pixels: int) -> int:
+    """Largest odd median kernel within the element budget for a frame of
+    ``num_pixels`` pixels. Mirrors the processing-side clamp so the UI can
+    constrain its spinner to the kernel that will actually be applied."""
+    size = int(np.sqrt(_MEDIAN_ELEMENT_BUDGET / max(1, int(num_pixels))))
+    return max(3, size if size % 2 else size - 1)
+
+
+def _median_size_within_budget(data: np.ndarray, size: int) -> int:
     size = _odd_size(size)
+    clamped = min(size, median_max_size(data.size))
+    if clamped != size:
+        warnings.warn(
+            f"median kernel {size}×{size} on a {data.shape[1]}×{data.shape[0]} "
+            f"frame exceeds the memory budget; clamped to {clamped}×{clamped}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return clamped
+
+
+def median_filter(data: np.ndarray, size: int) -> np.ndarray:
+    size = _median_size_within_budget(data, size)
     radius = size // 2
     padded = np.pad(data.astype(np.float32), radius, mode="edge")
     windows = np.lib.stride_tricks.sliding_window_view(padded, (size, size))
@@ -153,32 +188,78 @@ def apply_spatial_filter(data: np.ndarray, name: str, size: int) -> np.ndarray:
 
 
 class TemporalBuffer:
-    """Ring buffer of recent pipeline-input frames for temporal filters."""
+    """Ring of recent pipeline-input frames for temporal filters.
+
+    Storage is a single preallocated contiguous (depth, H, W) float32 ring,
+    replacing the per-frame ``np.stack`` of the whole history (~105 MiB
+    transient at depth 30, 1280×720). ``average`` maintains rolling finite
+    sum/count arrays — O(pixels) per frame instead of O(depth × pixels).
+    ``min``/``max`` reduce the ring in place; ``subtract`` uses the oldest
+    frame in the window (unchanged semantics).
+    """
 
     def __init__(self) -> None:
-        self._frames: deque[np.ndarray] = deque()
+        self._ring: np.ndarray | None = None
+        self._sum: np.ndarray | None = None
+        self._valid: np.ndarray | None = None
+        self._index = 0  # next write position
+        self._count = 0  # frames currently in the window
+        self._depth = 0
 
     def reset(self) -> None:
-        self._frames.clear()
+        self._ring = None
+        self._sum = None
+        self._valid = None
+        self._index = 0
+        self._count = 0
+        self._depth = 0
 
     def __len__(self) -> int:
-        return len(self._frames)
+        return self._count
 
     def apply(self, data: np.ndarray, name: str, depth: int) -> np.ndarray:
         depth = max(2, int(depth))
-        self._frames.append(data)
-        while len(self._frames) > depth:
-            self._frames.popleft()
+        if (
+            self._ring is None
+            or self._depth != depth
+            or self._ring.shape[1:] != data.shape
+        ):
+            self._ring = np.empty((depth,) + data.shape, dtype=np.float32)
+            self._sum = np.zeros(data.shape, dtype=np.float64)
+            self._valid = np.zeros(data.shape, dtype=np.float64)
+            self._index = 0
+            self._count = 0
+            self._depth = depth
+        assert self._sum is not None and self._valid is not None
+
+        if self._count == self._depth:
+            # evict the oldest frame from the rolling statistics
+            outgoing = self._ring[self._index]
+            np.subtract(
+                self._sum, np.where(np.isfinite(outgoing), outgoing, 0.0), out=self._sum
+            )
+            np.subtract(self._valid, np.isfinite(outgoing), out=self._valid)
+        else:
+            self._count += 1
+
+        slot = self._ring[self._index]
+        np.copyto(slot, data, casting="unsafe")  # cast into the float32 ring
+        np.add(self._sum, np.where(np.isfinite(slot), slot, 0.0), out=self._sum)
+        np.add(self._valid, np.isfinite(slot), out=self._valid)
+        self._index = (self._index + 1) % self._depth
+
         if name == "subtract":
             # sliding subtraction: current minus oldest frame in the window
-            return data - self._frames[0]
-        stack = np.stack(tuple(self._frames))
+            oldest = self._ring[self._index] if self._count == self._depth else self._ring[0]
+            return data - oldest
         if name == "average":
-            return np.nanmean(stack, axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                return self._sum / self._valid
+        window = self._ring if self._count == self._depth else self._ring[: self._count]
         if name == "min":
-            return np.nanmin(stack, axis=0)
+            return np.nanmin(window, axis=0)
         if name == "max":
-            return np.nanmax(stack, axis=0)
+            return np.nanmax(window, axis=0)
         return data
 
 

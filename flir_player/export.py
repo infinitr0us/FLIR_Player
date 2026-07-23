@@ -159,6 +159,23 @@ def write_stats_csv(path: Path, header: list[str], rows: list[list]) -> None:
         writer.writerows(rows)
 
 
+class StatsCsvWriter:
+    """Streaming stats CSV for long series exports: open once, one row per
+    frame, constant bookkeeping memory (rows are not accumulated in RAM)."""
+
+    def __init__(self, path: Path, header: list[str]) -> None:
+        self.path = Path(path)
+        self._handle = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._handle)
+        self._writer.writerow(header)
+
+    def append(self, row: list) -> None:
+        self._writer.writerow(row)
+
+    def close(self) -> None:
+        self._handle.close()
+
+
 def frame_burn_label(packet: FramePacket, metadata: VideoMetadata) -> str:
     """Timestamp burn-in text for composed exports (§4.9.1.1, p. 61)."""
     seconds = frame_seconds(packet.timestamp, metadata, packet.index)

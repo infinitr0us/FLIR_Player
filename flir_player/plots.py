@@ -154,6 +154,11 @@ class TemporalPlotPanel(_PlotPanel):
         self.clear_button.setText("Clear")
         self.add_header_widget(self.clear_button)
 
+        # persistent artists: refreshed via set_data instead of ax.clear()
+        self._lines: dict[str, object] = {}
+        self._message = None
+        self._legend = None
+
     @property
     def statistic_label(self) -> str:
         return str(self.stat_combo.currentData())
@@ -166,26 +171,79 @@ class TemporalPlotPanel(_PlotPanel):
     ) -> None:
         """series: (name, color, seconds, values) per ROI."""
         ax = self.canvas.ax
-        ax.clear()
-        _style_axes(ax)
-        if not series:
-            ax.text(
-                0.5, 0.5, "Play or scrub to collect data",
-                transform=ax.transAxes, ha="center", va="center",
-                color=MUTED, fontsize=10,
-            )
+        names = [name for name, *_ in series]
+        legend_dirty = False
+        for stale in [name for name in self._lines if name not in names]:
+            self._lines.pop(stale).remove()
+            legend_dirty = True
         for name, color, seconds, values in series:
             if seconds.size:
-                order = np.argsort(seconds)
-                ax.plot(
-                    seconds[order], values[order],
-                    color=color, linewidth=1.2, label=name,
+                # appended samples arrive ordered; seeks can insert older ones
+                order = (
+                    np.argsort(seconds)
+                    if np.any(seconds[1:] < seconds[:-1])
+                    else slice(None)
                 )
+                x, y = envelope(seconds[order], values[order])
+            else:
+                x, y = seconds, values
+            line = self._lines.get(name)
+            if line is None:
+                (line,) = ax.plot(x, y, color=color, linewidth=1.2, label=name)
+                self._lines[name] = line
+                legend_dirty = True
+            else:
+                line.set_data(x, y)
+        if not series:
+            if self._message is None:
+                self._message = ax.text(
+                    0.5, 0.5, "Play or scrub to collect data",
+                    transform=ax.transAxes, ha="center", va="center",
+                    color=MUTED, fontsize=10,
+                )
+        elif self._message is not None:
+            self._message.remove()
+            self._message = None
         ax.set_xlabel("time (s)", fontsize=8)
         ax.set_ylabel(f"{statistic} ({suffix})" if suffix else statistic, fontsize=8)
-        if any(s[2].size for s in series):
-            legend = ax.legend(fontsize=7, facecolor=SURFACE, edgecolor=GRID, labelcolor=INK)
+        if legend_dirty:
+            if self._legend is not None:
+                self._legend.remove()
+                self._legend = None
+            if self._lines:
+                self._legend = ax.legend(
+                    fontsize=7, facecolor=SURFACE, edgecolor=GRID, labelcolor=INK
+                )
+        ax.relim()
+        ax.autoscale_view()
         self.canvas.draw_idle()
+
+
+def envelope(
+    seconds: np.ndarray, values: np.ndarray, max_points: int = 2000
+) -> tuple[np.ndarray, np.ndarray]:
+    """Min/max envelope downsampling for display of long temporal series.
+
+    Emits (min, max) per bucket so short thermal excursions stay visible
+    instead of being averaged or skipped away. Series at or below
+    ``max_points`` are returned unchanged. Bucket edges are linspace-based,
+    so the newest remainder is never dropped and the emitted time extent
+    always reaches the series' final timestamp.
+    """
+    if seconds.size <= max_points:
+        return seconds, values
+    buckets = max(1, max_points // 2)
+    edges = np.linspace(0, seconds.size, buckets + 1).astype(int)
+    # seconds.size > buckets, so edges are strictly increasing and every
+    # reduceat slice is non-empty; the last slice covers the newest remainder
+    starts = edges[:-1]
+    mids = (starts + edges[1:] - 1) // 2
+    out_t = np.repeat(seconds[mids], 2)
+    out_t[-1] = seconds[-1]  # keep the chart's right edge at the newest sample
+    out_v = np.empty(buckets * 2, dtype=float)
+    out_v[0::2] = np.minimum.reduceat(values, starts)
+    out_v[1::2] = np.maximum.reduceat(values, starts)
+    return out_t, out_v
 
 
 def line_profile_values(data: np.ndarray, start: tuple[float, float], end: tuple[float, float]):

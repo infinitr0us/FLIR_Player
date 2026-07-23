@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -107,6 +108,19 @@ def palette_lut(name: str, invert: bool = False) -> np.ndarray:
     return lut[::-1] if invert else lut
 
 
+def _sanitize_range(low: float, high: float) -> tuple[float, float]:
+    """Shared range guards: non-finite fallback, swap, and zero-span padding."""
+    if not np.isfinite(low) or not np.isfinite(high):
+        return 0.0, 1.0
+    if high < low:
+        low, high = high, low
+    if high == low:
+        padding = max(1.0, abs(high) * 0.01)
+        low -= padding
+        high += padding
+    return low, high
+
+
 def display_range(
     data: np.ndarray,
     fixed_minimum: float | None = None,
@@ -119,16 +133,7 @@ def display_range(
         if not finite.size:
             return 0.0, 1.0
         low, high = float(np.min(finite)), float(np.max(finite))
-
-    if not np.isfinite(low) or not np.isfinite(high):
-        return 0.0, 1.0
-    if high < low:
-        low, high = high, low
-    if high == low:
-        padding = max(1.0, abs(high) * 0.01)
-        low -= padding
-        high += padding
-    return low, high
+    return _sanitize_range(low, high)
 
 
 def plateau_equalized_indices(normalized: np.ndarray, aggressiveness: float) -> np.ndarray:
@@ -156,6 +161,27 @@ def plateau_equalized_indices(normalized: np.ndarray, aggressiveness: float) -> 
     return mapping[indices]
 
 
+_local = threading.local()
+
+
+def _scratch(shape: tuple[int, ...], dtype) -> np.ndarray:
+    """Per-thread reusable work buffer keyed by (shape, dtype).
+
+    Live rendering runs on the GUI thread while exports render on the decoder
+    thread, so scratch must not be shared across threads.
+    """
+    buffers = getattr(_local, "buffers", None)
+    if buffers is None:
+        buffers = _local.buffers = {}
+    shape = tuple(shape)
+    dtype = np.dtype(dtype)
+    key = (shape, dtype)
+    buffer = buffers.get(key)
+    if buffer is None:
+        buffer = buffers[key] = np.empty(shape, dtype=dtype)
+    return buffer
+
+
 def render_rgb(
     data: np.ndarray,
     palette: str,
@@ -167,15 +193,32 @@ def render_rgb(
     span = high - low
     if not np.isfinite(span) or span <= 0:
         span = 1.0
-    normalized = np.nan_to_num((data.astype(np.float64, copy=False) - low) / span)
+    # Normalize in float32 with in-place ops: on 1280x720 this is ~1.5-1.7x
+    # faster than the former float64 pipeline and needs no full-frame
+    # temporaries. LUT indices may shift by +-1 vs float64 at bin edges
+    # (visually lossless; covered by tolerance parity tests).
+    normalized = _scratch(data.shape, np.float32)
+    normalized[:] = data
+    normalized -= np.float32(low)
+    normalized *= np.float32(1.0 / span)
+    np.nan_to_num(normalized, copy=False)  # NaN → bottom of the palette
     if pe > 0.0:
         indices = plateau_equalized_indices(normalized, pe)
     else:
-        indices = np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
+        normalized *= np.float32(255.0)
+        np.clip(normalized, 0.0, 255.0, out=normalized)
+        indices = _scratch(data.shape, np.uint8)
+        np.copyto(indices, normalized, casting="unsafe")
     return np.ascontiguousarray(palette_lut(palette, invert)[indices])
 
 
 CLIP_COLOR = (46, 168, 255)
+
+
+def _paint_clip_overlay(rgb: np.ndarray, mask: np.ndarray | None) -> None:
+    """Paint clipped/invalid pixels in place (rgb must be freshly created)."""
+    if mask is not None:
+        rgb[mask] = CLIP_COLOR
 
 
 def apply_clip_overlay(rgb: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
@@ -183,7 +226,7 @@ def apply_clip_overlay(rgb: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     if mask is None:
         return rgb
     overlaid = np.array(rgb, copy=True)
-    overlaid[mask] = CLIP_COLOR
+    _paint_clip_overlay(overlaid, mask)
     return overlaid
 
 
@@ -201,13 +244,20 @@ def segmentation_overlays(
     return (data < low) & finite, (data > high) & finite
 
 
+def _paint_segmentation_overlay(
+    rgb: np.ndarray, below: np.ndarray, above: np.ndarray
+) -> None:
+    """Paint out-of-range pixels in place (rgb must be freshly created)."""
+    rgb[below] = SEG_BELOW_COLOR
+    rgb[above] = SEG_ABOVE_COLOR
+
+
 def apply_segmentation_overlay(
     rgb: np.ndarray, below: np.ndarray, above: np.ndarray
 ) -> np.ndarray:
     """Paint out-of-range pixels blue (below) / red (above), ResearchIR-style."""
     overlaid = np.array(rgb, copy=True)
-    overlaid[below] = SEG_BELOW_COLOR
-    overlaid[above] = SEG_ABOVE_COLOR
+    _paint_segmentation_overlay(overlaid, below, above)
     return overlaid
 
 
@@ -238,6 +288,16 @@ def isotherm_color(mode: str) -> tuple[int, int, int]:
         "below": ISO_BELOW_COLOR,
         "interval": ISO_INTERVAL_COLOR,
     }.get(mode, ISO_ABOVE_COLOR)
+
+
+def _paint_isotherm_overlay(
+    rgb: np.ndarray, data: np.ndarray, mode: str, limit1: float, limit2: float
+) -> None:
+    """Paint the isotherm band in place (rgb must be freshly created)."""
+    mask = isotherm_mask(data, mode, limit1, limit2)
+    if mask is None or not mask.any():
+        return
+    rgb[mask] = isotherm_color(mode)
 
 
 def apply_isotherm_overlay(
@@ -272,8 +332,16 @@ class DisplayState:
     flip_v: bool = False
 
 
-def display_scale(data: np.ndarray, state: DisplayState) -> tuple[float, float]:
-    """Auto/fixed/ROI/segmentation-restricted display range for a frame."""
+def display_scale(
+    data: np.ndarray,
+    state: DisplayState,
+    extrema: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """Auto/fixed/ROI/segmentation-restricted display range for a frame.
+
+    ``extrema`` may carry the frame's already-known (min, max) — for example
+    from the FramePacket — so dynamic scaling does not scan the frame again.
+    """
     if state.range_mode == "fixed":
         return display_range(data, state.fixed_min, state.fixed_max)
     if state.range_mode == "roi" and state.roi_minmax is not None:
@@ -285,6 +353,8 @@ def display_scale(data: np.ndarray, state: DisplayState) -> tuple[float, float]:
         valid = data[np.isfinite(data) & (data >= low) & (data <= high)]
         if valid.size:
             return display_range(valid)
+    if extrema is not None:
+        return _sanitize_range(float(extrema[0]), float(extrema[1]))
     return display_range(data)
 
 
@@ -292,19 +362,26 @@ def render_frame_rgb(
     data: np.ndarray,
     state: DisplayState,
     clip_mask: np.ndarray | None = None,
+    extrema: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    """Full display pipeline: palette/PE → overlays → flips. Returns (rgb, low, high)."""
-    low, high = display_scale(data, state)
+    """Full display pipeline: palette/PE → overlays → flips. Returns (rgb, low, high).
+
+    ``extrema`` forwards the frame's known (min, max) to display_scale so
+    dynamic scaling skips a redundant full-frame scan.
+    """
+    low, high = display_scale(data, state, extrema)
     rgb = render_rgb(data, state.palette, low, high, pe=state.pe, invert=state.inverted)
+    # rgb is freshly created above, so every enabled overlay paints it in place
+    # instead of copying the whole image once per overlay.
     seg_on, seg_min, seg_max = state.segmentation
     if seg_on:
         below, above = segmentation_overlays(data, seg_min, seg_max)
-        rgb = apply_segmentation_overlay(rgb, below, above)
+        _paint_segmentation_overlay(rgb, below, above)
     iso_mode, iso_l1, iso_l2 = state.isotherm
     if iso_mode != "off":
-        rgb = apply_isotherm_overlay(rgb, data, iso_mode, iso_l1, iso_l2)
+        _paint_isotherm_overlay(rgb, data, iso_mode, iso_l1, iso_l2)
     if state.clipping:
-        rgb = apply_clip_overlay(rgb, clip_mask)
+        _paint_clip_overlay(rgb, clip_mask)
     if state.flip_h:
         rgb = np.fliplr(rgb)
     if state.flip_v:

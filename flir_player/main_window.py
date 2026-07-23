@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+import os
+import sys
+from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +42,8 @@ from .export_dialogs import (
 )
 from .extract import ExtractDialog
 from .models import FramePacket, RoiShape, UnitOption, VideoMetadata
-from .plots import TemporalPlotPanel, line_profile_values, roi_values
+from .plots import line_profile_values, roi_values
+from .processing import median_max_size
 from .render import (
     CUSTOM_PALETTE_STOPS,
     DisplayState,
@@ -80,6 +84,11 @@ ROI_KIND_LABELS = {"rect": "Box", "ellipse": "Ellipse", "line": "Line", "cursor"
 
 RECENT_FILES_LIMIT = 8
 
+# Bounded temporal history per ROI (~11 minutes at 30 fps): compact
+# (seconds, mean, min, max, std) tuples; oldest half dropped when exceeded.
+TEMPORAL_POINT_CAP = 20000
+_TEMPORAL_STAT_INDEX = {"Mean": 1, "Min": 2, "Max": 3, "Std Dev": 4}
+
 
 def _file_dialog_filter() -> str:
     patterns = " ".join(
@@ -110,9 +119,14 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._request_sequence = 0
         self._active_request_id = 0
-        self._playback_waiting = False
-        self._pending_playback_packet: FramePacket | None = None
+        self._playback_outstanding = False  # a playback frame request is in flight
+        self._ready: deque[FramePacket] = deque()  # due-order presentation queue
+        self._latest_decoded: FramePacket | None = None  # newest playback arrival
         self._restart_after_seek = False
+        # playback counters, printed ~1/s to stderr when FLIR_PERF_DEBUG is set
+        self._perf_debug = bool(os.environ.get("FLIR_PERF_DEBUG"))
+        self._perf = {"presented": 0, "dropped": 0, "skipped": 0}
+        self._perf_clock = QElapsedTimer()
         self._focus_mode = False
         self._rois: list[RoiShape] = []
         self._roi_next_id = 1
@@ -140,19 +154,21 @@ class MainWindow(QMainWindow):
         )
         self._play_range: tuple[int, int] | None = None
         self._wrap_pending = False
+        self._end_pending = False  # decode reached range end; terminal packet still queued
         self._filters_state: dict = {
             "point": ("none", 1.0),
             "spatial": ("none", 3),
             "temporal": ("none", 5),
         }
         self._reference_params: dict | None = None
-        self._temporal: dict[int, list] = {}
+        self._temporal: dict[int, dict[int, tuple[float, object]]] = {}
         self._plot_clock = QElapsedTimer()
+        self._stats_clock = QElapsedTimer()
         self._last_plot_tab = None
 
         self._playback_timer = QTimer(self)
         self._playback_timer.setSingleShot(True)
-        self._playback_timer.timeout.connect(self._present_pending_playback)
+        self._playback_timer.timeout.connect(self._present_due)
         self._playback_clock = QElapsedTimer()
         self._playback_anchor_timestamp: datetime | None = None
         self._playback_anchor_index = 0
@@ -289,9 +305,7 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.zoom_fit_requested.connect(self.canvas.set_zoom_fit)
         self.bottom_panel.close_requested.connect(lambda: self._toggle_statistics(False))
         self.bottom_panel.statistics.save_requested.connect(self._save_statistics)
-        self.bottom_panel.tabs.currentChanged.connect(
-            lambda _index: self._update_plots(self.current_packet)
-        )
+        self.bottom_panel.tabs.currentChanged.connect(self._on_tab_changed)
         self.bottom_panel.temporal.clear_button.clicked.connect(self._clear_temporal)
         self.bottom_panel.temporal.stat_combo.currentIndexChanged.connect(
             lambda _index: self._update_plots(self.current_packet, force=True)
@@ -423,10 +437,13 @@ class MainWindow(QMainWindow):
         if self.playing:
             self.pause_playback(invalidate=True)
             return
-        _start, end = self._playback_bounds()
+        start, end = self._playback_bounds()
         if self.current_packet.index >= end:
-            self._restart_after_seek = True
-            self.seek_to(self._playback_bounds()[0])
+            if start < end:
+                self._restart_after_seek = True
+                self.seek_to(start)
+            # degenerate (single-frame) range: nothing to play; seeking to the
+            # start would re-trigger this branch and spin a tight request loop
             return
         self._begin_playback()
 
@@ -438,15 +455,19 @@ class MainWindow(QMainWindow):
         self._playback_anchor_timestamp = self.current_packet.timestamp
         self._playback_anchor_index = self.current_packet.index
         self._playback_clock.start()
-        self._request_next_playback_frame()
+        self._perf_clock.start()
+        self._latest_decoded = self.current_packet
+        self._request_next_playback_frame(self.current_packet)
 
     def pause_playback(self, invalidate: bool = False) -> None:
         self.playing = False
         self.transport.set_playing(False)
         self._playback_timer.stop()
-        self._playback_waiting = False
-        self._pending_playback_packet = None
+        self._playback_outstanding = False
+        self._latest_decoded = None
+        self._ready.clear()
         self._wrap_pending = False
+        self._end_pending = False
         if invalidate:
             self._active_request_id = self._next_request_id()
 
@@ -463,6 +484,12 @@ class MainWindow(QMainWindow):
 
     def _play_range_changed(self, start: int, end: int) -> None:
         self._play_range = (min(start, end), max(start, end))
+        if self._end_pending:
+            # the range was edited after decode reached the old end; resume
+            # requesting so a grown range keeps playing (a shrunk range simply
+            # re-arms the end-pending state on the next request attempt)
+            self._end_pending = False
+            self._maybe_request_next()
 
     def _playback_bounds(self) -> tuple[int, int]:
         last = max(0, (self.metadata.num_frames - 1) if self.metadata else 0)
@@ -491,8 +518,13 @@ class MainWindow(QMainWindow):
         """Loop: jump back to the range start and keep playing."""
         self._wrap_pending = True
         request_id = self._activate_request()
-        self._playback_waiting = True
-        self.decoder.request_frame(start, request_id)
+        self._playback_outstanding = True
+        self.decoder.request_frame(
+            start,
+            request_id,
+            need_clip=self.show_clipping,
+            need_metadata=self._metadata_tab_active(),
+        )
 
     def step_frames(self, delta: int) -> None:
         if self.current_packet is None:
@@ -507,7 +539,12 @@ class MainWindow(QMainWindow):
         self._restart_after_seek = restart
         bounded = max(0, min(int(index), self.metadata.num_frames - 1))
         request_id = self._activate_request()
-        self.decoder.request_frame(bounded, request_id)
+        self.decoder.request_frame(
+            bounded,
+            request_id,
+            need_clip=self.show_clipping,
+            need_metadata=self._metadata_tab_active(),
+        )
 
     def _seek_to_end(self) -> None:
         if self.metadata is not None:
@@ -617,24 +654,67 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.stats_button.setChecked(show)
         self.analysis_toolbar.stats_button.blockSignals(False)
         if show:
-            self._update_statistics()
+            self._update_statistics(force=True)
+            # Reopening the panel is not a tab change, so the tab-changed
+            # hook never fires — fetch any payload the visible tab needs.
+            self._ensure_current_payload()
 
-    def _update_statistics(self) -> None:
+    def _update_statistics(self, force: bool = False) -> None:
         packet = self.current_packet
         if packet is None or not self.bottom_panel.isVisible():
             return
-        image_stats = (
-            packet.minimum,
-            packet.maximum,
-            packet.mean,
-            packet.std_dev,
-            packet.num_pixels,
+        # Tables rebuild Qt items cell by cell, so only the visible tab is
+        # refreshed, throttled to ~5 Hz during playback (immediate on pause,
+        # seek, or when a tab becomes visible).
+        due = (
+            not self.playing
+            or not self._stats_clock.isValid()
+            or self._stats_clock.elapsed() >= 200
         )
-        self.bottom_panel.statistics.set_statistics(
-            packet.roi_stats, image_stats, packet.unit.suffix
-        )
-        self.bottom_panel.metadata.set_entries(packet.metadata_entries)
+        if force or due:
+            self._stats_clock.restart()
+            current = self.bottom_panel.tabs.currentWidget()
+            if current is self.bottom_panel.statistics:
+                image_stats = (
+                    packet.minimum,
+                    packet.maximum,
+                    packet.mean,
+                    packet.std_dev,
+                    packet.num_pixels,
+                )
+                self.bottom_panel.statistics.set_statistics(
+                    packet.roi_stats, image_stats, packet.unit.suffix
+                )
+            elif current is self.bottom_panel.metadata:
+                self.bottom_panel.metadata.set_entries(packet.metadata_entries)
         self._update_plots(packet)
+
+    def _metadata_tab_active(self) -> bool:
+        return (
+            self.bottom_panel.isVisible()
+            and self.bottom_panel.tabs.currentWidget() is self.bottom_panel.metadata
+        )
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._update_statistics(force=True)
+        self._ensure_current_payload()
+
+    def _ensure_current_payload(self) -> None:
+        """Refetch the current frame when the visible tab needs a payload the
+        packet was decoded without (metadata is skipped for lean interactive
+        decodes while the Metadata tab is hidden)."""
+        if (
+            self._metadata_tab_active()
+            and self.current_packet is not None
+            and not self.current_packet.metadata_loaded
+        ):
+            request_id = self._activate_request()
+            self.decoder.request_frame(
+                self.current_packet.index,
+                request_id,
+                need_clip=self.show_clipping,
+                need_metadata=True,
+            )
 
     # --- analysis plots --------------------------------------------------------
 
@@ -648,7 +728,20 @@ class MainWindow(QMainWindow):
         if accumulate:
             seconds = frame_seconds(packet.timestamp, self.metadata, packet.index)
             for stats in packet.roi_stats:
-                self._temporal.setdefault(stats.id, []).append((seconds, stats))
+                # Keyed by frame index (dedupe); compact tuples, bounded count.
+                history = self._temporal.setdefault(stats.id, {})
+                if len(history) > TEMPORAL_POINT_CAP:
+                    # drop the oldest ~half (insertion order) to bound memory
+                    trim = len(history) - TEMPORAL_POINT_CAP // 2
+                    for old_key in list(history)[:trim]:
+                        del history[old_key]
+                history[packet.index] = (
+                    seconds,
+                    stats.mean,
+                    stats.minimum,
+                    stats.maximum,
+                    stats.std_dev,
+                )
             live_ids = {stats.id for stats in packet.roi_stats}
             for stale in [roi_id for roi_id in self._temporal if roi_id not in live_ids]:
                 del self._temporal[stale]
@@ -681,18 +774,25 @@ class MainWindow(QMainWindow):
                 panels.histogram.set_values(packet.data, "Whole image", suffix)
         elif current is panels.temporal:
             stat_label = panels.temporal.statistic_label
-            attr = dict(TemporalPlotPanel.STATISTICS)[stat_label]
+            attr_index = _TEMPORAL_STAT_INDEX[stat_label]
             series = []
             for shape in self._rois:
                 points = self._temporal.get(shape.id)
                 if not points:
                     continue
+                ordered = [points[key] for key in sorted(points)]
                 series.append(
                     (
                         shape.name,
                         ROI_COLORS[shape.id % len(ROI_COLORS)],
-                        np.array([point[0] for point in points]),
-                        np.array([float(getattr(point[1], attr)) for point in points]),
+                        np.fromiter(
+                            (point[0] for point in ordered), float, len(ordered)
+                        ),
+                        np.fromiter(
+                            (point[attr_index] for point in ordered),
+                            float,
+                            len(ordered),
+                        ),
                     )
                 )
             panels.temporal.set_series(series, stat_label, suffix)
@@ -754,7 +854,9 @@ class MainWindow(QMainWindow):
     def _export_still(self, params: dict) -> None:
         packet = self.current_packet
         state = self._display_state(packet)
-        rgb, low, high = render_frame_rgb(packet.data, state, packet.clip_mask)
+        rgb, low, high = render_frame_rgb(
+            packet.data, state, packet.clip_mask, extrema=(packet.minimum, packet.maximum)
+        )
         options = params["options"]
         label = frame_burn_label(packet, self.metadata) if options.timestamp else ""
         composed = compose_frame(
@@ -984,13 +1086,34 @@ class MainWindow(QMainWindow):
         )
 
     def _current_scale(self, packet: FramePacket) -> tuple[float, float]:
-        return display_scale(packet.data, self._display_state(packet))
+        return display_scale(
+            packet.data,
+            self._display_state(packet),
+            extrema=(packet.minimum, packet.maximum),
+        )
 
     def _change_overlays(self, clipping: bool, markers: bool) -> None:
+        clipping_changed = clipping != self.show_clipping
         self.show_clipping = clipping
         self.show_markers = markers
         self.canvas.set_overlay_options(markers)
-        self._render_current_frame()
+        if clipping and clipping_changed and self.current_packet is not None:
+            if self.current_packet.clip_mask is None and not self.playing:
+                # This packet was decoded while clipping was off and has no
+                # mask; refetch the current frame with one.
+                request_id = self._activate_request()
+                self.decoder.request_frame(
+                    self.current_packet.index,
+                    request_id,
+                    need_clip=True,
+                    need_metadata=self._metadata_tab_active(),
+                )
+                return
+            # playing: the next decoded frame carries the mask again
+        if clipping_changed:
+            self._render_current_frame()
+        # markers are painted by the canvas; toggling them alone needs no
+        # RGB rerender.
 
     def _change_flips(self, flip_h: bool, flip_v: bool) -> None:
         self.flip_h = flip_h
@@ -1104,28 +1227,145 @@ class MainWindow(QMainWindow):
         if was_playing:
             self._begin_playback()
 
-    def _request_next_playback_frame(self) -> None:
-        if not self.playing or self.metadata is None or self.current_packet is None:
+    def _request_next_playback_frame(self, after: FramePacket) -> None:
+        """Request the next frame to decode (issued on arrival, not after
+        presentation, so decode overlaps the presentation wait)."""
+        if not self.playing or self.metadata is None:
             return
-        next_index = self.current_packet.index + 1
         start, end = self._playback_bounds()
+        next_index = self._skip_ahead_index(after, end)
         if next_index > end:
-            if self.loop_playback:
-                self._wrap_playback(start)
-            else:
-                self.pause_playback(invalidate=False)
+            # Decode reached the range end. Do not pause/wrap here: the
+            # terminal packet is still queued and must be presented first
+            # (otherwise the range's last frame is never shown).
+            self._end_pending = True
+            self._finish_range_end_if_done()
             return
         request_id = self._activate_request()
-        self._playback_waiting = True
-        self.decoder.request_frame(next_index, request_id)
+        self._playback_outstanding = True
+        self.decoder.request_frame(
+            next_index,
+            request_id,
+            need_clip=self.show_clipping,
+            need_metadata=self._metadata_tab_active(),
+        )
 
-    def _present_pending_playback(self) -> None:
-        packet = self._pending_playback_packet
-        self._pending_playback_packet = None
-        if not self.playing or packet is None:
+    def _finish_range_end_if_done(self) -> bool:
+        """Pause/wrap once *presentation* has reached the decoded range end.
+
+        Waits while the terminal packet is still queued or not yet presented;
+        resolves immediately when the end frame is already on screen (e.g.
+        resuming playback exactly at the range end). Loop wraps are issued
+        only here, so the wrapped start arrives to an empty queue and the
+        anchor reset never mixes laps. Returns True when playback was paused
+        or a wrap was issued.
+        """
+        if not self._end_pending:
+            return False
+        start, end = self._playback_bounds()
+        if any(packet.index >= end for packet in self._ready):
+            return False
+        if self.current_packet is None or self.current_packet.index < end:
+            return False
+        self._end_pending = False
+        if self.loop_playback:
+            self._wrap_playback(start)
+        else:
+            self.pause_playback()
+        return True
+
+    def _skip_ahead_index(self, after: FramePacket, end: int) -> int:
+        """Next decode index: +1 normally; media-clock catch-up when late.
+
+        Decode skipping is disabled while a temporal filter is active — those
+        accumulate state from every decoded frame, so only presentation may
+        drop. A single jump is capped at one second of media time.
+        """
+        next_index = after.index + 1
+        if next_index > end or self._wrap_pending:
+            return next_index
+        temporal_active = self._filters_state.get("temporal", ("none", 5))[0] != "none"
+        fps = self.metadata.nominal_fps if self.metadata and self.metadata.nominal_fps > 0 else 30.0
+        if temporal_active or self.playback_speed <= 0:
+            return next_index
+        now = self._playback_clock.elapsed() / 1000.0
+        target = self._playback_target_seconds(after) / self.playback_speed
+        if now - target <= 1.0 / fps / self.playback_speed:
+            return next_index
+        frames_behind = int((now * self.playback_speed - self._playback_target_seconds(after)) * fps)
+        expected = after.index + max(frames_behind, 1)
+        expected = min(expected, after.index + max(1, int(fps)))
+        skipped = max(0, min(expected, end) - after.index - 1)
+        self._perf["skipped"] += skipped
+        return min(expected, end)
+
+    def _maybe_request_next(self) -> None:
+        """Issue the next decode request, bounded by a media-time horizon.
+
+        Decode-ahead overlaps the presentation wait, but is capped at ~2 frame
+        intervals ahead of the media clock; otherwise the decode chain would
+        free-run at SDK speed and presentation dues would race into the
+        future. When playback falls behind, the horizon is negative and the
+        request fires immediately (catch-up; `_skip_ahead_index` may jump).
+        """
+        if not self.playing or self.metadata is None or self._playback_outstanding:
             return
+        if self._end_pending:
+            return  # nothing left to decode past the range end
+        latest = self._latest_decoded
+        if latest is None:
+            return
+        fps = self.metadata.nominal_fps if self.metadata.nominal_fps > 0 else 30.0
+        horizon = 1.5 / fps / self.playback_speed
+        due = self._playback_target_seconds(latest) / self.playback_speed
+        if due - self._playback_clock.elapsed() / 1000.0 > horizon:
+            return
+        self._request_next_playback_frame(latest)
+
+    def _arm_presentation_timer(self) -> None:
+        if not self._ready:
+            return
+        packet = self._ready[0]
+        target = self._playback_target_seconds(packet) / self.playback_speed
+        delay = max(0.0, target - self._playback_clock.elapsed() / 1000.0)
+        self._playback_timer.start(max(0, int(round(delay * 1000.0))))
+
+    def _present_due(self) -> None:
+        """Present the newest due packet; drop superseded ones."""
+        if not self.playing or not self._ready:
+            return
+        now = self._playback_clock.elapsed() / 1000.0
+        newest_due = -1
+        for position, packet in enumerate(self._ready):
+            due = self._playback_target_seconds(packet) / self.playback_speed
+            if due <= now + 0.0005:
+                newest_due = position
+        if newest_due < 0:
+            self._maybe_request_next()
+            self._arm_presentation_timer()
+            return
+        for _ in range(newest_due):
+            self._ready.popleft()
+            self._perf["dropped"] += 1
+        packet = self._ready.popleft()
+        lateness = now - self._playback_target_seconds(packet) / self.playback_speed
         self._present_packet(packet)
-        self._request_next_playback_frame()
+        self._perf["presented"] += 1
+        if self._perf_debug and self._perf_clock.elapsed() >= 1000:
+            elapsed = self._perf_clock.elapsed() / 1000.0
+            print(
+                f"[perf] presented {self._perf['presented'] / elapsed:.1f} fps, "
+                f"dropped {self._perf['dropped']}, skipped {self._perf['skipped']}, "
+                f"lateness {lateness * 1000.0:.1f} ms",
+                file=sys.stderr,
+            )
+            self._perf = {"presented": 0, "dropped": 0, "skipped": 0}
+            self._perf_clock.restart()
+        if self._finish_range_end_if_done():
+            return
+        self._maybe_request_next()
+        if self._ready:
+            self._arm_presentation_timer()
 
     def _on_opened(
         self,
@@ -1143,6 +1383,9 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)
         self.transport.set_video(metadata.num_frames, metadata.duration_seconds)
+        self.inspector.set_median_size_cap(
+            median_max_size(metadata.width * metadata.height)
+        )
         self.fixed_minimum = packet.minimum
         self.fixed_maximum = packet.maximum
         self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
@@ -1151,29 +1394,50 @@ class MainWindow(QMainWindow):
     def _on_frame_ready(self, packet: FramePacket) -> None:
         if packet.request_id != self._active_request_id:
             return
-        if self.playing and self._playback_waiting and self.current_packet is not None:
-            self._playback_waiting = False
-            wrapped = self._wrap_pending
-            if wrapped:
+        if self.playing and self.current_packet is not None:
+            if self._wrap_pending:
                 self._wrap_pending = False
-                self._playback_anchor_timestamp = packet.timestamp
-                self._playback_anchor_index = packet.index
-                self._playback_clock.restart()
-            target_seconds = self._playback_target_seconds(packet) / self.playback_speed
-            wall_seconds = self._playback_clock.elapsed() / 1000.0
-            delay = max(0.0, target_seconds - wall_seconds)
-            if wrapped and self.metadata is not None:
-                # keep at least one nominal frame interval between loop wraps so a
-                # degenerate (single-frame) range cannot spin a tight request loop
-                interval = 1.0 / max(1.0, self.metadata.nominal_fps)
-                delay = max(delay, interval / self.playback_speed)
-            self._pending_playback_packet = packet
-            self._playback_timer.start(max(0, int(round(delay * 1000.0))))
+                self._anchor_after_wrap(packet)
+            if len(self._ready) >= 4:
+                # genuine overload only: the 1.5-interval decode horizon keeps
+                # the queue at ~2 packets in steady state, so reaching the cap
+                # means presentation is behind and superseded packets may go
+                self._ready.popleft()
+                self._perf["dropped"] += 1
+            self._ready.append(packet)
+            if not self._playback_timer.isActive():
+                self._arm_presentation_timer()
+            if self._playback_outstanding:
+                self._playback_outstanding = False
+            self._latest_decoded = packet
+            self._maybe_request_next()
             return
         self._present_packet(packet)
         if self._restart_after_seek:
             self._restart_after_seek = False
             QTimer.singleShot(0, self.toggle_playback)
+
+    def _anchor_after_wrap(self, packet: FramePacket) -> None:
+        """Anchor the wrapped lap to the running media clock.
+
+        The new lap's first frame is due one nominal interval after the
+        previous lap's terminal frame, so the cadence continues across the
+        wrap and no anti-spin hold (or stale-lap queue) is needed. The clock
+        is NOT restarted: dues are media seconds in one continuous space.
+        """
+        fps = (
+            self.metadata.nominal_fps
+            if self.metadata and self.metadata.nominal_fps > 0
+            else 30.0
+        )
+        base = 0.0
+        if self.current_packet is not None:
+            base = self._playback_target_seconds(self.current_packet) + 1.0 / fps
+        if packet.timestamp is not None:
+            self._playback_anchor_timestamp = packet.timestamp - timedelta(seconds=base)
+        else:
+            self._playback_anchor_timestamp = None
+        self._playback_anchor_index = packet.index - base * fps
 
     def _on_unit_ready(self, option: UnitOption, packet: FramePacket) -> None:
         if packet.request_id != self._active_request_id:
@@ -1193,7 +1457,10 @@ class MainWindow(QMainWindow):
             return
         packet = self.current_packet
         rgb, low, high = render_frame_rgb(
-            packet.data, self._display_state(packet), packet.clip_mask
+            packet.data,
+            self._display_state(packet),
+            packet.clip_mask,
+            extrema=(packet.minimum, packet.maximum),
         )
         self.canvas.set_frame(rgb, packet.data, packet.unit.suffix)
         self.canvas.set_overlay_data(

@@ -96,11 +96,13 @@ def test_source_and_metadata_tabs(qapp) -> None:
         keys = [source_table.item(row, 0).text() for row in range(source_table.rowCount())]
         assert "Camera model" in keys
 
-        # metadata tab follows the current frame
+        # metadata tab follows the current frame (populated on demand once visible)
         window._toggle_statistics(True)
         window.seek_to(10)
         assert wait_until(qapp, lambda: window.current_packet.index == 10)
+        window.bottom_panel.tabs.setCurrentWidget(window.bottom_panel.metadata)
         metadata_table = window.bottom_panel.metadata.table
+        assert wait_until(qapp, lambda: metadata_table.rowCount() > 0)
         entries = {
             metadata_table.item(row, 0).text(): metadata_table.item(row, 1).text()
             for row in range(metadata_table.rowCount())
