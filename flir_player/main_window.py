@@ -152,6 +152,15 @@ class MainWindow(QMainWindow):
                 "playback/loop", False, type=bool
             )
         )
+        # Pace presentation on frame index x nominal rate instead of on each
+        # frame's recorded timestamp. Off by default: timestamp pacing is true
+        # to capture, and recordings with dropped frames should look uneven
+        # unless the user asks otherwise.
+        self.constant_rate = bool(
+            QSettings("Local", "FLIR Thermal Player").value(
+                "playback/constant_rate", False, type=bool
+            )
+        )
         self._play_range: tuple[int, int] | None = None
         self._wrap_pending = False
         self._end_pending = False  # decode reached range end; terminal packet still queued
@@ -184,6 +193,7 @@ class MainWindow(QMainWindow):
         self._connect_ui()
         self._install_shortcuts()
         self.transport.set_loop(self.loop_playback)
+        self.transport.set_constant_rate(self.constant_rate)
 
         self.decoder = DecoderThread(self)
         self.decoder.opened.connect(self._on_opened)
@@ -315,6 +325,7 @@ class MainWindow(QMainWindow):
         self.transport.scrub_preview.connect(self._preview_scrub)
         self.transport.speed_changed.connect(self._change_speed)
         self.transport.loop_toggled.connect(self._change_loop)
+        self.transport.constant_rate_toggled.connect(self._change_constant_rate)
         self.transport.slider.range_changed.connect(self._play_range_changed)
         self.transport.fullscreen_requested.connect(self.toggle_focus_mode)
 
@@ -335,6 +346,7 @@ class MainWindow(QMainWindow):
             (QKeySequence("O"), self._mark_range_end),
             (QKeySequence("X"), self._clear_play_range),
             (QKeySequence("L"), self._toggle_loop_shortcut),
+            (QKeySequence("R"), self._toggle_constant_rate_shortcut),
             (QKeySequence("+"), lambda: self.canvas.zoom_step(1)),
             (QKeySequence("="), lambda: self.canvas.zoom_step(1)),
             (QKeySequence("-"), lambda: self.canvas.zoom_step(-1)),
@@ -481,6 +493,29 @@ class MainWindow(QMainWindow):
 
     def _toggle_loop_shortcut(self) -> None:
         self.transport.loop_button.toggle()
+
+    def _change_constant_rate(self, constant: bool) -> None:
+        """Switch between timestamp pacing and even index pacing.
+
+        Both modes measure dues against the same media clock, but from
+        different origins, so a live switch re-anchors (as a speed change does)
+        rather than reinterpreting an anchor taken under the other mode.
+        """
+        constant = bool(constant)
+        if constant == self.constant_rate:
+            return
+        was_playing = self.playing
+        if was_playing:
+            self.pause_playback(invalidate=True)
+        self.constant_rate = constant
+        QSettings("Local", "FLIR Thermal Player").setValue(
+            "playback/constant_rate", self.constant_rate
+        )
+        if was_playing:
+            self._begin_playback()
+
+    def _toggle_constant_rate_shortcut(self) -> None:
+        self.transport.constant_rate_button.toggle()
 
     def _play_range_changed(self, start: int, end: int) -> None:
         self._play_range = (min(start, end), max(start, end))
@@ -1382,6 +1417,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)
+        self.transport.set_cadence(metadata.cadence)
         self.transport.set_video(metadata.num_frames, metadata.duration_seconds)
         self.inspector.set_median_size_cap(
             median_max_size(metadata.width * metadata.height)
@@ -1497,7 +1533,11 @@ class MainWindow(QMainWindow):
         return 1.0 / 30.0
 
     def _playback_target_seconds(self, packet: FramePacket) -> float:
-        if self._playback_anchor_timestamp is not None and packet.timestamp is not None:
+        if (
+            not self.constant_rate
+            and self._playback_anchor_timestamp is not None
+            and packet.timestamp is not None
+        ):
             try:
                 delta = (packet.timestamp - self._playback_anchor_timestamp).total_seconds()
                 if delta >= 0:

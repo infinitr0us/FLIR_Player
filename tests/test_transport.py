@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -178,5 +180,103 @@ def test_loop_setting_persists(qapp, loop_setting_preserved) -> None:
             "playback/loop", False, type=bool
         )
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+# --- constant-rate playback --------------------------------------------------------
+
+
+@pytest.fixture()
+def rate_setting_preserved():
+    settings = QSettings("Local", "FLIR Thermal Player")
+    previous = settings.value("playback/constant_rate", False, type=bool)
+    settings.setValue("playback/constant_rate", False)  # deterministic starting state
+    yield
+    settings.setValue("playback/constant_rate", previous)
+
+
+def test_constant_rate_paces_on_index_not_timestamps(qapp, rate_setting_preserved) -> None:
+    """Constant rate must ignore recorded timestamps entirely.
+
+    Built with a packet whose timestamp disagrees with its index so the two
+    pacing modes cannot coincide: timestamp pacing owes 5 s, index pacing owes
+    index / nominal_fps.
+    """
+    window = _loaded_window(qapp)
+    try:
+        fps = window.metadata.nominal_fps
+        anchor = window.current_packet
+        assert anchor.timestamp is not None
+        window._playback_anchor_timestamp = anchor.timestamp
+        window._playback_anchor_index = anchor.index
+        packet = replace(
+            anchor,
+            index=anchor.index + 30,
+            timestamp=anchor.timestamp + timedelta(seconds=5.0),
+        )
+
+        window.constant_rate = False
+        assert window._playback_target_seconds(packet) == pytest.approx(5.0)
+
+        window.constant_rate = True
+        assert window._playback_target_seconds(packet) == pytest.approx(30.0 / fps)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_constant_rate_falls_back_when_timestamps_are_missing(qapp, rate_setting_preserved) -> None:
+    """Timestamp pacing already degrades to index pacing; both must agree there."""
+    window = _loaded_window(qapp)
+    try:
+        fps = window.metadata.nominal_fps
+        anchor = window.current_packet
+        window._playback_anchor_timestamp = anchor.timestamp
+        window._playback_anchor_index = anchor.index
+        packet = replace(anchor, index=anchor.index + 12, timestamp=None)
+        expected = pytest.approx(12.0 / fps)
+        assert window._playback_target_seconds(packet) == expected
+        window.constant_rate = True
+        assert window._playback_target_seconds(packet) == expected
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_constant_rate_toggle_persists_and_reanchors(qapp, rate_setting_preserved) -> None:
+    window = _loaded_window(qapp)
+    try:
+        assert not window.constant_rate
+        window.transport.constant_rate_button.setChecked(True)
+        assert window.constant_rate
+        assert QSettings("Local", "FLIR Thermal Player").value(
+            "playback/constant_rate", False, type=bool
+        )
+        # a live switch keeps playing rather than dropping out of playback
+        window.toggle_playback()
+        assert window.playing
+        window.transport.constant_rate_button.setChecked(False)
+        assert not window.constant_rate
+        assert window.playing
+        assert window._playback_anchor_index == window.current_packet.index
+        assert wait_until(qapp, lambda: window.current_packet.index > 0)
+    finally:
+        window.pause_playback()
+        window.close()
+        qapp.processEvents()
+
+
+def test_constant_rate_playback_advances_evenly(qapp, rate_setting_preserved) -> None:
+    window = _loaded_window(qapp)
+    try:
+        window._change_constant_rate(True)
+        window.seek_to(0)
+        assert wait_until(qapp, lambda: window.current_packet.index == 0)
+        window.toggle_playback()
+        assert wait_until(qapp, lambda: window.current_packet.index >= 20, timeout=8.0)
+        assert window.playing
+    finally:
+        window.pause_playback()
         window.close()
         qapp.processEvents()

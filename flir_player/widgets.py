@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import ROI_COLORS, UnitOption, VideoMetadata
+from .models import ROI_COLORS, CadenceInfo, UnitOption, VideoMetadata
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
 from .render import format_value, isotherm_color, lut_from_stops, palette_lut, palette_names
 
@@ -3083,7 +3083,17 @@ class TransportBar(QWidget):
     scrub_preview = Signal(int)
     speed_changed = Signal(float)
     loop_toggled = Signal(bool)
+    constant_rate_toggled = Signal(bool)
     fullscreen_requested = Signal()
+
+    _RATE_TOOLTIP = (
+        "Constant-rate playback (R)\n\n"
+        "Off: frames are paced from their recorded timestamps, so a recording "
+        "with dropped frames plays back as unevenly as it was captured.\n"
+        "On: frames are paced evenly at the recording's average rate. Total "
+        "duration is unchanged; the elapsed-time readout still shows recorded "
+        "time, so it jumps across gaps."
+    )
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3156,6 +3166,13 @@ class TransportBar(QWidget):
         self.loop_button.toggled.connect(self.loop_toggled)
         layout.addWidget(self.loop_button)
 
+        self.constant_rate_button = self._transport_button("fa6s.wave-square")
+        self.constant_rate_button.setProperty("small", True)
+        self.constant_rate_button.setToolTip(self._RATE_TOOLTIP)
+        self.constant_rate_button.setCheckable(True)
+        self.constant_rate_button.toggled.connect(self.constant_rate_toggled)
+        layout.addWidget(self.constant_rate_button)
+
         self.fullscreen_button = self._transport_button("fa6s.expand")
         self.fullscreen_button.setProperty("small", True)
         self.fullscreen_button.setToolTip("Full screen (F)")
@@ -3185,6 +3202,7 @@ class TransportBar(QWidget):
             self.slider,
             self.speed_combo,
             self.loop_button,
+            self.constant_rate_button,
             self.fullscreen_button,
         ):
             widget.setEnabled(enabled)
@@ -3193,6 +3211,27 @@ class TransportBar(QWidget):
         self.loop_button.blockSignals(True)
         self.loop_button.setChecked(bool(loop))
         self.loop_button.blockSignals(False)
+
+    def set_constant_rate(self, constant: bool) -> None:
+        self.constant_rate_button.blockSignals(True)
+        self.constant_rate_button.setChecked(bool(constant))
+        self.constant_rate_button.blockSignals(False)
+
+    def set_cadence(self, cadence: CadenceInfo | None) -> None:
+        """Point the rate toggle at the open recording's measured cadence.
+
+        Recordings whose capture grid is intact need no explanation; the ones
+        that dropped frames get the numbers appended to the tooltip, so the
+        control that fixes the symptom also states the cause.
+        """
+        tooltip = self._RATE_TOOLTIP
+        if cadence is not None and not cadence.is_even:
+            tooltip += (
+                f"\n\nThis recording stored {cadence.stored_frames} of "
+                f"{cadence.expected_frames} frames ({cadence.kept_fraction * 100:.1f} %) "
+                f"at {cadence.base_fps:.2f} Hz — its uneven playback is in the file."
+            )
+        self.constant_rate_button.setToolTip(tooltip)
 
     def set_video(self, num_frames: int, duration: float) -> None:
         self.slider.blockSignals(True)

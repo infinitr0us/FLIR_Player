@@ -18,7 +18,14 @@ except ModuleNotFoundError:  # Let this module import without the SDK present.
     _SDK_AVAILABLE = False
 import numpy as np
 
-from .models import FramePacket, RoiShape, RoiStats, UnitOption, VideoMetadata
+from .models import (
+    CadenceInfo,
+    FramePacket,
+    RoiShape,
+    RoiStats,
+    UnitOption,
+    VideoMetadata,
+)
 from .processing import (
     ProcessingState,
     TemporalBuffer,
@@ -112,6 +119,73 @@ def _pretty_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_pretty_value(item) for item in value) + "]"
     return str(value)
+
+
+def _base_frame_rate(im: Any) -> float:
+    """Camera rate of the recording's active preset, or 0.0 when unknown.
+
+    Only presets that are both available and flag ``frame_rate_valid`` are
+    trusted: the SDK leaves a placeholder 1.0/30.0 in ``frame_rate`` otherwise,
+    and a made-up base rate would produce a made-up dropped-frame count.
+    """
+    info = getattr(im, "source_info", None)
+    for preset in getattr(info, "preset_info", ()) or ():
+        if getattr(preset, "available", False) and getattr(preset, "frame_rate_valid", False):
+            try:
+                rate = float(preset.frame_rate)
+            except (TypeError, ValueError):
+                continue
+            if rate > 0:
+                return rate
+    return 0.0
+
+
+def _cadence_info(im: Any, span_seconds: float, stored_frames: int) -> CadenceInfo | None:
+    """Compare stored frames against the capture grid the preset rate implies.
+
+    Derived from metadata already read at open time, so it costs no extra frame
+    decodes — scanning every frame's timestamp would mean a full decode pass
+    (~100 s for the 19302-frame CSQ sample).
+    """
+    base_fps = _base_frame_rate(im)
+    if base_fps <= 0 or span_seconds <= 0 or stored_frames < 2:
+        return None
+    expected = int(round(span_seconds * base_fps)) + 1
+    if expected < stored_frames:
+        # The span implies fewer slots than were stored: the preset rate does
+        # not describe this recording, so there is nothing meaningful to report.
+        return None
+    return CadenceInfo(
+        base_fps=base_fps, expected_frames=expected, stored_frames=stored_frames
+    )
+
+
+def _cadence_rows(cadence: CadenceInfo | None, average_fps: float) -> tuple[tuple[str, str], ...]:
+    """Source-panel rows describing the recording's frame rate and evenness."""
+    rows: list[tuple[str, str]] = []
+    if average_fps > 0:
+        if cadence is not None and not cadence.is_even:
+            rows.append(
+                (
+                    "Frame rate",
+                    f"{average_fps:.2f} fps average · {cadence.base_fps:.2f} Hz camera rate",
+                )
+            )
+        else:
+            rows.append(("Frame rate", f"{average_fps:.2f} fps"))
+    if cadence is None:
+        return tuple(rows)
+    if cadence.is_even:
+        rows.append(("Frame cadence", "Even"))
+    else:
+        rows.append(
+            (
+                "Frame cadence",
+                f"Uneven — {cadence.stored_frames} of {cadence.expected_frames} frames stored "
+                f"({cadence.kept_fraction * 100:.1f} %), {cadence.missing_frames} missing",
+            )
+        )
+    return tuple(rows)
 
 
 def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
@@ -272,6 +346,7 @@ class FlirVideoSource:
             duration = self._duration(first_time, last_time)
             nominal_fps = (last_index / duration) if last_index > 0 and duration > 0 else 30.0
 
+            cadence = _cadence_info(self._im, duration, int(self._im.num_frames))
             source_info = self._im.source_info
             self._metadata = VideoMetadata(
                 path=resolved,
@@ -284,7 +359,9 @@ class FlirVideoSource:
                 nominal_fps=float(nominal_fps),
                 camera_model=str(getattr(source_info, "camera_model", "") or ""),
                 camera_serial=str(getattr(source_info, "camera_serial", "") or ""),
-                source_details=_source_details(self._im),
+                source_details=_cadence_rows(cadence, float(nominal_fps))
+                + _source_details(self._im),
+                cadence=cadence,
             )
             return self._metadata
         except Exception:

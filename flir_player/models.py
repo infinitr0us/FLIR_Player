@@ -31,6 +31,47 @@ ROI_COLORS: tuple[str, ...] = (
 
 
 @dataclass(frozen=True, slots=True)
+class CadenceInfo:
+    """How the stored frames sit on the camera's capture grid.
+
+    ``base_fps`` is the rate the recording's active camera preset reports, so
+    the span between the first and last frame timestamps implies how many
+    frames that rate would have produced (``expected_frames``). A recording
+    holding fewer than that skipped capture grid slots — frames dropped while
+    recording, or decimated during extraction — and its stored timestamps then
+    sit on an uneven grid. Playback paced from those timestamps is faithfully
+    uneven as a result, which is what this record exists to explain.
+
+    Only built when the preset rate is marked valid; ``None`` metadata means
+    "no base rate to compare against", never "cadence is even".
+    """
+
+    base_fps: float
+    expected_frames: int
+    stored_frames: int
+
+    @property
+    def kept_fraction(self) -> float:
+        if self.expected_frames <= 0:
+            return 1.0
+        return min(1.0, self.stored_frames / self.expected_frames)
+
+    @property
+    def missing_frames(self) -> int:
+        return max(0, self.expected_frames - self.stored_frames)
+
+    @property
+    def is_even(self) -> bool:
+        """True when essentially every capture grid slot was stored.
+
+        The 2 % tolerance absorbs rounding in ``expected_frames`` and the odd
+        single dropped frame; the recordings this is meant to flag sit far
+        below it (the measured ATS sample keeps 59.9 %).
+        """
+        return self.kept_fraction >= 0.98
+
+
+@dataclass(frozen=True, slots=True)
 class VideoMetadata:
     """Metadata needed by the player without retaining the SDK object."""
 
@@ -45,6 +86,7 @@ class VideoMetadata:
     camera_model: str = ""
     camera_serial: str = ""
     source_details: tuple[tuple[str, str], ...] = ()
+    cadence: CadenceInfo | None = None
 
     @property
     def filename(self) -> str:

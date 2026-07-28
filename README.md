@@ -11,7 +11,12 @@ all decoding work off the GUI thread.
 
 ## What the new player supports
 
-- Recorded-timestamp playback rather than a hard-coded frame interval.
+- Recorded-timestamp playback rather than a hard-coded frame interval, with an
+  optional constant-rate mode (`R`) for recordings that dropped frames at
+  capture time and would otherwise play back as unevenly as they were recorded.
+- Capture-cadence reporting: the Source tab states the average frame rate and,
+  where the camera's preset rate is known, how many frames of the capture grid
+  the file actually stored.
 - Play, pause, single-frame stepping, timeline scrubbing, and 0.25×–4× speed.
 - Counts, object signal, factory/user temperature (°C, °F, K, °R), and radiance
   modes, driven by the units the file actually supports.
@@ -155,6 +160,7 @@ outside your permitted users or organization.
 | Set play-range start / end | `I` / `O` (drag the markers on the timeline to adjust) |
 | Clear play range | `X` |
 | Loop playback | `L` or the transport repeat button |
+| Constant-rate playback | `R` or the transport square-wave button |
 | Full-screen inspection | `F` or double-click the thermal image |
 | Leave full screen | `Esc` |
 
@@ -168,7 +174,12 @@ touches it — while state changes (unit, parameters, corrections, filters,
 exports) keep strict FIFO order.
 
 Playback uses an absolute media clock anchored to each recording's frame
-timestamps. Decoding runs ahead of presentation through a small bounded
+timestamps, so a recording that dropped frames during capture plays back as
+unevenly as it was recorded — that wobble is in the file, not the player.
+Constant-rate mode (`R`) re-anchors the same clock to frame index × the
+recording's average rate instead, which paces frames evenly and preserves the
+total duration; the elapsed-time readout keeps showing recorded time, so it
+steps across the gaps. Decoding runs ahead of presentation through a small bounded
 queue, so decode, processing, and rendering overlap the presentation wait
 instead of serializing. If the player falls behind, it drops or skips forward
 to stay on the media clock, which keeps the 0.25×–4× speed multipliers
