@@ -20,7 +20,8 @@ GRID = np.arange(100, dtype=float).reshape(10, 10)
 
 def test_line_profile_values_diagonal() -> None:
     distances, values = line_profile_values(GRID, (0.0, 0.0), (9.0, 9.0))
-    assert distances[0] == 0.0 and distances[-1] == len(distances) - 1
+    assert distances[0] == 0.0 and distances[-1] == pytest.approx(np.hypot(9, 9))
+    assert len(values) == 10  # one sample per covered pixel
     assert values[0] == GRID[0, 0]
     assert values[-1] == GRID[9, 9]
 

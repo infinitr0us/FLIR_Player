@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QElapsedTimer, QEvent, QMimeData, QSettings, QTimer, Qt
+from PySide6.QtCore import QElapsedTimer, QEvent, QMimeData, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from .decoder import DecoderThread
+from .analysis import threshold_conversion
+from .jobs import OutputTransaction
 from .compose import compose_frame
 from .export import (
     frame_burn_label,
@@ -41,9 +43,10 @@ from .export_dialogs import (
     ExportSeriesDialog,
 )
 from .extract import ExtractDialog
-from .models import FramePacket, RoiShape, UnitOption, VideoMetadata
+from .settings import app_settings
+from .models import FramePacket, RoiShape, UnitOption, VideoMetadata, StatisticsSnapshot
 from .plots import line_profile_values, roi_values
-from .processing import median_max_size
+from .processing import median_max_size, ProcessingState
 from .render import (
     CUSTOM_PALETTE_STOPS,
     DisplayState,
@@ -81,6 +84,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 ROI_KIND_LABELS = {"rect": "Box", "ellipse": "Ellipse", "line": "Line", "cursor": "Spot"}
+_CLOSING_WINDOWS = set()  # Retain Python owners until their SDK threads finish.
 
 RECENT_FILES_LIMIT = 8
 
@@ -148,7 +152,7 @@ class MainWindow(QMainWindow):
         self.iso_limit2 = 1.0
         self.palette_inverted = False
         self.loop_playback = bool(
-            QSettings("Local", "FLIR Thermal Player").value(
+            app_settings().value(
                 "playback/loop", False, type=bool
             )
         )
@@ -157,7 +161,7 @@ class MainWindow(QMainWindow):
         # to capture, and recordings with dropped frames should look uneven
         # unless the user asks otherwise.
         self.constant_rate = bool(
-            QSettings("Local", "FLIR Thermal Player").value(
+            app_settings().value(
                 "playback/constant_rate", False, type=bool
             )
         )
@@ -372,7 +376,7 @@ class MainWindow(QMainWindow):
     # --- recent files -----------------------------------------------------------
 
     def _recent_files(self) -> list[str]:
-        value = QSettings("Local", "FLIR Thermal Player").value("files/recent", [])
+        value = app_settings().value("files/recent", [])
         if isinstance(value, str):
             value = [value]
         return [str(path) for path in (value or [])]
@@ -383,13 +387,13 @@ class MainWindow(QMainWindow):
         if resolved in recents:
             recents.remove(resolved)
         recents.insert(0, resolved)
-        QSettings("Local", "FLIR Thermal Player").setValue(
+        app_settings().setValue(
             "files/recent", recents[:RECENT_FILES_LIMIT]
         )
         self._refresh_recent_menu()
 
     def _clear_recent_files(self) -> None:
-        QSettings("Local", "FLIR Thermal Player").setValue("files/recent", [])
+        app_settings().setValue("files/recent", [])
         self._refresh_recent_menu()
 
     def _refresh_recent_menu(self) -> None:
@@ -450,9 +454,11 @@ class MainWindow(QMainWindow):
             self.pause_playback(invalidate=True)
             return
         start, end = self._playback_bounds()
-        if self.current_packet.index >= end:
+        if self.current_packet.index < start or self.current_packet.index >= end:
             if start < end:
                 self._restart_after_seek = True
+                self.seek_to(start)
+            elif self.current_packet.index != start:
                 self.seek_to(start)
             # degenerate (single-frame) range: nothing to play; seeking to the
             # start would re-trigger this branch and spin a tight request loop
@@ -487,7 +493,7 @@ class MainWindow(QMainWindow):
 
     def _change_loop(self, loop: bool) -> None:
         self.loop_playback = bool(loop)
-        QSettings("Local", "FLIR Thermal Player").setValue(
+        app_settings().setValue(
             "playback/loop", self.loop_playback
         )
 
@@ -508,7 +514,7 @@ class MainWindow(QMainWindow):
         if was_playing:
             self.pause_playback(invalidate=True)
         self.constant_rate = constant
-        QSettings("Local", "FLIR Thermal Player").setValue(
+        app_settings().setValue(
             "playback/constant_rate", self.constant_rate
         )
         if was_playing:
@@ -518,13 +524,16 @@ class MainWindow(QMainWindow):
         self.transport.constant_rate_button.toggle()
 
     def _play_range_changed(self, start: int, end: int) -> None:
+        previous = self._playback_bounds()
         self._play_range = (min(start, end), max(start, end))
-        if self._end_pending:
-            # the range was edited after decode reached the old end; resume
-            # requesting so a grown range keeps playing (a shrunk range simply
-            # re-arms the end-pending state on the next request attempt)
-            self._end_pending = False
-            self._maybe_request_next()
+        if self.playing:
+            if start <= previous[0] and end >= previous[1]:
+                if self._end_pending:
+                    self._end_pending = False
+                    self._maybe_request_next()
+            else:
+                self.pause_playback(invalidate=True)
+                self.toggle_playback()
 
     def _playback_bounds(self) -> tuple[int, int]:
         last = max(0, (self.metadata.num_frames - 1) if self.metadata else 0)
@@ -604,7 +613,6 @@ class MainWindow(QMainWindow):
         self.pause_playback(invalidate=True)
         request_id = self._activate_request()
         self.decoder.request_unit(key, self.current_packet.index, request_id)
-        self._reload_reference(request_id)
 
     def _apply_object_parameters(self, values: dict | None) -> None:
         if self.current_packet is None or self._busy:
@@ -612,7 +620,6 @@ class MainWindow(QMainWindow):
         self.pause_playback(invalidate=True)
         request_id = self._activate_request()
         self.decoder.request_object_params(values, self.current_packet.index, request_id)
-        self._reload_reference(request_id)
 
     def _reset_object_parameters(self) -> None:
         self._apply_object_parameters(None)
@@ -645,11 +652,15 @@ class MainWindow(QMainWindow):
         self.canvas.set_rois(self._rois, roi_id)
         if self.range_mode == "roi":
             self._render_current_frame()
+        self._update_plots(self.current_packet, force=True, accumulate=False)
 
     def _replace_roi(self, shape: RoiShape) -> None:
         for index, existing in enumerate(self._rois):
             if existing.id == shape.id:
                 self._rois[index] = shape
+                self._temporal.pop(shape.id, None)
+                self.bottom_panel.temporal.setToolTip("History cleared for the edited ROI")
+                self.bottom_panel.temporal.history_note.setText("Edited ROI history cleared")
                 break
         self._push_rois()
 
@@ -668,10 +679,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_rois(self._rois, self._selected_roi_id)
         if self.current_packet is None:
             return
-        if self.playing:
-            request_id = self._active_request_id
-        else:
-            request_id = self._activate_request()
+        self.pause_playback(invalidate=True)
+        request_id = self._activate_request()
         self.decoder.request_rois(tuple(self._rois), self.current_packet.index, request_id)
 
     def _clear_rois(self) -> None:
@@ -718,7 +727,8 @@ class MainWindow(QMainWindow):
                     packet.num_pixels,
                 )
                 self.bottom_panel.statistics.set_statistics(
-                    packet.roi_stats, image_stats, packet.unit.suffix
+                    packet.roi_stats, image_stats, packet.unit.suffix,
+                    StatisticsSnapshot(packet, self.metadata, tuple(self._rois)),
                 )
             elif current is self.bottom_panel.metadata:
                 self.bottom_panel.metadata.set_entries(packet.metadata_entries)
@@ -740,6 +750,7 @@ class MainWindow(QMainWindow):
         decodes while the Metadata tab is hidden)."""
         if (
             self._metadata_tab_active()
+            and not self.playing
             and self.current_packet is not None
             and not self.current_packet.metadata_loaded
         ):
@@ -782,7 +793,7 @@ class MainWindow(QMainWindow):
                 del self._temporal[stale]
 
         current = panels.tabs.currentWidget()
-        due = not self._plot_clock.isValid() or self._plot_clock.elapsed() >= 250
+        due = not self.playing or not self._plot_clock.isValid() or self._plot_clock.elapsed() >= 250
         tab_changed = current is not self._last_plot_tab
         self._last_plot_tab = current
         if not (force or due or tab_changed):
@@ -834,6 +845,7 @@ class MainWindow(QMainWindow):
 
     def _clear_temporal(self) -> None:
         self._temporal.clear()
+        self.bottom_panel.temporal.history_note.setText("History cleared")
         self._update_plots(self.current_packet, force=True, accumulate=False)
 
     # --- extract clip -----------------------------------------------------------
@@ -881,19 +893,21 @@ class MainWindow(QMainWindow):
     def _open_export_image_dialog(self) -> None:
         if self.current_packet is None or self.metadata is None:
             return
-        dialog = ExportImageDialog(self.metadata, self.current_packet.index, self)
+        self.pause_playback(invalidate=True)
+        snapshot = (self.current_packet, self.metadata, self._display_state(self.current_packet), tuple(self._rois))
+        dialog = ExportImageDialog(snapshot[1], snapshot[0].index, self)
         if dialog.exec() != ExportImageDialog.DialogCode.Accepted:
             return
-        self._export_still(dialog.parameters())
+        self._export_still(dialog.parameters(), snapshot)
 
-    def _export_still(self, params: dict) -> None:
-        packet = self.current_packet
-        state = self._display_state(packet)
-        rgb, low, high = render_frame_rgb(
-            packet.data, state, packet.clip_mask, extrema=(packet.minimum, packet.maximum)
+    def _export_still(self, params: dict, snapshot=None) -> None:
+        packet, metadata, state, rois = snapshot or (
+            self.current_packet, self.metadata, self._display_state(self.current_packet), tuple(self._rois))
+        rgb, low, high, mapping = render_frame_rgb(
+            packet.data, state, packet.clip_mask, extrema=(packet.minimum, packet.maximum), return_mapping=True
         )
         options = params["options"]
-        label = frame_burn_label(packet, self.metadata) if options.timestamp else ""
+        label = frame_burn_label(packet, metadata) if options.timestamp else ""
         composed = compose_frame(
             rgb,
             options,
@@ -901,23 +915,24 @@ class MainWindow(QMainWindow):
             inverted=state.inverted,
             scale=(low, high),
             suffix=packet.unit.suffix,
-            rois=tuple(self._rois),
+            rois=rois,
             roi_stats=packet.roi_stats,
             min_position=packet.min_position,
             max_position=packet.max_position,
             label=label,
             flips=(state.flip_h, state.flip_v),
+            mapping=mapping, segmentation=state.segmentation, isotherm=state.isotherm,
         )
         dest = Path(params["dest"])
         try:
-            save_frame(dest, params["fmt"], composed, packet.data, (low, high))
-            if params["stats_sidecar"]:
-                roi_names = [shape.name for shape in self._rois]
-                write_stats_csv(
-                    dest.with_suffix(".csv"),
-                    stats_csv_header(roi_names),
-                    [stats_csv_row(packet, packet.unit.label)],
-                )
+            with OutputTransaction([metadata.path]) as job:
+                frame_path = job.stage(dest)
+                csv_path = job.stage(dest.with_suffix(".csv")) if params["stats_sidecar"] else None
+                save_frame(frame_path, params["fmt"], composed, packet.data, (low, high), packet=packet, source=metadata)
+                if csv_path is not None:
+                    write_stats_csv(csv_path, stats_csv_header([shape.name for shape in rois]),
+                        [stats_csv_row(packet, packet.unit.label, scale=(low, high), fmt=params["fmt"])])
+                job.commit()
             self.title_bar.export_button.setToolTip(f"Saved {dest.name}")
         except Exception as exc:
             self._show_error("Export failed", f"{type(exc).__name__}: {exc}")
@@ -976,6 +991,7 @@ class MainWindow(QMainWindow):
         params["rois"] = tuple(self._rois)
         params["suffix"] = packet.unit.suffix
         params["unit_label"] = packet.unit.label
+        params["revision"] = packet.revision
         return params
 
     def _start_export(self, params: dict, title: str) -> None:
@@ -1014,12 +1030,14 @@ class MainWindow(QMainWindow):
             self._show_error("Export failed", message)
 
     def _save_statistics(self) -> None:
-        packet = self.current_packet
-        if packet is None or self.metadata is None:
+        snapshot = self.bottom_panel.statistics.snapshot
+        if snapshot is None:
             return
+        packet, metadata = snapshot.packet, snapshot.metadata
+        rows = self.bottom_panel.statistics.to_rows()
         default_name = (
-            self.metadata.path.parent
-            / f"{self.metadata.path.stem}_frame_{packet.index + 1:05d}_stats.csv"
+            metadata.path.parent
+            / f"{metadata.path.stem}_frame_{packet.index + 1:05d}_stats.csv"
         )
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1033,13 +1051,18 @@ class MainWindow(QMainWindow):
         if output.suffix.lower() != ".csv":
             output = output.with_suffix(".csv")
         try:
-            with output.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["Source", self.metadata.filename])
-                writer.writerow(["Frame", f"{packet.index + 1} / {self.metadata.num_frames}"])
-                writer.writerow(["Unit", packet.unit.label])
-                writer.writerow([])
-                writer.writerows(self.bottom_panel.statistics.to_rows())
+            with OutputTransaction([metadata.path]) as job:
+                with job.stage(output).open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["Source", str(metadata.path)])
+                    writer.writerow(["Frame", f"{packet.index + 1} / {metadata.num_frames}"])
+                    writer.writerow(["Unit", packet.unit.label])
+                    writer.writerow(["Timestamp", packet.timestamp.isoformat() if packet.timestamp else ""])
+                    writer.writerow(["Analysis revision", packet.revision])
+                    writer.writerow(["ROIs", repr(snapshot.rois)])
+                    writer.writerow([])
+                    writer.writerows(rows)
+                job.commit()
             self.title_bar.export_button.setToolTip(f"Saved {output.name}")
         except Exception as exc:
             self._show_error("Statistics export failed", f"{type(exc).__name__}: {exc}")
@@ -1186,14 +1209,6 @@ class MainWindow(QMainWindow):
         request_id = self._activate_request()
         self.decoder.request_reference(None, self.current_packet.index, request_id)
 
-    def _reload_reference(self, request_id: int) -> None:
-        """Re-read the reference after a unit / object-parameter change."""
-        if self._reference_params is None or self.current_packet is None:
-            return
-        self.decoder.request_reference(
-            self._reference_params, self.current_packet.index, request_id
-        )
-
     def _change_filters(self, state: dict) -> None:
         self._filters_state = {
             "point": tuple(state.get("point", ("none", 1.0))),
@@ -1268,7 +1283,7 @@ class MainWindow(QMainWindow):
         if not self.playing or self.metadata is None:
             return
         start, end = self._playback_bounds()
-        next_index = self._skip_ahead_index(after, end)
+        next_index = max(start, self._skip_ahead_index(after, end))
         if next_index > end:
             # Decode reached the range end. Do not pause/wrap here: the
             # terminal packet is still queued and must be presented first
@@ -1425,6 +1440,7 @@ class MainWindow(QMainWindow):
         self.fixed_minimum = packet.minimum
         self.fixed_maximum = packet.maximum
         self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
+        self._sync_thresholds(packet, None)
         self._present_packet(packet)
 
     def _on_frame_ready(self, packet: FramePacket) -> None:
@@ -1478,25 +1494,51 @@ class MainWindow(QMainWindow):
     def _on_unit_ready(self, option: UnitOption, packet: FramePacket) -> None:
         if packet.request_id != self._active_request_id:
             return
-        self.current_packet = packet
+        self._sync_thresholds(packet, self.current_packet)
         self.fixed_minimum = packet.minimum
         self.fixed_maximum = packet.maximum
         self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
         self._present_packet(packet)
 
     def _present_packet(self, packet: FramePacket) -> None:
+        previous = self.current_packet
+        if previous is not None and packet.revision != previous.revision:
+            self._temporal.clear()
+            self.bottom_panel.temporal.setToolTip("History cleared: analysis settings changed")
+            self.bottom_panel.temporal.history_note.setText("History cleared: settings changed")
+            if previous.unit.key == packet.unit.key:
+                self._sync_thresholds(packet, None)
         self.current_packet = packet
         self._render_current_frame()
+
+    def _sync_thresholds(self, packet: FramePacket, previous: FramePacket | None) -> None:
+        conversion = threshold_conversion(previous.unit.key, packet.unit.key,
+            packet.processing or ProcessingState()) if previous is not None else None
+        if conversion is None:
+            self.seg_min, self.seg_max = packet.minimum, packet.maximum
+            self.iso_limit1, self.iso_limit2 = packet.minimum, packet.maximum
+        else:
+            factor, offset = conversion
+            self.seg_min, self.seg_max = (factor * self.seg_min + offset, factor * self.seg_max + offset)
+            self.iso_limit1, self.iso_limit2 = (factor * self.iso_limit1 + offset, factor * self.iso_limit2 + offset)
+        for spin, value in ((self.inspector.seg_min_spin, self.seg_min),
+                            (self.inspector.seg_max_spin, self.seg_max),
+                            (self.inspector.iso_limit1_spin, self.iso_limit1),
+                            (self.inspector.iso_limit2_spin, self.iso_limit2)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _render_current_frame(self) -> None:
         if self.current_packet is None or self.metadata is None:
             return
         packet = self.current_packet
-        rgb, low, high = render_frame_rgb(
+        rgb, low, high, mapping = render_frame_rgb(
             packet.data,
             self._display_state(packet),
             packet.clip_mask,
             extrema=(packet.minimum, packet.maximum),
+            return_mapping=True,
         )
         self.canvas.set_frame(rgb, packet.data, packet.unit.suffix)
         self.canvas.set_overlay_data(
@@ -1508,6 +1550,7 @@ class MainWindow(QMainWindow):
             high,
             invert=self.palette_inverted,
             unit=packet.unit.suffix or packet.unit.label,
+            mapping=mapping, segmentation=self._display_state(packet).segmentation,
         )
         self.color_scale.set_isotherm(self.isotherm_mode, self.iso_limit1, self.iso_limit2)
         seconds = frame_seconds(packet.timestamp, self.metadata, packet.index)
@@ -1570,6 +1613,8 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def _on_decode_failed(self, message: str) -> None:
+        if getattr(self, "_closing", False):
+            return
         self.pause_playback(invalidate=True)
         if self.current_packet is None:
             self.canvas.clear_frame("Unable to open this recording")
@@ -1578,6 +1623,8 @@ class MainWindow(QMainWindow):
     def _export(self, kind: str) -> None:
         if self.current_packet is None or self.metadata is None:
             return
+        self.pause_playback(invalidate=True)
+        packet, metadata, image = self.current_packet, self.metadata, self.canvas.image.copy()
         suffix_map = {"png": ".png", "npy": ".npy", "csv": ".csv"}
         filter_map = {
             "png": "PNG image (*.png)",
@@ -1586,8 +1633,8 @@ class MainWindow(QMainWindow):
         }
         extension = suffix_map[kind]
         default_name = (
-            self.metadata.path.parent
-            / f"{self.metadata.path.stem}_frame_{self.current_packet.index + 1:05d}{extension}"
+            metadata.path.parent
+            / f"{metadata.path.stem}_frame_{packet.index + 1:05d}{extension}"
         )
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1601,13 +1648,16 @@ class MainWindow(QMainWindow):
         if output.suffix.lower() != extension:
             output = output.with_suffix(extension)
         try:
-            if kind == "png":
-                if self.canvas.image.isNull() or not self.canvas.image.save(str(output), "PNG"):
-                    raise OSError("Qt could not write the PNG image")
-            elif kind == "npy":
-                np.save(output, self.current_packet.data)
-            else:
-                np.savetxt(output, self.current_packet.data, delimiter=",", fmt="%.6f")
+            with OutputTransaction([metadata.path]) as job:
+                stage = job.stage(output)
+                if kind == "png":
+                    if image.isNull() or not image.save(str(stage), "PNG"):
+                        raise OSError("Qt could not write the PNG image")
+                elif kind == "npy":
+                    np.save(stage, packet.data)
+                else:
+                    np.savetxt(stage, packet.data, delimiter=",", fmt="%.6f")
+                job.commit()
             self.title_bar.export_button.setToolTip(f"Saved {output.name}")
         except Exception as exc:
             self._show_error("Export failed", f"{type(exc).__name__}: {exc}")
@@ -1662,9 +1712,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.pause_playback(invalidate=True)
-        self.decoder.shutdown()
-        if not self.decoder.wait(4000):
-            self.decoder.requestInterruption()
+        if self.decoder.isRunning():
+            event.ignore()
+            if not getattr(self, "_closing", False):
+                self._closing = True
+                _CLOSING_WINDOWS.add(self)
+                self.setEnabled(False)
+                self.title_bar.set_filename("Closing — waiting for the current operation…")
+                self.decoder.finished.connect(self.close)
+                self.decoder.shutdown()
+            return
         while QApplication.overrideCursor() is not None:
             QApplication.restoreOverrideCursor()
+        _CLOSING_WINDOWS.discard(self)
         event.accept()

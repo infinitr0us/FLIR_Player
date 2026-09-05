@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from matplotlib import font_manager
 
 from .models import ROI_COLORS, RoiShape, RoiStats
-from .render import palette_lut
+from .render import palette_lut, legend_colors
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +67,9 @@ def compose_frame(
     max_position: tuple[int, int] | None = None,
     label: str = "",
     flips: tuple[bool, bool] = (False, False),
+    mapping=None,
+    segmentation=(False, 0.0, 1.0),
+    isotherm=("off", 0.0, 1.0),
 ) -> np.ndarray:
     """Compose the final export image: frame + overlays (+ optional color bar)."""
     image = Image.fromarray(rgb, mode="RGB")
@@ -82,7 +85,8 @@ def compose_frame(
     if options.border:
         draw.rectangle((0, 0, width - 1, height - 1), outline=(73, 88, 108), width=1)
     if options.color_bar:
-        image = _append_color_bar(image, palette, inverted, scale, suffix)
+        image = _append_color_bar(image, palette, inverted, scale, suffix,
+                                  mapping, segmentation, isotherm)
 
     result = np.asarray(image, dtype=np.uint8)
     return np.ascontiguousarray(result)
@@ -176,6 +180,9 @@ def _append_color_bar(
     inverted: bool,
     scale: tuple[float, float],
     suffix: str,
+    mapping=None,
+    segmentation=(False, 0.0, 1.0),
+    isotherm=("off", 0.0, 1.0),
 ) -> Image.Image:
     width, height = image.size
     strip_width = 104
@@ -184,9 +191,9 @@ def _append_color_bar(
     combined = Image.new("RGB", (width + strip_width, height), (6, 8, 11))
     combined.paste(image, (0, 0))
 
-    lut = palette_lut(palette, inverted)[::-1]  # low values at the bottom
+    lut = legend_colors(palette, inverted, mapping, scale, segmentation, isotherm)[::-1]
     gradient = Image.fromarray(np.ascontiguousarray(lut.reshape(256, 1, 3)), mode="RGB")
-    gradient = gradient.resize((bar_width, height - 32), Image.BILINEAR)
+    gradient = gradient.resize((bar_width, max(1, height - 32)), Image.Resampling.NEAREST)
     combined.paste(gradient, (bar_left, 16))
 
     draw = ImageDraw.Draw(combined)

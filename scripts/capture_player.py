@@ -48,8 +48,13 @@ def main() -> int:
             return
         state["captured"] = True
         state["exit_code"] = 0 if window.grab().save(str(args.output), "PNG") else 2
-        window.close()
-        app.quit()
+        app.setQuitOnLastWindowClosed(False)
+        if window.decoder.isRunning():
+            window.decoder.finished.connect(app.quit)
+            window.close()
+        else:
+            window.close()
+            app.quit()
 
     window.decoder.opened.connect(lambda *_: QTimer.singleShot(args.settle_ms, capture))
     QTimer.singleShot(args.timeout_ms, capture)

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
+import json
+from .jobs import CancellationToken, JobCancelled, OutputTransaction, extract_recording, unique_destination
 from queue import Queue
 from typing import Any
 
@@ -41,7 +43,7 @@ class _PacketCache:
     def __init__(self, budget_bytes: int, max_count: int) -> None:
         self._budget = max(1, int(budget_bytes))
         self._max_count = max(1, int(max_count))
-        self._packets: OrderedDict[tuple[str, int], FramePacket] = OrderedDict()
+        self._packets: OrderedDict[tuple, FramePacket] = OrderedDict()
         self._bytes = 0
         self.hits = 0
         self.misses = 0
@@ -56,7 +58,7 @@ class _PacketCache:
 
     def get(
         self,
-        key: tuple[str, int],
+        key: tuple,
         need_clip: bool = False,
         need_metadata: bool = False,
     ) -> FramePacket | None:
@@ -81,7 +83,7 @@ class _PacketCache:
         self._packets.move_to_end(key)
         return packet
 
-    def put(self, key: tuple[str, int], packet: FramePacket) -> None:
+    def put(self, key: tuple, packet: FramePacket) -> None:
         old = self._packets.pop(key, None)
         if old is not None:
             self._bytes -= self._size(old)
@@ -133,8 +135,8 @@ def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
         else:
             scale = (0.0, 0.0)
         return packet, None, None, scale
-    rgb, low, high = render_frame_rgb(
-        packet.data, display, packet.clip_mask, extrema=(packet.minimum, packet.maximum)
+    rgb, low, high, mapping = render_frame_rgb(
+        packet.data, display, packet.clip_mask, extrema=(packet.minimum, packet.maximum), return_mapping=True
     )
     options = payload["options"]
     label = (
@@ -153,6 +155,7 @@ def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
         max_position=packet.max_position,
         label=label,
         flips=(display.flip_h, display.flip_v),
+        mapping=mapping, segmentation=display.segmentation, isotherm=display.isotherm,
     )
     return packet, rgb, composed, (low, high)
 
@@ -184,6 +187,7 @@ class DecoderThread(QThread):
         self._cache_size = max(1, int(cache_size))
         self._cache_budget = max(1, int(cache_bytes))
         self._abort = False
+        self._tokens: list[CancellationToken] = []
 
     def request_open(self, path: str) -> None:
         self._clear_pending_commands()
@@ -233,13 +237,19 @@ class DecoderThread(QThread):
         self._commands.put(("filters", (dict(state), int(index), int(request_id))))
 
     def request_extract(self, params: dict) -> None:
-        self._commands.put(("extract", dict(params)))
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("extract", dict(params, _token=token)))
 
     def request_export_sequence(self, params: dict) -> None:
-        self._commands.put(("export_sequence", dict(params)))
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("export_sequence", dict(params, _token=token)))
 
     def request_batch_extract(self, params: dict) -> None:
-        self._commands.put(("batch_extract", dict(params)))
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("batch_extract", dict(params, _token=token)))
 
     def request_export_bitmasks(self, folder: str) -> None:
         self._commands.put(("export_bitmasks", {"folder": str(folder)}))
@@ -247,8 +257,12 @@ class DecoderThread(QThread):
     def cancel_extract(self) -> None:
         """Abort the running extract/export operation."""
         self._abort = True
+        for token in tuple(self._tokens):
+            token.cancel()
 
     def shutdown(self) -> None:
+        self.cancel_extract()
+        self.requestInterruption()
         self._clear_pending_commands()
         self._commands.put(("stop", None))
 
@@ -258,7 +272,7 @@ class DecoderThread(QThread):
         try:
             while True:
                 command, payload = self._commands.get()
-                if command == "stop":
+                if command == "stop" or self.isInterruptionRequested():
                     break
                 try:
                     if command == "open":
@@ -269,14 +283,14 @@ class DecoderThread(QThread):
                         packet = source.take_first_packet()
                         if packet is None:
                             packet = source.read_frame(0, request_id=0)
-                        cache.put((packet.unit.key, 0), packet)
+                        cache.put((packet.revision, packet.unit.key, 0), packet)
                         self.opened.emit(metadata, source.available_units, packet)
                         self.object_params_ready.emit(source.read_object_parameters())
                         self.corrections_ready.emit(source.read_corrections())
                         self.busy_changed.emit(False, "")
                     elif command == "frame":
                         index, request_id, need_clip, need_metadata = payload
-                        key = (source.unit.key, index)
+                        key = (source.revision, source.unit.key, index)
                         packet = cache.get(
                             key, need_clip=need_clip, need_metadata=need_metadata
                         )
@@ -295,7 +309,7 @@ class DecoderThread(QThread):
                         snapshot = source.apply_object_parameters(values)
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((packet.unit.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
                         self.object_params_ready.emit(snapshot)
                         self.frame_ready.emit(packet)
                         self.busy_changed.emit(False, "")
@@ -305,7 +319,7 @@ class DecoderThread(QThread):
                         state = source.set_corrections(nuc, bp)
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((packet.unit.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
                         self.corrections_ready.emit(state)
                         self.frame_ready.emit(packet)
                         self.busy_changed.emit(False, "")
@@ -321,7 +335,7 @@ class DecoderThread(QThread):
                             )
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((packet.unit.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
                         self.reference_ready.emit(label)
                         self.frame_ready.emit(packet)
                         self.busy_changed.emit(False, "")
@@ -331,7 +345,7 @@ class DecoderThread(QThread):
                         source.set_processing(state_from_dict(state_dict))
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((packet.unit.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
                         self.frame_ready.emit(packet)
                         self.busy_changed.emit(False, "")
                     elif command == "rois":
@@ -339,10 +353,10 @@ class DecoderThread(QThread):
                         source.set_rois(shapes)
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((packet.unit.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
                         self.frame_ready.emit(packet)
                     elif command == "extract":
-                        self._abort = False
+                        self._abort = payload["_token"]()
                         self.busy_changed.emit(True, "Extracting clip…")
                         ok, message = source.extract(
                             payload["dest"],
@@ -350,18 +364,18 @@ class DecoderThread(QThread):
                             payload["end_frame"],
                             payload.get("decimation", 1),
                             progress=lambda cur, total: self.extract_progress.emit(cur, total),
-                            abort=lambda: self._abort,
+                            abort=payload["_token"],
                         )
                         self.extract_finished.emit(ok, message)
                         self.busy_changed.emit(False, "")
                     elif command == "export_sequence":
-                        self._abort = False
+                        self._abort = payload["_token"]()
                         self.busy_changed.emit(True, "Exporting…")
                         ok, message = self._run_export_sequence(source, payload)
                         self.export_finished.emit(ok, message)
                         self.busy_changed.emit(False, "")
                     elif command == "batch_extract":
-                        self._abort = False
+                        self._abort = payload["_token"]()
                         self.busy_changed.emit(True, "Batch extracting…")
                         ok, message = self._run_batch_extract(payload)
                         self.export_finished.emit(ok, message)
@@ -379,122 +393,150 @@ class DecoderThread(QThread):
                         option = source.set_unit(key)
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
-                        cache.put((option.key, packet.index), replace(packet, request_id=0))
+                        cache.put((packet.revision, option.key, packet.index), replace(packet, request_id=0))
                         self.unit_ready.emit(option, packet)
+                        self.object_params_ready.emit(source.read_object_parameters())
                         self.busy_changed.emit(False, "")
                 except Exception as exc:
                     self.busy_changed.emit(False, "")
-                    self.failed.emit(f"{type(exc).__name__}: {exc}")
+                    message = f"{type(exc).__name__}: {exc}"
+                    if command == "extract":
+                        self.extract_finished.emit(False, message)
+                    elif command in {"export_sequence", "batch_extract", "export_bitmasks"}:
+                        self.export_finished.emit(False, message)
+                    else:
+                        self.failed.emit(message)
+                finally:
+                    if isinstance(payload, dict) and payload.get("_token") in self._tokens:
+                        self._tokens.remove(payload["_token"])
         finally:
             source.close()
 
-    def _run_export_sequence(self, source: FlirVideoSource, payload: dict) -> tuple[bool, str]:
-        """Movie or numbered-series export loop (§4.9.1.1, p. 59–60).
+    def _job_aborted(self, payload):
+        token = payload.get("_token")
+        return token() if token is not None else self._abort
 
-        Bookkeeping is O(1): the frame range is iterated lazily and the stats
-        CSV is streamed one row per frame instead of being accumulated.
-        """
-        start = payload["start_frame"]
-        end = payload["end_frame"]
-        step = max(1, payload["decimation"])
+    def _run_export_sequence(self, source: FlirVideoSource, payload: dict) -> tuple[bool, str]:
+        """Stage a complete job; decimation selects outputs, not filter inputs."""
+        start, end = int(payload["start_frame"]), int(payload["end_frame"])
+        step = max(1, int(payload["decimation"]))
         frame_range = range(start, end + 1, step)
         total = len(frame_range)
-        if total <= 0:
-            return (False, "The frame range is empty")
+        if start < 0 or end >= source.metadata.num_frames or total <= 0:
+            return False, "Invalid or empty frame range"
+        if payload.get("revision", source.revision) != source.revision:
+            return False, "Analysis settings changed; start the export again"
         is_movie = payload["kind"] == "movie"
-        writer = None
-        stats_writer = None
-        dest_path = Path(payload["dest"])
+        writer = stats_writer = None
+        dest = Path(payload["dest"])
+        old_ring, old_index = source._temporal, source._last_frame_index
+        from .processing import TemporalBuffer
+        source._temporal, source._last_frame_index = TemporalBuffer(), None
         try:
-            if is_movie:
-                writer = MovieWriter(dest_path, payload["fps"], payload["fmt"])
-            else:
-                dest_path.mkdir(parents=True, exist_ok=True)
-                if payload["stats_csv"]:
-                    roi_names = [shape.name for shape in payload["rois"]]
-                    stats_writer = StatsCsvWriter(
-                        dest_path / f"{payload['base_name']}_stats.csv",
-                        stats_csv_header(roi_names),
-                    )
-            for count, index in enumerate(frame_range, 1):
-                if self._abort:
-                    if writer is not None:
-                        writer.close()
-                        dest_path.unlink(missing_ok=True)
-                    if stats_writer is not None:
-                        stats_writer.close()
-                        stats_writer.path.unlink(missing_ok=True)
-                    return (False, "Export cancelled")
-                packet, rgb, composed, scale = _render_export_frame(source, payload, index)
-                if writer is not None:
-                    writer.append(composed)
+            with OutputTransaction([source.metadata.path], lambda: self._job_aborted(payload)) as job:
+                paths = {}
+                if is_movie:
+                    stage = job.stage(dest)
+                    writer = MovieWriter(stage, payload["fps"], payload["fmt"])
                 else:
-                    frame_path = dest_path / (
-                        f"{payload['base_name']}_{index + 1:05d}{EXTENSIONS[payload['fmt']]}"
-                    )
-                    save_frame(frame_path, payload["fmt"], composed, packet.data, scale)
-                    if stats_writer is not None:
-                        stats_writer.append(stats_csv_row(packet, payload["unit_label"]))
-                self.export_progress.emit(count, total)
-            if writer is not None:
-                writer.close()
-                writer = None
-            if stats_writer is not None:
-                stats_writer.close()
-                stats_writer = None
-            return (True, "")
+                    base = payload["base_name"]
+                    if not base or Path(base).name != base or any(c in base for c in '/\\:'):
+                        raise ValueError("Base name must be a filename, without a directory")
+                    # Preflight the entire map before writing the first frame.
+                    for index in frame_range:
+                        paths[index] = job.stage(dest / f"{base}_{index + 1:05d}{EXTENSIONS[payload['fmt']]}")
+                    if payload.get("stats_csv"):
+                        stage = job.stage(dest / f"{base}_stats.csv")
+                        stats_writer = StatsCsvWriter(stage, stats_csv_header([r.name for r in payload["rois"]]))
+                temporal = source.processing.temporal[0] != "none"
+                inputs = range(start, end + 1) if temporal else frame_range
+                count = 0
+                try:
+                    for index in inputs:
+                        job.check_cancelled()
+                        if (index - start) % step:
+                            source.read_frame(index, need_clip=False, need_metadata=False)
+                            continue
+                        packet, rgb, composed, scale = _render_export_frame(source, payload, index)
+                        job.check_cancelled()
+                        if writer is not None:
+                            writer.append(composed)
+                        else:
+                            save_frame(paths[index], payload["fmt"], composed, packet.data, scale,
+                                       packet=packet, source=source.metadata)
+                            if stats_writer is not None:
+                                stats_writer.append(stats_csv_row(packet, packet.unit.label,
+                                    scale=scale, fmt=payload["fmt"]))
+                        count += 1
+                        self.export_progress.emit(count, total)
+                finally:
+                    try:
+                        if writer is not None:
+                            writer.close()
+                    finally:
+                        if stats_writer is not None:
+                            stats_writer.close()
+                job.commit()
+            return True, ""
+        except JobCancelled:
+            return False, "Export cancelled"
         except Exception as exc:
-            if writer is not None:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-            if stats_writer is not None:
-                try:
-                    stats_writer.close()
-                except Exception:
-                    pass
-            return (False, f"{type(exc).__name__}: {exc}")
+            return False, f"{type(exc).__name__}: {exc}"
+        finally:
+            source._temporal, source._last_frame_index = old_ring, old_index
 
     def _run_batch_extract(self, payload: dict) -> tuple[bool, str]:
-        """Extract a list of ATS recordings via temporary SDK handles (§4.9.1.3)."""
+        """Preflight unique destinations and persist an outcome for every input."""
         folder = Path(payload["folder"])
+        files = [Path(path).expanduser().resolve() for path in payload["files"]]
         folder.mkdir(parents=True, exist_ok=True)
-        files = payload["files"]
-        produced: list[str] = []
-        skipped: list[str] = []
-        failed: list[str] = []
-        for count, path in enumerate(files, 1):
-            if self._abort:
-                return (False, f"Cancelled after {count - 1} of {len(files)} files")
-            source_path = Path(path)
-            dest = folder / f"{source_path.stem}_extract.ats"
+        reserved = list(files)
+        outcomes = []
+        for path in files:
+            dest = unique_destination(folder / f"{path.stem}_extract.ats", reserved)
+            reserved.append(dest)
+            outcomes.append({"source": str(path), "destination": str(dest),
+                             "status": "not_started", "message": ""})
+        for count, result in enumerate(outcomes, 1):
+            if self._job_aborted(payload):
+                result["status"] = "cancelled"
+                continue
+            im = None
             try:
-                im = fnv.file.ImagerFile(str(source_path))
-                try:
-                    options = fnv.file.ImagerFileExtractOptions()
-                    options.start_frame = 0
-                    options.end_frame = int(im.num_frames) - 1
-                    options.decimation = max(1, int(payload["decimation"]))
-                    ok = bool(im.extract(str(dest), options))
-                finally:
-                    im.close()
-                if ok and dest.is_file():
-                    produced.append(source_path.name)
-                else:
-                    skipped.append(source_path.name)
-                    dest.unlink(missing_ok=True)
+                im = fnv.file.ImagerFile(result["source"])
+                options = fnv.file.ImagerFileExtractOptions()
+                options.start_frame = 0
+                options.end_frame = int(im.num_frames) - 1
+                options.decimation = max(1, int(payload["decimation"]))
+                ok, message = extract_recording(im, result["source"], result["destination"], options,
+                    progress=lambda cur, total: self.export_progress.emit(
+                        (count - 1) * 1000 + int(1000 * cur / max(1, total)), len(files) * 1000),
+                    abort=lambda: self._job_aborted(payload))
+                result["status"] = "succeeded" if ok else (
+                    "cancelled" if self._job_aborted(payload) or message == "Extraction cancelled" else "failed")
+                result["message"] = message
             except Exception as exc:
-                failed.append(f"{source_path.name} ({type(exc).__name__})")
-                dest.unlink(missing_ok=True)
-            self.export_progress.emit(count, len(files))
-        parts = [f"Extracted {len(produced)} of {len(files)} recording(s)"]
-        if skipped:
-            parts.append("no output (ATS sources only): " + ", ".join(skipped))
-        if failed:
-            parts.append("failed: " + ", ".join(failed))
-        return (not failed, "; ".join(parts))
+                result["status"] = "failed"
+                result["message"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                if im is not None:
+                    im.close()
+        report = unique_destination(folder / "batch_extract_report.json", reserved)
+        with OutputTransaction(files) as job:
+            job.stage(report).write_text(json.dumps(outcomes, indent=2), encoding="utf-8")
+            job.commit()
+        succeeded = sum(r["status"] == "succeeded" for r in outcomes)
+        cancelled = self._job_aborted(payload) or any(r["status"] == "cancelled" for r in outcomes)
+        prefix = "Cancelled; extracted" if cancelled else "Extracted"
+        details = "; ".join(f"{Path(r['source']).name}: {r['status']}" for r in outcomes if r["status"] != "succeeded")
+        return (not cancelled and succeeded == len(files),
+                f"{prefix} {succeeded} of {len(files)} recording(s). {details}. Report: {report}")
 
     def _clear_pending_commands(self) -> None:
         with self._commands.mutex:
+            for _, payload in self._commands.queue:
+                if isinstance(payload, dict) and payload.get("_token") in self._tokens:
+                    token = payload["_token"]
+                    token.cancel()
+                    self._tokens.remove(token)
             self._commands.queue.clear()

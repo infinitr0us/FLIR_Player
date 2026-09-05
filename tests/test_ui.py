@@ -75,10 +75,11 @@ def test_object_parameters_panel_edits_apply(qapp) -> None:
     try:
         window.open_path(SAMPLES / "2.seq")
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
-        assert window.inspector.params_panel.isEnabled()
+        assert not window.inspector.params_panel.isEnabled()  # Counts is not editable
 
         window._change_unit("temperature_factory_c")
         assert wait_until(qapp, lambda: window.current_packet.unit.key == "temperature_factory_c" and not window._busy)
+        assert window.inspector.params_panel.isEnabled()
         baseline = window.current_packet.mean
 
         spin = window.inspector.params_panel._spins["emissivity"]

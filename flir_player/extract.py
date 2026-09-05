@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import VideoMetadata
+from .jobs import validate_destination, unique_destination
 from .widgets import FramelessDialog
 
 
@@ -71,7 +72,7 @@ class ExtractDialog(FramelessDialog):
 
         output_row = QHBoxLayout()
         output_row.setSpacing(8)
-        default_name = metadata.path.parent / f"{metadata.path.stem}_extract.ats"
+        default_name = unique_destination(metadata.path.parent / f"{metadata.path.stem}_extract.ats", [metadata.path])
         self.output_edit = QLineEdit(str(default_name))
         output_row.addWidget(self.output_edit, 1)
         browse = QToolButton()
@@ -111,6 +112,7 @@ class ExtractDialog(FramelessDialog):
 
         self.start_spin.valueChanged.connect(self._validate)
         self.end_spin.valueChanged.connect(self._validate)
+        self.output_edit.textChanged.connect(self._validate)
         self._validate()
 
     def _browse_output(self) -> None:
@@ -125,6 +127,18 @@ class ExtractDialog(FramelessDialog):
 
     def _validate(self) -> None:
         valid = self.start_spin.value() <= self.end_spin.value()
+        try:
+            if not self.output_edit.text().strip():
+                raise ValueError("Choose an output filename")
+            dest = Path(self.parameters()["dest"])
+            validate_destination(dest, [self._metadata.path])
+        except (OSError, ValueError) as exc:
+            valid = False
+            self.warning_label.setText(str(exc))
+        else:
+            self.warning_label.setText("Output uses a new ATS filename; existing files are preserved."
+                if self._metadata.path.suffix.lower() == ".ats" else
+                "The File SDK only supports extraction from ATS recordings.")
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
 
     def parameters(self) -> dict:

@@ -49,8 +49,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.smoke_output.parent.mkdir(parents=True, exist_ok=True)
                 if not window.grab().save(str(args.smoke_output), "PNG"):
                     code = 4
-            window.close()
-            app.exit(code)
+            # A smoke-test exit obeys the same worker lifetime as an ordinary
+            # close, including timeout/error paths during a noninterruptible SDK call.
+            app.setQuitOnLastWindowClosed(False)
+            if window.decoder.isRunning():
+                window.decoder.finished.connect(lambda: app.exit(code))
+                window.close()
+            else:
+                window.close()
+                app.exit(code)
 
         def exercise_playback(*_args) -> None:
             def start() -> None:

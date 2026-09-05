@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from flir_player.settings import app_settings
+
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -10,7 +12,7 @@ import pytest
 
 from conftest import wait_until
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 
 from flir_player.extract import ExtractDialog
 from flir_player.main_window import MainWindow
@@ -82,7 +84,7 @@ def test_extract_dialog_seeds_from_play_range(qapp) -> None:
 
 @pytest.fixture()
 def loop_setting_preserved():
-    settings = QSettings("Local", "FLIR Thermal Player")
+    settings = app_settings()
     previous = settings.value("playback/loop", False, type=bool)
     settings.setValue("playback/loop", False)  # deterministic starting state
     yield
@@ -176,7 +178,7 @@ def test_loop_setting_persists(qapp, loop_setting_preserved) -> None:
         assert not window.loop_playback
         window.transport.loop_button.setChecked(True)
         assert window.loop_playback
-        assert QSettings("Local", "FLIR Thermal Player").value(
+        assert app_settings().value(
             "playback/loop", False, type=bool
         )
     finally:
@@ -189,7 +191,7 @@ def test_loop_setting_persists(qapp, loop_setting_preserved) -> None:
 
 @pytest.fixture()
 def rate_setting_preserved():
-    settings = QSettings("Local", "FLIR Thermal Player")
+    settings = app_settings()
     previous = settings.value("playback/constant_rate", False, type=bool)
     settings.setValue("playback/constant_rate", False)  # deterministic starting state
     yield
@@ -250,7 +252,7 @@ def test_constant_rate_toggle_persists_and_reanchors(qapp, rate_setting_preserve
         assert not window.constant_rate
         window.transport.constant_rate_button.setChecked(True)
         assert window.constant_rate
-        assert QSettings("Local", "FLIR Thermal Player").value(
+        assert app_settings().value(
             "playback/constant_rate", False, type=bool
         )
         # a live switch keeps playing rather than dropping out of playback

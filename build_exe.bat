@@ -5,7 +5,7 @@ call D:\Anaconda\Scripts\activate.bat FLIR
 if errorlevel 1 goto :error
 
 rem Install/verify Python dependencies (idempotent, quick when satisfied)
-python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+python -m pip install --quiet --disable-pip-version-check -r requirements.txt -r packaging-requirements.txt
 if errorlevel 1 goto :error
 
 python packaging\create_icon.py
@@ -16,13 +16,16 @@ set FLIR_PACKAGE_CONSOLE=0
 python -m PyInstaller --noconfirm --clean --distpath release --workpath build\pyinstaller packaging\FLIR_Thermal_Player.spec
 if errorlevel 1 goto :error
 
-rem Regenerate SHA256SUMS.txt, BUILD_INFO.txt and README.txt for the release
+rem Mark the new build unverified until its smoke test succeeds.
 python packaging\finalize_release.py
 if errorlevel 1 goto :error
 
 rem Smoke-test the built executable: open local\data\2.seq, verify playback advances
 release\FLIR_Thermal_Player.exe local\data\2.seq --smoke-test
 if errorlevel 1 goto :smoke_error
+
+python packaging\finalize_release.py --smoke-tested
+if errorlevel 1 goto :error
 
 echo.
 echo Built and verified: %CD%\release\FLIR_Thermal_Player.exe

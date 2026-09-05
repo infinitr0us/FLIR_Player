@@ -70,7 +70,7 @@ def test_extract_abort_cleans_up(tmp_path) -> None:
         )
         assert not ok
         assert message == "Extraction cancelled"
-        assert calls == [1]  # aborted right after the first progress callback
+        assert calls == []  # a pre-cancelled job never enters the SDK
         assert not dest.exists()
     finally:
         source.close()

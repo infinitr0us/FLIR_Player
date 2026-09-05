@@ -131,9 +131,9 @@ runs PyInstaller (the specification explicitly includes the FLIR native DLLs
 and the imageio-ffmpeg encoder binary, and excludes Anaconda's incompatible
 legacy ICU shadow DLL), then regenerates `release/BUILD_INFO.txt`,
 `release/SHA256SUMS.txt`, and `release/README.txt` via
-`packaging/finalize_release.py`, and finally smoke-tests the built executable
-against the sample recording `local/data/2.seq`. A build that fails the smoke
-test exits with code 2.
+`packaging/finalize_release.py`, and smoke-tests the built executable against
+the sample recording `local/data/2.seq`. Only a successful smoke test marks the
+release metadata as verified. A build that fails the smoke test exits with code 2.
 
 The executable contains FLIR File SDK components. Check the FLIR SDK license
 and the EAR notice in the installed `fnv` package before redistributing it
@@ -227,6 +227,46 @@ float64 reference, request coalescing, prefetch and end-of-range
 presentation (including loop wraps), cache byte accounting and payload
 completeness, bounded temporal history and envelope downsampling, and
 filter-kernel parity.
+
+## Analysis and export behavior
+
+Temporal filters use the trailing source-frame window
+`max(0, frame - depth + 1) ... frame`. Seeking, reverse stepping, cache hits,
+metadata refreshes and export use that same definition. Decimation selects
+which results to write; intervening frames still contribute to filtering.
+Reference arithmetic promotes integer Counts before calculating differences
+or products. References use the current unit, object parameters and available
+correction switches; an incompatible reference rejects the state change.
+
+Changing numerical analysis settings clears temporal plot history. Editing an
+ROI clears that ROI's history. Palette and zoom changes preserve it. Temperature
+overlay limits convert between compatible temperature units; subtraction uses
+temperature-difference conversion. Other numerical-domain or source changes
+reset the limits to the new frame's range.
+
+ROI statistics, histogram/profile sampling and masks share pixel coverage:
+boxes exclude the right/bottom endpoint, ellipses include pixel centers inside
+that box, and lines sample each major-axis pixel once. Profile distance is in
+image pixels. Plateau-equalized legends use the frame's actual color mapping.
+
+Exports and extracts stage their output and publish only after successful
+completion. Existing paths are refused; choose a new filename. Source aliases
+are always rejected. Batch extraction allocates distinct names and saves a JSON
+report with the actual path and outcome for each input. Failed or cancelled jobs
+remove their own staging files. Closing waits responsively for SDK operations
+and writers to finish.
+
+Numeric TIFF16 preserves unprocessed `uint16` Counts exactly. Other data is
+mapped over the selected range; TIFF `ImageDescription` records the scale,
+offset, clipping policy, unit, processing and measurement provenance. Use float
+TIFF or NumPy export for processed values outside the display range or nonfinite
+values. Numeric TIFFs have no RGB overlays, flips or composition. Movie export
+preserves the image dimensions and pads an odd edge by one pixel for encoding.
+Still exports retain the frame chosen before the dialog; statistics CSV saves
+the displayed statistics snapshot, including when the table is paused.
+
+Tests use temporary INI preferences and do not write the application's registry
+settings. Set `FLIR_SETTINGS_FILE` to an INI path to isolate another run.
 
 ## License
 

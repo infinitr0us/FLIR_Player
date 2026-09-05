@@ -153,6 +153,9 @@ class TemporalPlotPanel(_PlotPanel):
         self.clear_button.setObjectName("TransportButton")
         self.clear_button.setText("Clear")
         self.add_header_widget(self.clear_button)
+        self.history_note = QLabel()
+        self.history_note.setObjectName("FieldLabel")
+        self.add_header_widget(self.history_note)
 
         # persistent artists: refreshed via set_data instead of ax.clear()
         self._lines: dict[str, object] = {}
@@ -247,45 +250,14 @@ def envelope(
 
 
 def line_profile_values(data: np.ndarray, start: tuple[float, float], end: tuple[float, float]):
-    """Nearest-neighbor samples along a line; returns (distances, values)."""
-    height, width = data.shape
-    length = int(round(float(np.hypot(end[0] - start[0], end[1] - start[1])))) + 1
-    xs = np.linspace(start[0], end[0], length)
-    ys = np.linspace(start[1], end[1], length)
-    xi = np.clip(np.round(xs).astype(int), 0, width - 1)
-    yi = np.clip(np.round(ys).astype(int), 0, height - 1)
-    return np.arange(length, dtype=float), data[yi, xi]
+    from .geometry import roi_coordinates
+    from .models import RoiShape
+    ys, xs = roi_coordinates(RoiShape(0, "line", (start, end), ""), *data.shape)
+    distances = np.hypot(xs.astype(float) - xs[0], ys.astype(float) - ys[0]) if xs.size else np.empty(0)
+    return distances, data[ys, xs]
 
 
 def roi_values(data: np.ndarray, shape) -> np.ndarray:
-    """Flat array of pixel values covered by an ROI shape (app-side geometry)."""
-    height, width = data.shape
-
-    def clip_point(point):
-        return (
-            max(0, min(int(round(point[0])), width - 1)),
-            max(0, min(int(round(point[1])), height - 1)),
-        )
-
-    if shape.kind == "cursor":
-        x, y = clip_point(shape.points[0])
-        return data[y : y + 1, x : x + 1].ravel()
-    if shape.kind == "line":
-        _, values = line_profile_values(data, shape.points[0], shape.points[1])
-        return np.asarray(values).ravel()
-    if len(shape.points) != 2:
-        return np.empty(0)
-    (x0, y0), (x1, y1) = clip_point(shape.points[0]), clip_point(shape.points[1])
-    left, right = sorted((x0, x1))
-    top, bottom = sorted((y0, y1))
-    if shape.kind == "rect":
-        return data[top:bottom, left:right].ravel()
-    if shape.kind == "ellipse":
-        yy, xx = np.mgrid[top:bottom, left:right]
-        cx = (left + right) / 2.0
-        cy = (top + bottom) / 2.0
-        rx = max((right - left) / 2.0, 0.5)
-        ry = max((bottom - top) / 2.0, 0.5)
-        mask = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
-        return data[top:bottom, left:right][mask].ravel()
-    return np.empty(0)
+    from .geometry import roi_coordinates
+    ys, xs = roi_coordinates(shape, *data.shape)
+    return data[ys, xs]

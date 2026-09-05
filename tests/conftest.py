@@ -7,9 +7,14 @@ import inspect
 import os
 import re
 import time
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# Set before application imports and test collection; never write HKCU in tests.
+_settings_dir = tempfile.TemporaryDirectory(prefix="flir-test-settings-")
+os.environ["FLIR_SETTINGS_FILE"] = str(Path(_settings_dir.name) / "preferences.ini")
 
 import pytest
 from PySide6.QtWidgets import QApplication
@@ -31,6 +36,7 @@ _SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 _SDK_AVAILABLE = importlib.util.find_spec("fnv") is not None
 _SEQ_AVAILABLE = (_SAMPLES / "2.seq").exists()
 _ATS_AVAILABLE = (_SAMPLES / "1.ats").exists()
+_CSQ_AVAILABLE = (_SAMPLES / "3.csq").exists()
 
 
 def _relevant_sources(item: pytest.Item) -> str:
@@ -81,7 +87,8 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401
         source = _relevant_sources(item)
         needs_seq = "2.seq" in source
         needs_ats = "1.ats" in source
-        if not (needs_seq or needs_ats):
+        needs_csq = "3.csq" in source
+        if not (needs_seq or needs_ats or needs_csq):
             continue
         if not _SDK_AVAILABLE:
             item.add_marker(
@@ -95,6 +102,10 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401
             item.add_marker(
                 pytest.mark.skip(reason="sample recording '1.ats' is not present in local/data/")
             )
+        elif needs_csq and not _CSQ_AVAILABLE:
+            item.add_marker(
+                pytest.mark.skip(reason="sample recording '3.csq' is not present in local/data/")
+            )
 
 
 @pytest.fixture(scope="session")
@@ -104,6 +115,26 @@ def qapp():
     install_ui_fonts()
     app.setStyleSheet(APP_STYLESHEET)
     return app
+
+
+@pytest.fixture(autouse=True)
+def guard_gui_lifecycle(monkeypatch):
+    from flir_player.main_window import MainWindow
+    errors = []
+
+    def unexpected_error(title, message):
+        errors.append(f"{title}: {message}")
+
+    monkeypatch.setattr(MainWindow, "_show_error", staticmethod(unexpected_error))
+    yield
+    app = QApplication.instance()
+    if app is not None:
+        windows = [w for w in app.topLevelWidgets() if isinstance(w, MainWindow)]
+        for window in windows:
+            window.close()
+        assert wait_until(app, lambda: all(not w.decoder.isRunning() for w in windows), timeout=30)
+        app.processEvents()
+    assert not errors, "Unexpected application errors: " + "; ".join(errors)
 
 
 def wait_until(app: QApplication, predicate, timeout: float = 5.0) -> bool:

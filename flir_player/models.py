@@ -149,3 +149,13 @@ class FramePacket:
     # "not loaded" — the packet cache keys its sufficiency check off these.
     clip_loaded: bool = True
     metadata_loaded: bool = True
+    revision: int = 0
+    processing: object = None
+    analysis: tuple = ()
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsSnapshot:
+    packet: FramePacket
+    metadata: VideoMetadata
+    rois: tuple[RoiShape, ...]

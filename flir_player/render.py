@@ -9,7 +9,8 @@ from functools import lru_cache
 
 import numpy as np
 from matplotlib import colormaps
-from PySide6.QtCore import QSettings
+
+from .settings import app_settings
 
 
 PALETTES: dict[str, str] = {
@@ -70,7 +71,7 @@ def unregister_custom_palette(name: str) -> None:
 
 
 def load_custom_palettes() -> None:
-    raw = QSettings("Local", "FLIR Thermal Player").value("palettes/custom", "[]")
+    raw = app_settings().value("palettes/custom", "[]")
     try:
         entries = json.loads(str(raw))
     except (TypeError, ValueError):
@@ -90,7 +91,7 @@ def save_custom_palettes() -> None:
         {"name": name, "stops": [[p, list(rgb)] for p, rgb in stops]}
         for name, stops in CUSTOM_PALETTE_STOPS.items()
     ]
-    QSettings("Local", "FLIR Thermal Player").setValue(
+    app_settings().setValue(
         "palettes/custom", json.dumps(entries)
     )
 
@@ -136,7 +137,7 @@ def display_range(
     return _sanitize_range(low, high)
 
 
-def plateau_equalized_indices(normalized: np.ndarray, aggressiveness: float) -> np.ndarray:
+def plateau_equalized_indices(normalized: np.ndarray, aggressiveness: float, *, return_mapping=False):
     """Remap normalized [0, 1] values through a plateau-clipped histogram CDF.
 
     ResearchIR §4.3.2 "Plateau Equalization": histogram counts are clipped at a
@@ -145,20 +146,21 @@ def plateau_equalized_indices(normalized: np.ndarray, aggressiveness: float) -> 
     full histogram equalization.
     """
     indices = np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
+    identity = np.arange(256, dtype=np.uint8)
     p = min(1.0, max(0.0, float(aggressiveness)))
     if p <= 0.0:
-        return indices
+        return (indices, identity) if return_mapping else indices
     counts = np.bincount(indices.ravel(), minlength=256).astype(np.float64)
     total = float(counts.sum())
     if total <= 0.0:
-        return indices
+        return (indices, identity) if return_mapping else indices
     clip = max(1.0, total ** (1.0 - p))
     cdf = np.cumsum(np.minimum(counts, clip))
     cdf_total = float(cdf[-1])
     if cdf_total <= 0.0:
-        return indices
+        return (indices, identity) if return_mapping else indices
     mapping = np.clip(cdf / cdf_total * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
-    return mapping[indices]
+    return (mapping[indices], mapping) if return_mapping else mapping[indices]
 
 
 _local = threading.local()
@@ -178,6 +180,10 @@ def _scratch(shape: tuple[int, ...], dtype) -> np.ndarray:
     key = (shape, dtype)
     buffer = buffers.get(key)
     if buffer is None:
+        # Keep only the current resolution's float and index buffers.
+        for old in list(buffers):
+            if old[0] != shape:
+                del buffers[old]
         buffer = buffers[key] = np.empty(shape, dtype=dtype)
     return buffer
 
@@ -189,6 +195,7 @@ def render_rgb(
     high: float,
     pe: float = 0.0,
     invert: bool = False,
+    *, return_mapping: bool = False,
 ) -> np.ndarray:
     span = high - low
     if not np.isfinite(span) or span <= 0:
@@ -203,13 +210,15 @@ def render_rgb(
     normalized *= np.float32(1.0 / span)
     np.nan_to_num(normalized, copy=False)  # NaN → bottom of the palette
     if pe > 0.0:
-        indices = plateau_equalized_indices(normalized, pe)
+        indices, mapping = plateau_equalized_indices(normalized, pe, return_mapping=True)
     else:
+        mapping = np.arange(256, dtype=np.uint8)
         normalized *= np.float32(255.0)
         np.clip(normalized, 0.0, 255.0, out=normalized)
         indices = _scratch(data.shape, np.uint8)
         np.copyto(indices, normalized, casting="unsafe")
-    return np.ascontiguousarray(palette_lut(palette, invert)[indices])
+    rgb = np.ascontiguousarray(palette_lut(palette, invert)[indices])
+    return (rgb, mapping) if return_mapping else rgb
 
 
 CLIP_COLOR = (46, 168, 255)
@@ -363,6 +372,7 @@ def render_frame_rgb(
     state: DisplayState,
     clip_mask: np.ndarray | None = None,
     extrema: tuple[float, float] | None = None,
+    *, return_mapping: bool = False,
 ) -> tuple[np.ndarray, float, float]:
     """Full display pipeline: palette/PE → overlays → flips. Returns (rgb, low, high).
 
@@ -370,7 +380,8 @@ def render_frame_rgb(
     dynamic scaling skips a redundant full-frame scan.
     """
     low, high = display_scale(data, state, extrema)
-    rgb = render_rgb(data, state.palette, low, high, pe=state.pe, invert=state.inverted)
+    rgb, mapping = render_rgb(data, state.palette, low, high, pe=state.pe,
+                              invert=state.inverted, return_mapping=True)
     # rgb is freshly created above, so every enabled overlay paints it in place
     # instead of copying the whole image once per overlay.
     seg_on, seg_min, seg_max = state.segmentation
@@ -388,7 +399,19 @@ def render_frame_rgb(
         rgb = np.flipud(rgb)
     if state.flip_h or state.flip_v:
         rgb = np.ascontiguousarray(rgb)
-    return rgb, low, high
+    return (rgb, low, high, mapping) if return_mapping else (rgb, low, high)
+
+
+def legend_colors(palette, inverted, mapping=None, scale=(0.0, 1.0),
+                  segmentation=(False, 0.0, 1.0), isotherm=("off", 0.0, 1.0)):
+    """Value-indexed colors, shared by live and exported numerical legends."""
+    mapping = np.arange(256, dtype=np.uint8) if mapping is None else mapping
+    colors = palette_lut(palette, inverted)[mapping].copy()
+    values = np.linspace(*scale, 256)
+    if segmentation[0]:
+        _paint_segmentation_overlay(colors, *segmentation_overlays(values, *segmentation[1:]))
+    _paint_isotherm_overlay(colors, values, *isotherm)
+    return colors
 
 
 def format_time(seconds: float) -> str:

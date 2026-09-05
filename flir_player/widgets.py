@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 import qtawesome as qta
 import qtawesome.iconic_font as qta_font
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .settings import app_settings
 from .models import ROI_COLORS, CadenceInfo, UnitOption, VideoMetadata
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
 from .render import format_value, isotherm_color, lut_from_stops, palette_lut, palette_names
@@ -371,6 +372,7 @@ class StatisticsPanel(QFrame):
         layout.addWidget(self.table)
 
         self._last: tuple | None = None
+        self.snapshot = None
 
     def _header_button(self, icon_name: str, tooltip: str, checkable: bool = False) -> QToolButton:
         button = QToolButton()
@@ -381,10 +383,13 @@ class StatisticsPanel(QFrame):
         button.setCheckable(checkable)
         return button
 
-    def set_statistics(self, roi_stats, image_stats, suffix: str) -> None:
-        self._last = (tuple(roi_stats), image_stats, suffix)
+    def set_statistics(self, roi_stats, image_stats, suffix: str, snapshot=None) -> None:
         if self.pause_toggle.isChecked():
             return
+        self._last = (tuple(roi_stats), image_stats, suffix)
+        self.snapshot = snapshot
+        if snapshot is not None:
+            self.table.setToolTip(f"{snapshot.metadata.filename} · frame {snapshot.packet.index + 1} · {suffix}")
         self._render()
 
     def _render(self) -> None:
@@ -424,19 +429,19 @@ class StatisticsPanel(QFrame):
                 self.table.setItem(row, column, item)
 
     def to_rows(self) -> list[list[str]]:
-        headers = ["Metric"]
-        for column in range(self.table.columnCount()):
-            item = self.table.horizontalHeaderItem(column)
-            headers.append(item.text() if item is not None else "")
-        rows = [headers]
-        for row in range(self.table.rowCount()):
-            label_item = self.table.verticalHeaderItem(row)
-            cells = [label_item.text() if label_item is not None else ""]
-            for column in range(self.table.columnCount()):
-                item = self.table.item(row, column)
-                cells.append(item.text() if item is not None else "")
-            rows.append(cells)
-        return rows
+        if self._last is None:
+            return []
+        rois, image, _suffix = self._last
+        columns = []
+        if self.image_toggle.isChecked() and image is not None:
+            columns.append(("Image", (*image, "")))
+        for stats in rois:
+            columns.append((stats.name, (stats.minimum, stats.maximum, stats.mean,
+                stats.std_dev, stats.num_pixels, stats.value if stats.kind == "cursor" else "")))
+        return [["Metric", *[name for name, _ in columns]]] + [
+            [metric, *[values[i] for _, values in columns]]
+            for i, metric in enumerate(self.METRICS)
+        ]
 
 
 class ThermalCanvas(QWidget):
@@ -1154,13 +1159,20 @@ class ThermalCanvas(QWidget):
             return replace(original, points=tuple(points))
         # corner handles on rect/ellipse: anchor opposite corner
         first, second = original.points
+        left, right = sorted((first[0], second[0]))
+        top, bottom = sorted((first[1], second[1]))
+        handle = drag["handle"]
+        if self._flip_h:
+            handle = handle.translate(str.maketrans("we", "ew"))
+        if self._flip_v:
+            handle = handle.translate(str.maketrans("ns", "sn"))
         anchors = {
-            "nw": second,
-            "se": first,
-            "ne": (first[0], second[1]),
-            "sw": (second[0], first[1]),
+            "nw": (right, bottom),
+            "se": (left, top),
+            "ne": (left, bottom),
+            "sw": (right, top),
         }
-        anchor = anchors.get(drag["handle"])
+        anchor = anchors.get(handle)
         if anchor is None:
             return original
         return replace(original, points=(anchor, image_pos))
@@ -1229,6 +1241,8 @@ class ColorScaleWidget(QWidget):
         self._iso_limit1 = 0.0
         self._iso_limit2 = 1.0
         self._dragging: str | None = None
+        self._mapping = None
+        self._segmentation = (False, 0.0, 1.0)
 
     def set_scale(
         self,
@@ -1237,12 +1251,16 @@ class ColorScaleWidget(QWidget):
         maximum: float,
         invert: bool = False,
         unit: str = "",
+        mapping=None,
+        segmentation=(False, 0.0, 1.0),
     ) -> None:
         self._palette = palette
         self._minimum = float(minimum)
         self._maximum = float(maximum)
         self._invert = bool(invert)
         self._unit = unit
+        self._mapping = mapping
+        self._segmentation = segmentation
         self._active = True
         self.update()
 
@@ -1320,7 +1338,10 @@ class ColorScaleWidget(QWidget):
                 ),
             )
 
-        lut = np.ascontiguousarray(palette_lut(self._palette, self._invert)[::-1]).reshape(256, 1, 3)
+        from .render import legend_colors
+        lut = np.ascontiguousarray(legend_colors(self._palette, self._invert,
+            self._mapping, (self._minimum, self._maximum), self._segmentation,
+            (self._iso_mode, self._iso_limit1, self._iso_limit2))[::-1]).reshape(256, 1, 3)
         image = QImage(
             lut.data,
             1,
@@ -1331,7 +1352,7 @@ class ColorScaleWidget(QWidget):
         clip = QPainterPath()
         clip.addRoundedRect(QRectF(bar), 4, 4)
         painter.setClipPath(clip)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawImage(bar, image)
         zone = self._iso_zone()
         if zone is not None:
@@ -1445,6 +1466,8 @@ class ObjectParametersPanel(QFrame):
 
         self._spins: dict[str, QDoubleSpinBox] = {}
         self._scales: dict[str, float] = {}
+        self._snapshot: dict = {}
+        self._displayed: dict = {}
         # Core rows stay visible; the atmosphere/optics rows fold away (§P8).
         for key, label, minimum, maximum, decimals, scale in self.FIELDS[:2]:
             layout.addLayout(self._field_row(key, label, minimum, maximum, decimals, scale))
@@ -1503,7 +1526,7 @@ class ObjectParametersPanel(QFrame):
         spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         spin.setFixedWidth(88)  # uniform field length regardless of value width
         spin.setProperty("compact", True)
-        spin.editingFinished.connect(self._emit_applied)
+        spin.editingFinished.connect(lambda key=key: self._emit_applied(key))
         row.addWidget(spin)
         self._spins[key] = spin
         self._scales[key] = scale
@@ -1515,17 +1538,24 @@ class ObjectParametersPanel(QFrame):
         self.advanced_button.setIcon(awesome_icon(icon, ICON_MUTED))
 
     def set_parameters(self, snapshot: dict) -> None:
+        self._snapshot = dict(snapshot)
+        self.setEnabled(bool(snapshot.get("can_change", True)))
         for key, spin in self._spins.items():
             if key not in snapshot:
                 continue
             spin.blockSignals(True)
             spin.setValue(float(snapshot[key]) / self._scales[key])
             spin.blockSignals(False)
+            self._displayed[key] = spin.value()
 
-    def _emit_applied(self) -> None:
-        self.applied.emit(
-            {key: spin.value() * self._scales[key] for key, spin in self._spins.items()}
-        )
+    def _emit_applied(self, key: str | None = None) -> None:
+        if not self._snapshot.get("can_change", True):
+            return
+        keys = (key,) if key is not None else self._spins
+        changed = {name: self._spins[name].value() * self._scales[name]
+                   for name in keys if self._spins[name].value() != self._displayed.get(name)}
+        if changed:
+            self.applied.emit(changed)
 
 
 class ElidingLabel(QLabel):
@@ -1906,6 +1936,7 @@ class InspectorPanel(QWidget):
             maximum=15,
         )
         # resolution-dependent median cap (memory budget); set on recording open
+        self.spatial_spin.setSingleStep(2)
         self._median_size_cap: int | None = None
         self.temporal_combo, self.temporal_spin = self._filter_row(
             processing_layout,
@@ -2040,6 +2071,10 @@ class InspectorPanel(QWidget):
         self.spatial_spin.setVisible(str(self.spatial_combo.currentData()) != "none")
         self.temporal_spin.setVisible(str(self.temporal_combo.currentData()) != "none")
         self._apply_spatial_size_cap()
+        size = min(self.spatial_spin.maximum(), int(self.spatial_spin.value()) | 1)
+        self.spatial_spin.blockSignals(True)
+        self.spatial_spin.setValue(size)
+        self.spatial_spin.blockSignals(False)
         if update_only:
             return
         self.filters_changed.emit(
@@ -2312,7 +2347,7 @@ class InspectorPanel(QWidget):
         iso_on = enabled and iso_mode != "off"
         self.iso_limit1_spin.setEnabled(iso_on)
         self.iso_limit2_spin.setEnabled(iso_on and iso_mode == "interval")
-        self.params_panel.setEnabled(enabled)
+        self.params_panel.setEnabled(enabled and self.params_panel._snapshot.get("can_change", False))
         self.clipping_check.setEnabled(enabled)
         self.markers_check.setEnabled(enabled)
         self.flip_h_button.setEnabled(enabled)
@@ -2841,7 +2876,7 @@ class MetadataPanel(QFrame):
 
         self._entries: tuple[tuple[str, str], ...] = ()
         self._known: list[str] = []
-        settings = QSettings("Local", "FLIR Thermal Player")
+        settings = app_settings()
         self._hidden: set[str] = set(settings.value("metadata/hidden", [], type=list))
 
     def set_entries(self, entries: tuple[tuple[str, str], ...]) -> None:
@@ -2866,7 +2901,7 @@ class MetadataPanel(QFrame):
         dialog = MetadataPickerDialog(self._known, self._hidden, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._hidden = dialog.hidden_names()
-            QSettings("Local", "FLIR Thermal Player").setValue(
+            app_settings().setValue(
                 "metadata/hidden", sorted(self._hidden)
             )
             self._render()

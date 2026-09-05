@@ -10,12 +10,13 @@ Run by ``build_exe.bat``; safe to run standalone as well.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import importlib.metadata
 import sys
 from datetime import date
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_DIR = PROJECT_ROOT / "release"
@@ -43,8 +44,7 @@ This is a single-file GUI build. Python, Conda, and the source checkout are
 not required on the target computer. Initial startup may take a few seconds
 while the bundled runtime is extracted.
 
-Verified on {build_date} with the bundled smoke test:
-  FLIR_Thermal_Player.exe <recording>.seq --smoke-test  (playback advances, exit 0)
+{verification}
 
 The executable is unsigned, so Windows SmartScreen may show an unknown
 publisher warning. For wider distribution, sign it with your organization's
@@ -72,6 +72,10 @@ def package_version(name: str) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke-tested", action="store_true",
+                        help="Record successful smoke testing performed by build_exe.bat")
+    args = parser.parse_args()
     if not EXE.is_file():
         print(f"error: {EXE} not found — run PyInstaller first", file=sys.stderr)
         return 1
@@ -98,6 +102,7 @@ def main() -> int:
         f"imageio-ffmpeg: {package_version('imageio-ffmpeg')}",
         f"Executable size: {size:,} bytes ({size / 1048576:.1f} MiB)",
         f"SHA-256: {digest}",
+        f"Smoke test: {'passed' if args.smoke_tested else 'not verified'}",
     ]
     (RELEASE_DIR / "BUILD_INFO.txt").write_text(
         "\n".join(info_lines) + "\n", encoding="utf-8"
@@ -106,7 +111,9 @@ def main() -> int:
     title = f"FLIR Thermal Player {VERSION} (Windows x64)"
     (RELEASE_DIR / "README.txt").write_text(
         README_TEMPLATE.format(
-            version=VERSION, underline="=" * len(title), build_date=build_date
+            version=VERSION, underline="=" * len(title), build_date=build_date,
+            verification=(f"Verified on {build_date}: bundled smoke test exited 0 and playback advanced."
+                          if args.smoke_tested else "This build has not been smoke-test verified.")
         ),
         encoding="utf-8",
     )

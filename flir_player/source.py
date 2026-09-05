@@ -291,6 +291,17 @@ class FlirVideoSource:
         self._reference_label = ""
         self._temporal = TemporalBuffer()
         self._last_frame_index: int | None = None
+        self._reference_spec: tuple[Path, int, str] | None = None
+        self.revision = 0
+
+    def _invalidate_processing(self) -> None:
+        self.revision += 1
+        self._temporal.reset()
+        self._last_frame_index = None
+
+    def _reload_reference(self) -> None:
+        if self._reference_spec is not None:
+            self.load_reference(*self._reference_spec)
 
     @property
     def is_open(self) -> bool:
@@ -377,10 +388,21 @@ class FlirVideoSource:
         if not self._im.has_unit(spec.sdk_unit):
             raise ValueError(f"The current recording does not support {spec.option.label}")
 
-        self._im.unit = spec.sdk_unit
-        if spec.temperature_type is not None:
-            self._im.temp_type = spec.temperature_type
-        self._unit_spec = spec
+        previous = self._unit_spec
+        try:
+            self._im.unit = spec.sdk_unit
+            if spec.temperature_type is not None:
+                self._im.temp_type = spec.temperature_type
+            self._unit_spec = spec
+            self._reload_reference()
+        except Exception:
+            self._unit_spec = previous
+            if previous is not None:
+                self._im.unit = previous.sdk_unit
+                if previous.temperature_type is not None:
+                    self._im.temp_type = previous.temperature_type
+            raise
+        self._invalidate_processing()
         return spec.option
 
     def read_frame(
@@ -393,6 +415,19 @@ class FlirVideoSource:
         if self._im is None or self._unit_spec is None:
             raise RuntimeError("No FLIR recording is open")
         frame_index = max(0, min(int(index), int(self._im.num_frames) - 1))
+        # Define every result by source indices, independent of request order,
+        # packet-cache hits, exports, reverse stepping and payload refreshes.
+        temporal, depth = self._processing.temporal
+        if temporal != "none" and frame_index != (
+            self._last_frame_index + 1 if self._last_frame_index is not None else -1
+        ):
+            self._temporal.reset()
+            for warm_index in range(max(0, frame_index - max(2, int(depth)) + 1), frame_index):
+                self._im.get_frame(warm_index)
+                raw = np.array(self._im.final, copy=True).reshape(
+                    (int(self._im.height), int(self._im.width))
+                )
+                self._process_frame(raw, warm_index)
         self._im.get_frame(frame_index)
         return self._packet_from_current(
             frame_index, request_id, need_clip, need_metadata
@@ -447,7 +482,17 @@ class FlirVideoSource:
             metadata_entries=metadata_entries,
             clip_loaded=need_clip,
             metadata_loaded=need_metadata,
+            revision=self.revision,
+            processing=self._processing,
+            analysis=self._analysis_provenance(),
         )
+
+    def _analysis_provenance(self) -> tuple:
+        # Small immutable values, never SDK handles, accompany numerical exports.
+        reference = self._reference_spec
+        return (("reference", (str(reference[0]), reference[1], reference[2]) if reference else None),
+                ("object_parameters", tuple(self.read_object_parameters().items())),
+                ("corrections", tuple(self.read_corrections().items())))
 
     def _whole_image_stats(self, data: np.ndarray):
         """Whole-image statistics for one (possibly processed) frame.
@@ -496,11 +541,6 @@ class FlirVideoSource:
 
     def _process_frame(self, data: np.ndarray, frame_index: int) -> np.ndarray:
         """Apply the processing pipeline (file-op → point → spatial → temporal)."""
-        if (
-            self._last_frame_index is None
-            or abs(frame_index - self._last_frame_index) != 1
-        ):
-            self._temporal.reset()
         self._last_frame_index = frame_index
         state = self._processing
         if not state.is_active:
@@ -516,11 +556,19 @@ class FlirVideoSource:
         return data
 
     def _frame_roi_stats(self, data: np.ndarray) -> tuple[RoiStats, ...]:
-        """SDK stats normally; app-side stats from the processed frame when active."""
+        """Use SDK fast paths only for coverage with established parity.
+
+        Long SDK diagonal lines can differ by a pixel from integer nearest
+        sampling. Always measure lines with our canonical geometry, including
+        when processing is disabled, so enabling identity filters changes nothing.
+        """
         if self._processing.is_active:
             shapes = tuple(shape for _, shape, _ in self._roi_handles)
             return roi_stats_app(data, shapes)
-        return self._roi_stats()
+        sdk_stats = self._roi_stats()
+        lines = {s.id: s for s in roi_stats_app(data, tuple(
+            shape for _, shape, _ in self._roi_handles if shape.kind == "line"))}
+        return tuple(lines.get(stats.id, stats) for stats in sdk_stats)
 
     def _clip_mask(self, shape: tuple[int, ...]) -> np.ndarray | None:
         """Boolean mask of pixels the SDK flags as clipped/invalid (status bit 1).
@@ -562,6 +610,7 @@ class FlirVideoSource:
         self._processing = ProcessingState()
         self._reference = None
         self._reference_label = ""
+        self._reference_spec = None
         self._temporal.reset()
         self._last_frame_index = None
 
@@ -578,9 +627,13 @@ class FlirVideoSource:
     def set_processing(self, state: ProcessingState) -> None:
         """Update point/spatial/temporal stages; file-op is reference-owned."""
         merged = replace(state, file_op=self._processing.file_op)
-        if merged.temporal != self._processing.temporal or not merged.is_active:
-            self._temporal.reset()
+        from .processing import median_max_size
+        size = max(3, int(merged.spatial[1]) | 1)
+        if merged.spatial[0] == "median" and self._im is not None:
+            size = min(size, median_max_size(int(self._im.height) * int(self._im.width)))
+        merged = replace(merged, spatial=(merged.spatial[0], size))
         self._processing = merged
+        self._invalidate_processing()
 
     def load_reference(self, path: str | Path, frame_index: int, operation: str) -> str:
         """Load a reference frame for file operations (§4.9.5.3).
@@ -598,10 +651,24 @@ class FlirVideoSource:
         same_file = self._metadata is not None and resolved == self._metadata.path
         im = self._im if same_file else fnv.file.ImagerFile(str(resolved))
         try:
-            if self._unit_spec is not None and im.has_unit(self._unit_spec.sdk_unit):
+            if self._unit_spec is not None:
+                if not im.has_unit(self._unit_spec.sdk_unit):
+                    raise ValueError("The reference does not support the selected unit")
                 im.unit = self._unit_spec.sdk_unit
                 if self._unit_spec.temperature_type is not None:
                     im.temp_type = self._unit_spec.temperature_type
+            if not same_file:
+                # Reference pixels use the same measurement parameters and
+                # available correction switches as the current recording.
+                if im.can_change_object_parameters:
+                    params = im.object_parameters
+                    current = self.read_object_parameters()
+                    for field in OBJECT_PARAMETER_FIELDS:
+                        setattr(params, field, current[field])
+                    im.object_parameters = params
+                for key in ("nuc", "bp"):
+                    if getattr(im, f"has_{key}", False):
+                        setattr(im, f"apply_{key}", getattr(self._im, f"apply_{key}", False))
             index = max(0, min(int(frame_index), int(im.num_frames) - 1))
             im.get_frame(index)
             reference = np.array(im.final, copy=True).reshape(
@@ -621,15 +688,18 @@ class FlirVideoSource:
                 f"match the current recording ({expected[1]}×{expected[0]})"
             )
         self._reference = reference
+        self._reference_spec = (resolved, index, str(operation))
         self._processing = replace(self._processing, file_op=str(operation))
-        self._temporal.reset()
+        self._invalidate_processing()
         self._reference_label = f"{resolved.name} · frame {index + 1}"
         return self._reference_label
 
     def clear_reference(self) -> None:
         self._reference = None
         self._reference_label = ""
+        self._reference_spec = None
         self._processing = replace(self._processing, file_op=None)
+        self._invalidate_processing()
 
     def export_roi_bitmasks(self, folder: str | Path) -> list[str]:
         """Export one PNG bitmask per app-managed ROI (§4.9.1.1, p. 61)."""
@@ -637,11 +707,23 @@ class FlirVideoSource:
             raise RuntimeError("No FLIR recording is open")
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
+        from PIL import Image
+        from .geometry import roi_coordinates
+        from .jobs import OutputTransaction
         written: list[str] = []
-        for _roi_id, shape, handle in self._roi_handles:
-            dest = folder / f"{shape.name.replace(' ', '_')}_bitmask.png"
-            if handle.export_bitmask(str(dest)) and dest.is_file():
+        with OutputTransaction([self.metadata.path]) as job:
+            entries = []
+            for _roi_id, shape, handle in self._roi_handles:
+                name = "".join(c if c.isalnum() or c in "-_" else "_" for c in shape.name)
+                dest = folder / f"{name}_bitmask.png"
+                entries.append((shape, job.stage(dest)))
                 written.append(str(dest))
+            for shape, stage in entries:
+                mask = np.zeros((self.metadata.height, self.metadata.width), np.uint8)
+                ys, xs = roi_coordinates(shape, *mask.shape)
+                mask[ys, xs] = 255
+                Image.fromarray(mask).save(stage, "PNG")
+            job.commit()
         return written
 
     def set_rois(self, shapes: tuple[RoiShape, ...]) -> None:
@@ -706,7 +788,7 @@ class FlirVideoSource:
                     mean=float(handle.mean),
                     std_dev=float(handle.std_dev),
                     num_pixels=int(handle.num_pixels),
-                    value=float(handle.center_value),
+                    value=float(handle.center_value if shape.kind == "cursor" else handle.mean),
                     min_position=_position(handle.min_position),
                     max_position=_position(handle.max_position),
                 )
@@ -758,33 +840,9 @@ class FlirVideoSource:
         options.end_frame = int(end_frame)
         options.decimation = max(1, int(decimation))
 
-        def _callback(current: int, total: int) -> bool:
-            if progress is not None:
-                progress(current, total)
-            return bool(abort is not None and abort())  # True aborts the SDK call
-
-        options.progress_callback = _callback
-        try:
-            ok = bool(self._im.extract(str(dest_path), options))
-        except Exception as exc:
-            return (False, f"{type(exc).__name__}: {exc}")
-
-        aborted = bool(abort is not None and abort())
-        if aborted or not ok or not dest_path.is_file():
-            try:
-                dest_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            if aborted:
-                return (False, "Extraction cancelled")
-            if not ok:
-                return (False, "The File SDK reported the extraction as failed")
-            return (
-                False,
-                "The File SDK produced no output for this recording "
-                "(extraction is only supported from ATS sources)",
-            )
-        return (True, "")
+        from .jobs import extract_recording
+        return extract_recording(self._im, self.metadata.path, dest_path, options,
+                                 progress=progress, abort=abort)
 
     def read_corrections(self) -> dict[str, bool]:
         """Availability and apply-state of embedded NUC / bad-pixel corrections."""
@@ -801,11 +859,21 @@ class FlirVideoSource:
         """Toggle embedded corrections; files without them are left untouched."""
         if self._im is None:
             raise RuntimeError("No FLIR recording is open")
-        if nuc is not None and self.read_corrections()["has_nuc"]:
-            self._im.apply_nuc = bool(nuc)
-        if bp is not None and self.read_corrections()["has_bp"]:
-            self._im.apply_bp = bool(bp)
-        self._im.update_frame()
+        previous = self.read_corrections()
+        try:
+            if nuc is not None and previous["has_nuc"]:
+                self._im.apply_nuc = bool(nuc)
+            if bp is not None and previous["has_bp"]:
+                self._im.apply_bp = bool(bp)
+            self._im.update_frame()
+            self._reload_reference()
+        except Exception:
+            for key in ("nuc", "bp"):
+                if previous[f"has_{key}"]:
+                    setattr(self._im, f"apply_{key}", previous[f"apply_{key}"])
+            self._im.update_frame()
+            raise
+        self._invalidate_processing()
         return self.read_corrections()
 
     def read_object_parameters(self) -> dict[str, Any]:
@@ -829,15 +897,23 @@ class FlirVideoSource:
         """
         if self._im is None:
             raise RuntimeError("No FLIR recording is open")
-        if values is None:
-            self._im.reset_object_parameters()
-        else:
-            params = self._im.object_parameters
-            for field in OBJECT_PARAMETER_FIELDS:
-                if field in values:
-                    setattr(params, field, float(values[field]))
-            self._im.object_parameters = params
-        self._im.update_frame()
+        previous = self._im.object_parameters
+        try:
+            if values is None:
+                self._im.reset_object_parameters()
+            else:
+                params = self._im.object_parameters
+                for field in OBJECT_PARAMETER_FIELDS:
+                    if field in values:
+                        setattr(params, field, float(values[field]))
+                self._im.object_parameters = params
+            self._im.update_frame()
+            self._reload_reference()
+        except Exception:
+            self._im.object_parameters = previous
+            self._im.update_frame()
+            raise
+        self._invalidate_processing()
         return self.read_object_parameters()
 
     def _timestamp_for_frame(self, index: int) -> datetime | None:

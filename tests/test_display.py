@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from flir_player.settings import app_settings
+
 from pathlib import Path
 
 import numpy as np
@@ -147,9 +149,8 @@ def test_lut_from_stops_requires_two_stops() -> None:
 
 
 def test_custom_palette_register_roundtrip(tmp_path) -> None:
-    from PySide6.QtCore import QSettings
-
-    QSettings("Local", "FLIR Thermal Player").remove("palettes/custom")
+    saved = app_settings().value("palettes/custom", "[]")
+    app_settings().remove("palettes/custom")
     stops = [(0.0, (255, 0, 0)), (1.0, (0, 0, 255))]
     try:
         register_custom_palette("Unit Test Ramp", stops)
@@ -167,7 +168,8 @@ def test_custom_palette_register_roundtrip(tmp_path) -> None:
         assert tuple(palette_lut("Unit Test Ramp")[0]) == (255, 0, 0)
     finally:
         unregister_custom_palette("Unit Test Ramp")
-        QSettings("Local", "FLIR Thermal Player").remove("palettes/custom")
+        app_settings().setValue("palettes/custom", saved)
+        load_custom_palettes()
     assert "Unit Test Ramp" not in palette_names()
 
 

@@ -60,6 +60,11 @@ def apply_file_operation(
 ) -> np.ndarray:
     if reference is None or operation is None:
         return data
+    # Counts are uint16. Promote before arithmetic, including products whose
+    # exact integer values exceed float32's 24-bit mantissa.
+    dtype = np.float64 if data.dtype.kind in "iu" or reference.dtype.kind in "iu" else np.result_type(data, reference)
+    data = data.astype(dtype, copy=False)
+    reference = reference.astype(dtype, copy=False)
     if operation == "subtract":
         return data - reference
     if operation == "add":
@@ -190,7 +195,8 @@ def apply_spatial_filter(data: np.ndarray, name: str, size: int) -> np.ndarray:
 class TemporalBuffer:
     """Ring of recent pipeline-input frames for temporal filters.
 
-    Storage is a single preallocated contiguous (depth, H, W) float32 ring,
+    Storage is a preallocated contiguous (depth, H, W) ring, float32 for
+    Counts/float32 inputs and float64 for higher-precision processing,
     replacing the per-frame ``np.stack`` of the whole history (~105 MiB
     transient at depth 30, 1280×720). ``average`` maintains rolling finite
     sum/count arrays — O(pixels) per frame instead of O(depth × pixels).
@@ -223,8 +229,9 @@ class TemporalBuffer:
             self._ring is None
             or self._depth != depth
             or self._ring.shape[1:] != data.shape
+            or self._ring.dtype != np.result_type(data.dtype, np.float32)
         ):
-            self._ring = np.empty((depth,) + data.shape, dtype=np.float32)
+            self._ring = np.empty((depth,) + data.shape, dtype=np.result_type(data.dtype, np.float32))
             self._sum = np.zeros(data.shape, dtype=np.float64)
             self._valid = np.zeros(data.shape, dtype=np.float64)
             self._index = 0
@@ -243,7 +250,7 @@ class TemporalBuffer:
             self._count += 1
 
         slot = self._ring[self._index]
-        np.copyto(slot, data, casting="unsafe")  # cast into the float32 ring
+        np.copyto(slot, data, casting="unsafe")  # retain the processing dtype
         np.add(self._sum, np.where(np.isfinite(slot), slot, 0.0), out=self._sum)
         np.add(self._valid, np.isfinite(slot), out=self._valid)
         self._index = (self._index + 1) % self._depth
@@ -314,40 +321,5 @@ def roi_stats_app(data: np.ndarray, shapes: tuple[RoiShape, ...]) -> tuple[RoiSt
     return tuple(results)
 
 
-def _roi_coordinates(
-    shape: RoiShape, height: int, width: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """(ys, xs) index arrays covered by the ROI geometry."""
-
-    def clip_point(point: tuple[float, float]) -> tuple[int, int]:
-        return (
-            max(0, min(int(round(point[0])), width - 1)),
-            max(0, min(int(round(point[1])), height - 1)),
-        )
-
-    if shape.kind == "cursor" and len(shape.points) == 1:
-        x, y = clip_point(shape.points[0])
-        return np.array([y]), np.array([x])
-
-    if shape.kind == "line" and len(shape.points) == 2:
-        (x0, y0), (x1, y1) = shape.points
-        length = int(round(float(np.hypot(x1 - x0, y1 - y0)))) + 1
-        xs = np.clip(np.round(np.linspace(x0, x1, length)).astype(int), 0, width - 1)
-        ys = np.clip(np.round(np.linspace(y0, y1, length)).astype(int), 0, height - 1)
-        return ys, xs
-
-    if shape.kind in {"rect", "ellipse"} and len(shape.points) == 2:
-        (x0, y0), (x1, y1) = clip_point(shape.points[0]), clip_point(shape.points[1])
-        left, right = sorted((x0, x1))
-        top, bottom = sorted((y0, y1))
-        yy, xx = np.mgrid[top:bottom, left:right]
-        if shape.kind == "ellipse":
-            cx = (left + right) / 2.0
-            cy = (top + bottom) / 2.0
-            rx = max((right - left) / 2.0, 0.5)
-            ry = max((bottom - top) / 2.0, 0.5)
-            inside = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
-            return yy[inside].ravel(), xx[inside].ravel()
-        return yy.ravel(), xx.ravel()
-
-    return np.empty(0, dtype=int), np.empty(0, dtype=int)
+# Backward-compatible name for callers; one shared geometry implementation.
+from .geometry import roi_coordinates as _roi_coordinates

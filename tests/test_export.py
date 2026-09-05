@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from flir_player.settings import app_settings
+
 import csv
 from pathlib import Path
 
@@ -12,7 +14,6 @@ import pytest
 from conftest import wait_until
 
 from PIL import Image
-from PySide6.QtCore import QSettings
 
 from flir_player.compose import ExportOptions, compose_frame
 from flir_player.export import (
@@ -258,8 +259,10 @@ def test_movie_export_end_to_end(qapp, tmp_path) -> None:
         qapp.processEvents()
 
 
-def test_batch_extract_reports_non_ats_honestly(qapp, tmp_path) -> None:
+def test_batch_extract_reports_non_ats_honestly(qapp, tmp_path, monkeypatch) -> None:
     window = MainWindow()
+    errors = []
+    monkeypatch.setattr(window, "_show_error", lambda title, message: errors.append(message))
     window.show()
     try:
         window.open_path(SAMPLES / "2.seq")
@@ -279,6 +282,7 @@ def test_batch_extract_reports_non_ats_honestly(qapp, tmp_path) -> None:
         _ok, message = finished[0]
         assert "1 of 2" in message
         assert "2.seq" in message  # reported as producing no output
+        assert errors and "2.seq" in errors[0]
         assert (tmp_path / "1_extract.ats").is_file()
         assert not (tmp_path / "2_extract.ats").exists()
     finally:
@@ -341,7 +345,7 @@ def test_render_frame_rgb_matches_window_pipeline(qapp) -> None:
 
 
 def test_recent_files_roundtrip(qapp) -> None:
-    settings = QSettings("Local", "FLIR Thermal Player")
+    settings = app_settings()
     previous = settings.value("files/recent", [])
     settings.setValue("files/recent", [])
     window = MainWindow()

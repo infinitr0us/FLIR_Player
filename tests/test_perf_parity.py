@@ -800,7 +800,8 @@ def test_stats_csv_writer_streams_rows(tmp_path) -> None:
 
     with dest.open() as handle:
         rows = list(csv_module.reader(handle))
-    assert len(rows) == 3 and rows[0][-1] == "Roi 1 std_dev"
+    assert len(rows) == 3 and "Roi 1 std_dev" in rows[0]
+    assert rows[0][-1] == "analysis_revision"
 
 
 def test_tiff_series_bypasses_rgb(qapp, tmp_path) -> None:
