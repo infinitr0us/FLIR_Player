@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from dataclasses import dataclass
 from functools import lru_cache
@@ -34,7 +35,7 @@ CUSTOM_PALETTE_STOPS: dict[str, list] = {}
 
 
 def palette_names() -> tuple[str, ...]:
-    return tuple(PALETTES) + tuple(CUSTOM_PALETTES)
+    return tuple(PALETTES) + tuple(name for name in CUSTOM_PALETTES if name not in PALETTES)
 
 
 def lut_from_stops(stops) -> np.ndarray:
@@ -57,6 +58,8 @@ def register_custom_palette(name: str, stops) -> None:
     name = str(name).strip()
     if not name:
         raise ValueError("Palette name must not be empty")
+    if name in PALETTES:
+        raise ValueError(f"“{name}” is a built-in palette; choose another name")
     CUSTOM_PALETTE_STOPS[name] = [
         (float(p), tuple(int(c) for c in rgb)) for p, rgb in stops
     ]
@@ -77,6 +80,8 @@ def load_custom_palettes() -> None:
     except (TypeError, ValueError):
         return
     for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("name") in PALETTES:
+            continue  # never let a saved palette shadow a built-in one
         try:
             CUSTOM_PALETTE_STOPS[entry["name"]] = [
                 (float(p), tuple(int(c) for c in rgb)) for p, rgb in entry["stops"]
@@ -435,11 +440,49 @@ def frame_seconds(packet_timestamp, metadata, frame_index: int) -> float:
     return metadata.fallback_seconds_for_frame(frame_index)
 
 
+_TEMPERATURE_SUFFIXES = {"°C", "°F", "K", "°R"}
+
+
+def span_decimals(span: float, significant: int = 3, minimum: int = 0, maximum: int = 8) -> int:
+    """Decimal places that show about ``significant`` digits across a range.
+
+    Radiance spans ~0.0006 on the sample SEQ, Counts ~200: one fixed number
+    of decimals cannot label both.
+    """
+    span = abs(float(span))
+    if not math.isfinite(span) or span <= 0:
+        return max(minimum, min(maximum, 2))
+    return max(minimum, min(maximum, significant - 1 - math.floor(math.log10(span))))
+
+
+def format_tick(value: float, low: float, high: float) -> str:
+    """Legend tick label with enough decimals to tell a range's ticks apart."""
+    decimals = span_decimals(high - low)
+    rounded = round(float(value), decimals)
+    return f"{rounded if rounded != 0 else 0.0:.{decimals}f}"  # never "-0.00"
+
+
+def _significant(value: float, digits: int) -> str:
+    """Fixed-point text with ``digits`` significant digits (no exponent)."""
+    value = float(value)
+    if value == 0 or not math.isfinite(value):
+        return "0" if value == 0 else str(value)
+    decimals = max(0, digits - 1 - math.floor(math.log10(abs(value))))
+    return f"{value:.{decimals}f}"
+
+
 def format_value(value: float, suffix: str) -> str:
     if suffix == "counts":
         return f"{value:.0f} counts"
     if not suffix:
-        return f"{value:.0f}"
-    if suffix in {"°C", "°F", "K", "°R"}:
+        return _significant(value, 4)
+    if suffix in _TEMPERATURE_SUFFIXES:
         return f"{value:.2f} {suffix}"
-    return f"{value:.3g} {suffix}".strip()
+    return f"{_significant(value, 5)} {suffix}".strip()
+
+
+def format_spread(value: float, suffix: str) -> str:
+    """Standard deviations: two decimals, significant digits for tiny units."""
+    if suffix == "counts" or suffix in _TEMPERATURE_SUFFIXES:
+        return f"{value:.2f} {suffix}"
+    return f"{_significant(value, 3)} {suffix}".strip()

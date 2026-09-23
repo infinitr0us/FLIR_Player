@@ -80,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
 
         window.decoder.opened.connect(exercise_playback)
         window.decoder.failed.connect(lambda _message: finish(2))
+        window.decoder.open_failed.connect(lambda _open_id, _message: finish(2))
         QTimer.singleShot(20000, lambda: finish(3))
 
     return app.exec()

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -293,11 +294,19 @@ class FlirVideoSource:
         self._last_frame_index: int | None = None
         self._reference_spec: tuple[Path, int, str] | None = None
         self.revision = 0
+        # Temporal-filter inputs (file op → point → spatial) by (revision,
+        # index), so warm-ups after a seek replay cached work, not the pipeline.
+        self._pretemporal: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._pretemporal_bytes = 0
+        self._provenance: tuple[int, tuple] | None = None  # (revision, provenance)
 
     def _invalidate_processing(self) -> None:
         self.revision += 1
         self._temporal.reset()
         self._last_frame_index = None
+        self._pretemporal.clear()
+        self._pretemporal_bytes = 0
+        self._provenance = None
 
     def _reload_reference(self) -> None:
         if self._reference_spec is not None:
@@ -415,23 +424,72 @@ class FlirVideoSource:
         if self._im is None or self._unit_spec is None:
             raise RuntimeError("No FLIR recording is open")
         frame_index = max(0, min(int(index), int(self._im.num_frames) - 1))
+        try:
+            return self._read_frame(frame_index, request_id, need_clip, need_metadata)
+        except BaseException:
+            # A failure part-way (e.g. MemoryError in a large median) leaves the
+            # temporal ring and frame index unreliable: a retry must not treat
+            # the previous frame's window as this frame's. Rebuild from scratch.
+            self._temporal.reset()
+            self._last_frame_index = None
+            raise
+
+    def _read_frame(
+        self, frame_index: int, request_id: int, need_clip: bool, need_metadata: bool
+    ) -> FramePacket:
         # Define every result by source indices, independent of request order,
         # packet-cache hits, exports, reverse stepping and payload refreshes.
         temporal, depth = self._processing.temporal
-        if temporal != "none" and frame_index != (
-            self._last_frame_index + 1 if self._last_frame_index is not None else -1
-        ):
-            self._temporal.reset()
-            for warm_index in range(max(0, frame_index - max(2, int(depth)) + 1), frame_index):
-                self._im.get_frame(warm_index)
-                raw = np.array(self._im.final, copy=True).reshape(
-                    (int(self._im.height), int(self._im.width))
+        if temporal != "none":
+            depth = max(2, int(depth))
+            if frame_index == self._last_frame_index and len(self._temporal):
+                # The frame just produced again (payload refetch, ROI edit):
+                # its window is already in the ring, so nothing is replayed.
+                self._im.get_frame(frame_index)
+                return self._packet_from_current(
+                    frame_index, request_id, need_clip, need_metadata,
+                    processed=self._temporal.result(temporal),
                 )
-                self._process_frame(raw, warm_index)
+            if frame_index != (
+                self._last_frame_index + 1 if self._last_frame_index is not None else -1
+            ):
+                self._temporal.reset()
+                for warm_index in range(max(0, frame_index - depth + 1), frame_index):
+                    self._temporal.push(self._pretemporal_frame(warm_index), depth)
+                    self._last_frame_index = warm_index
         self._im.get_frame(frame_index)
         return self._packet_from_current(
             frame_index, request_id, need_clip, need_metadata
         )
+
+    _PRETEMPORAL_BUDGET = 256 * 1024 * 1024
+
+    def _pretemporal_frame(self, frame_index: int, raw: np.ndarray | None = None) -> np.ndarray:
+        """Frame ``frame_index`` through every stage before the temporal filter.
+
+        Cached per processing revision (arrays are never modified afterwards),
+        bounded by a byte budget and about two temporal windows.
+        """
+        key = (self.revision, frame_index)
+        cached = self._pretemporal.get(key)
+        if cached is not None:
+            self._pretemporal.move_to_end(key)
+            return cached
+        if raw is None:
+            self._im.get_frame(frame_index)
+            raw = np.array(self._im.final, copy=True).reshape(
+                (int(self._im.height), int(self._im.width))
+            )
+        data = self._pretemporal_stages(raw)
+        self._pretemporal[key] = data
+        self._pretemporal_bytes += data.nbytes
+        limit = 2 * max(2, int(self._processing.temporal[1]))
+        while len(self._pretemporal) > 1 and (
+            self._pretemporal_bytes > self._PRETEMPORAL_BUDGET or len(self._pretemporal) > limit
+        ):
+            _, evicted = self._pretemporal.popitem(last=False)
+            self._pretemporal_bytes -= evicted.nbytes
+        return data
 
     def _packet_from_current(
         self,
@@ -439,6 +497,7 @@ class FlirVideoSource:
         request_id: int,
         need_clip: bool = True,
         need_metadata: bool = True,
+        processed: np.ndarray | None = None,
     ) -> FramePacket:
         """Build a FramePacket for the frame the SDK is currently positioned on.
 
@@ -447,10 +506,13 @@ class FlirVideoSource:
         interactive requests pass False when those views are hidden, exports
         always keep the defaults.
         """
-        data = np.array(self._im.final, copy=True).reshape(
-            (int(self._im.height), int(self._im.width))
-        )
-        data = self._process_frame(data, frame_index)
+        if processed is None:
+            data = np.array(self._im.final, copy=True).reshape(
+                (int(self._im.height), int(self._im.width))
+            )
+            data = self._process_frame(data, frame_index)
+        else:
+            data = processed
         (
             minimum,
             maximum,
@@ -489,10 +551,16 @@ class FlirVideoSource:
 
     def _analysis_provenance(self) -> tuple:
         # Small immutable values, never SDK handles, accompany numerical exports.
+        # Everything here changes only with the revision, so read the SDK once.
+        if self._provenance is not None and self._provenance[0] == self.revision:
+            return self._provenance[1]
         reference = self._reference_spec
-        return (("reference", (str(reference[0]), reference[1], reference[2]) if reference else None),
-                ("object_parameters", tuple(self.read_object_parameters().items())),
-                ("corrections", tuple(self.read_corrections().items())))
+        provenance = (
+            ("reference", (str(reference[0]), reference[1], reference[2]) if reference else None),
+            ("object_parameters", tuple(self.read_object_parameters().items())),
+            ("corrections", tuple(self.read_corrections().items())))
+        self._provenance = (self.revision, provenance)
+        return provenance
 
     def _whole_image_stats(self, data: np.ndarray):
         """Whole-image statistics for one (possibly processed) frame.
@@ -532,8 +600,8 @@ class FlirVideoSource:
         return (
             float(np.min(finite)),
             float(np.max(finite)),
-            float(np.mean(finite)),
-            float(np.std(finite)),
+            float(np.mean(finite, dtype=np.float64)),
+            float(np.std(finite, dtype=np.float64)),
             num_pixels,
             (int(low_index[1]), int(low_index[0])),
             (int(high_index[1]), int(high_index[0])),
@@ -541,18 +609,26 @@ class FlirVideoSource:
 
     def _process_frame(self, data: np.ndarray, frame_index: int) -> np.ndarray:
         """Apply the processing pipeline (file-op → point → spatial → temporal)."""
-        self._last_frame_index = frame_index
         state = self._processing
         if not state.is_active:
-            return data
+            result = data
+        elif state.temporal[0] != "none":
+            result = self._temporal.apply(
+                self._pretemporal_frame(frame_index, raw=data), state.temporal[0], state.temporal[1]
+            )
+        else:
+            result = self._pretemporal_stages(data)
+        self._last_frame_index = frame_index  # only once the frame is fully processed
+        return result
+
+    def _pretemporal_stages(self, data: np.ndarray) -> np.ndarray:
+        state = self._processing
         if state.file_op is not None and self._reference is not None:
             data = apply_file_operation(data, self._reference, state.file_op)
         if state.point[0] != "none":
             data = apply_point_filter(data, state.point[0], state.point[1])
         if state.spatial[0] != "none":
             data = apply_spatial_filter(data, state.spatial[0], state.spatial[1])
-        if state.temporal[0] != "none":
-            data = self._temporal.apply(data, state.temporal[0], state.temporal[1])
         return data
 
     def _frame_roi_stats(self, data: np.ndarray) -> tuple[RoiStats, ...]:
@@ -613,6 +689,9 @@ class FlirVideoSource:
         self._reference_spec = None
         self._temporal.reset()
         self._last_frame_index = None
+        self._pretemporal.clear()
+        self._pretemporal_bytes = 0
+        self._provenance = None
 
     # --- processing pipeline (§4.8.6, §4.9.5.3) ------------------------------------
 
@@ -701,21 +780,24 @@ class FlirVideoSource:
         self._processing = replace(self._processing, file_op=None)
         self._invalidate_processing()
 
-    def export_roi_bitmasks(self, folder: str | Path) -> list[str]:
-        """Export one PNG bitmask per app-managed ROI (§4.9.1.1, p. 61)."""
+    def export_roi_bitmasks(self, folder: str | Path, overwrite=()) -> list[str]:
+        """Export one PNG bitmask per app-managed ROI (§4.9.1.1, p. 61).
+
+        ``overwrite`` lists existing bitmask files the user agreed to replace.
+        """
         if self._im is None:
             raise RuntimeError("No FLIR recording is open")
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         from PIL import Image
+        from .export import bitmask_filename
         from .geometry import roi_coordinates
         from .jobs import OutputTransaction
         written: list[str] = []
-        with OutputTransaction([self.metadata.path]) as job:
+        with OutputTransaction([self.metadata.path], replace=overwrite) as job:
             entries = []
             for _roi_id, shape, handle in self._roi_handles:
-                name = "".join(c if c.isalnum() or c in "-_" else "_" for c in shape.name)
-                dest = folder / f"{name}_bitmask.png"
+                dest = folder / bitmask_filename(shape.name)
                 entries.append((shape, job.stage(dest)))
                 written.append(str(dest))
             for shape, stage in entries:
@@ -748,13 +830,14 @@ class FlirVideoSource:
         self._im.update_frame()
 
     def _add_roi(self, shape: RoiShape) -> Any | None:
+        from .geometry import pixel_index
         width, height = int(self._im.width), int(self._im.height)
 
         def clamp(point: tuple[float, float]) -> dict[str, int]:
-            return {
-                "x": max(0, min(int(round(point[0])), width - 1)),
-                "y": max(0, min(int(round(point[1])), height - 1)),
-            }
+            # The same integer pixels as the app geometry, so SDK statistics
+            # and app-side statistics measure one pixel set.
+            x, y = pixel_index(shape.kind, point[0], point[1], width, height)
+            return {"x": x, "y": y}
 
         if shape.kind == "cursor" and len(shape.points) == 1:
             return self._im.rois.add_cursor(clamp(shape.points[0]))
@@ -811,6 +894,23 @@ class FlirVideoSource:
         except Exception:
             pass
         return None
+
+    def state_snapshot(self) -> dict:
+        """Plain-value measurement and processing state currently in force."""
+        spec = self._reference_spec
+        return {
+            "unit": self.unit.key,
+            "object_parameters": self.read_object_parameters(),
+            "corrections": self.read_corrections(),
+            "reference": None if spec is None else {
+                "path": str(spec[0]), "frame_index": spec[1], "op": spec[2]},
+            "reference_label": self._reference_label,
+            "processing": {
+                "point": tuple(self._processing.point),
+                "spatial": tuple(self._processing.spatial),
+                "temporal": tuple(self._processing.temporal),
+            },
+        }
 
     def take_first_packet(self) -> FramePacket | None:
         """Hand out the frame-0 packet decoded during open() (consumed once)."""

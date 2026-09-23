@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.4.2 — 2026-09-23
+
+This release fixes the findings of a whole-package review of 0.4.1: side
+effects of that release's safety fixes, measurement accuracy at the pixel
+level, and controls that drifted from the data they describe.
+
+### Measurements
+
+- Spots and line endpoints measure the pixel they are drawn on; before, a
+  click in the right or bottom half of a pixel measured its neighbour.
+  Flipped views no longer shift boxes/ellipses by one pixel, the hover probe
+  reads the pixel under the pointer and draws its marker there (also at
+  125–175 % display scaling), and export overlays follow the same convention.
+  Boxes and ellipses can include the last row and column.
+- Isotherm, segmentation and fixed-range limits survive object-parameter,
+  correction and domain-preserving filter changes. When the domain does
+  change they re-seed like first enabling them, so an isotherm no longer
+  paints the whole frame. A unit change overtaken by a frame step still
+  converts them.
+- Statistics CSV columns are matched to ROIs by identity, and boxes/ellipses
+  too thin to cover a pixel are no longer created, so values can no longer
+  shift under another ROI's name.
+- Radiance and other small-valued units get enough decimals in the fixed
+  range, segmentation and isotherm fields, the legends and the readouts; raw
+  CSV export is lossless; emissivity and transmissions take three decimals.
+- Whole-image statistics reduce in float64; the temporal average recovers
+  exactly after an extreme-magnitude frame leaves its window.
+
+### Exports
+
+- Confirmed replacements are honoured (including the Save dialog's own
+  prompt) and restored if the job fails. If a previous version cannot be put
+  back, it is kept as "name (previous)" and the error says so. Export dialogs
+  suggest unused names and ask before replacing, while still open.
+- Outputs publish on drives without hard links (FAT32/exFAT USB sticks).
+- Movie decimation explains that the frame rate is not divided by N.
+
+### Interface
+
+- Controls return to the state in force when the decoder rejects a unit,
+  parameter, correction, reference or filter change (unless a newer change
+  already replaced it); a superseded file open can no longer populate the
+  window.
+- The hover readout follows new frames, unit changes and flips.
+- The palette editor's Color… and Remove Stop act on the clicked stop;
+  renaming a custom palette retires the old name; built-in names are reserved.
+- Clicking the timeline jumps there (and can be dragged); wheel and keyboard
+  steps seek too.
+- An external reference can use any of its frames, not only as many as the
+  open recording has.
+- Integer Counts histograms use integer-aligned bins (no comb pattern).
+
+### Performance
+
+- With a temporal filter, re-serving the current frame (metadata tab,
+  clipping toggle, ROI edits) no longer replays its window, and seeks reuse
+  cached pre-temporal frames; typed filter values apply on Enter, and pending
+  filter states coalesce. A frame whose processing fails (e.g. out of memory)
+  is recomputed on retry, never served from the previous window.
+
+### Validation and development
+
+- 266 tests pass, including 52 new regression cases; eight existing Qt
+  deprecation warnings remain. With SDK imports disabled, 154 tests pass and
+  108 skip.
+- Rendered-pixel tests compare the probe, spots and boxes with what the canvas
+  draws under every flip, including at 125/150/175 % display scaling.
+- Output transactions are tested against missing hard links, failed or
+  locked restores, and files changed by other programs mid-job.
+- Source smoke tests pass on ATS, SEQ and CSQ and at 125 % scaling; builds
+  smoke-test the executable with throw-away preferences.
+
+Native Windows file dialogs, a physical FAT32/exFAT drive and
+correction-bearing recordings were not exercised by these tests. This is a
+source-only release: obtain the proprietary FLIR File SDK separately and run
+from source or build locally.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.4.1...v0.4.2)
+
 ## 0.4.1 — 2026-09-05
 
 This release fixes analysis consistency, output safety and interactions between

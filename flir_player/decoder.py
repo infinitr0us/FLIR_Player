@@ -18,11 +18,12 @@ from PySide6.QtCore import QThread, Signal
 
 from .compose import compose_frame
 from .export import (
-    EXTENSIONS,
     MovieWriter,
     StatsCsvWriter,
     frame_burn_label,
     save_frame,
+    series_frame_path,
+    series_stats_path,
     stats_csv_header,
     stats_csv_row,
 )
@@ -163,6 +164,8 @@ def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
 class DecoderThread(QThread):
     """Owns File SDK state and performs all decoding away from the UI thread."""
 
+    _STATE_COMMANDS = frozenset({"unit", "params", "corrections", "reference", "filters"})
+
     opened = Signal(object, object, object)
     frame_ready = Signal(object)
     unit_ready = Signal(object, object)
@@ -175,6 +178,11 @@ class DecoderThread(QThread):
     export_finished = Signal(bool, str)
     busy_changed = Signal(bool, str)
     failed = Signal(str)
+    open_failed = Signal(int, str)  # open generation, message
+    # A rejected state change: its request id, the message, and the
+    # measurement/processing state still in force (None if unavailable), so
+    # the GUI can put its controls back unless a newer change superseded it.
+    state_failed = Signal(int, str, object)
 
     def __init__(
         self,
@@ -189,9 +197,11 @@ class DecoderThread(QThread):
         self._abort = False
         self._tokens: list[CancellationToken] = []
 
-    def request_open(self, path: str) -> None:
+    def request_open(self, path: str, open_id: int = 0) -> None:
+        """Open a recording; ``open_id`` tags the opened packet and failures so
+        the GUI can ignore an open that a later one superseded."""
         self._clear_pending_commands()
-        self._commands.put(("open", path))
+        self._commands.put(("open", (path, int(open_id))))
 
     def request_frame(
         self,
@@ -234,7 +244,17 @@ class DecoderThread(QThread):
         self._commands.put(("reference", (payload, int(index), int(request_id))))
 
     def request_filters(self, state: dict, index: int, request_id: int) -> None:
-        self._commands.put(("filters", (dict(state), int(index), int(request_id))))
+        """Latest-wins like frame reads: each filter state replaces the whole
+        point/spatial/temporal state, so a pending one that a newer state
+        supersedes would only cost a full (temporal warm-up) recompute."""
+        payload = (dict(state), int(index), int(request_id))
+        with self._commands.not_empty:
+            queue = self._commands.queue
+            kept = [entry for entry in queue if entry[0] != "filters"]
+            kept.append(("filters", payload))
+            queue.clear()
+            queue.extend(kept)
+            self._commands.not_empty.notify()
 
     def request_extract(self, params: dict) -> None:
         token = CancellationToken()
@@ -251,8 +271,10 @@ class DecoderThread(QThread):
         self._tokens.append(token)
         self._commands.put(("batch_extract", dict(params, _token=token)))
 
-    def request_export_bitmasks(self, folder: str) -> None:
-        self._commands.put(("export_bitmasks", {"folder": str(folder)}))
+    def request_export_bitmasks(self, folder: str, overwrite=()) -> None:
+        """``overwrite``: existing bitmask files the user agreed to replace."""
+        self._commands.put(("export_bitmasks", {"folder": str(folder),
+                                                "replace": [str(path) for path in overwrite]}))
 
     def cancel_extract(self) -> None:
         """Abort the running extract/export operation."""
@@ -276,15 +298,17 @@ class DecoderThread(QThread):
                     break
                 try:
                     if command == "open":
+                        path, open_id = payload
                         self.busy_changed.emit(True, "Opening recording…")
                         source.close()
                         cache.clear()
-                        metadata = source.open(payload)
+                        metadata = source.open(path)
                         packet = source.take_first_packet()
                         if packet is None:
                             packet = source.read_frame(0, request_id=0)
-                        cache.put((packet.revision, packet.unit.key, 0), packet)
-                        self.opened.emit(metadata, source.available_units, packet)
+                        cache.put((packet.revision, packet.unit.key, 0), replace(packet, request_id=0))
+                        self.opened.emit(metadata, source.available_units,
+                                         replace(packet, request_id=open_id))
                         self.object_params_ready.emit(source.read_object_parameters())
                         self.corrections_ready.emit(source.read_corrections())
                         self.busy_changed.emit(False, "")
@@ -382,7 +406,8 @@ class DecoderThread(QThread):
                         self.busy_changed.emit(False, "")
                     elif command == "export_bitmasks":
                         self.busy_changed.emit(True, "Exporting ROI bitmasks…")
-                        written = source.export_roi_bitmasks(payload["folder"])
+                        written = source.export_roi_bitmasks(
+                            payload["folder"], overwrite=payload.get("replace", ()))
                         self.export_finished.emit(
                             True, f"Wrote {len(written)} bitmask file(s)"
                         )
@@ -404,6 +429,16 @@ class DecoderThread(QThread):
                         self.extract_finished.emit(False, message)
                     elif command in {"export_sequence", "batch_extract", "export_bitmasks"}:
                         self.export_finished.emit(False, message)
+                    elif command == "open":
+                        self.open_failed.emit(payload[1], message)
+                    elif command in self._STATE_COMMANDS:
+                        state = None
+                        if source.is_open:
+                            try:
+                                state = source.state_snapshot()
+                            except Exception:
+                                pass  # the failure itself is still reported
+                        self.state_failed.emit(payload[-1], message, state)  # request id is last
                     else:
                         self.failed.emit(message)
                 finally:
@@ -433,7 +468,9 @@ class DecoderThread(QThread):
         from .processing import TemporalBuffer
         source._temporal, source._last_frame_index = TemporalBuffer(), None
         try:
-            with OutputTransaction([source.metadata.path], lambda: self._job_aborted(payload)) as job:
+            # Only outputs the export dialog confirmed replacing may be replaced.
+            with OutputTransaction([source.metadata.path], lambda: self._job_aborted(payload),
+                                   replace=payload.get("replace", ())) as job:
                 paths = {}
                 if is_movie:
                     stage = job.stage(dest)
@@ -444,9 +481,9 @@ class DecoderThread(QThread):
                         raise ValueError("Base name must be a filename, without a directory")
                     # Preflight the entire map before writing the first frame.
                     for index in frame_range:
-                        paths[index] = job.stage(dest / f"{base}_{index + 1:05d}{EXTENSIONS[payload['fmt']]}")
+                        paths[index] = job.stage(series_frame_path(dest, base, index, payload["fmt"]))
                     if payload.get("stats_csv"):
-                        stage = job.stage(dest / f"{base}_stats.csv")
+                        stage = job.stage(series_stats_path(dest, base))
                         stats_writer = StatsCsvWriter(stage, stats_csv_header([r.name for r in payload["rois"]]))
                 temporal = source.processing.temporal[0] != "none"
                 inputs = range(start, end + 1) if temporal else frame_range
@@ -466,7 +503,7 @@ class DecoderThread(QThread):
                                        packet=packet, source=source.metadata)
                             if stats_writer is not None:
                                 stats_writer.append(stats_csv_row(packet, packet.unit.label,
-                                    scale=scale, fmt=payload["fmt"]))
+                                    rois=payload["rois"], scale=scale, fmt=payload["fmt"]))
                         count += 1
                         self.export_progress.emit(count, total)
                 finally:
@@ -529,8 +566,10 @@ class DecoderThread(QThread):
         cancelled = self._job_aborted(payload) or any(r["status"] == "cancelled" for r in outcomes)
         prefix = "Cancelled; extracted" if cancelled else "Extracted"
         details = "; ".join(f"{Path(r['source']).name}: {r['status']}" for r in outcomes if r["status"] != "succeeded")
-        return (not cancelled and succeeded == len(files),
-                f"{prefix} {succeeded} of {len(files)} recording(s). {details}. Report: {report}")
+        summary = f"{prefix} {succeeded} of {len(files)} recording(s)."
+        if details:
+            summary += f" {details}."
+        return (not cancelled and succeeded == len(files), f"{summary} Report: {report}")
 
     def _clear_pending_commands(self) -> None:
         with self._commands.mutex:

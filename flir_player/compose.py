@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from matplotlib import font_manager
 
 from .models import ROI_COLORS, RoiShape, RoiStats
-from .render import palette_lut, legend_colors
+from .render import format_tick, legend_colors
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +46,13 @@ def _hex_rgb(value: str) -> tuple[int, int, int]:
 def _flip_point(
     x: float, y: float, width: int, height: int, flips: tuple[bool, bool]
 ) -> tuple[float, float]:
+    """Continuous image coordinates (pixel i spans [i, i+1), as on the
+    canvas) → PIL drawing coordinates (pixel i is centred on i), mirrored."""
     if flips[0]:
-        x = width - 1.0 - x
+        x = width - x
     if flips[1]:
-        y = height - 1.0 - y
-    return (x, y)
+        y = height - y
+    return (x - 0.5, y - 0.5)
 
 
 def compose_frame(
@@ -143,7 +145,8 @@ def _draw_markers(
     def cross(position, color) -> None:
         if position is None:
             return
-        x, y = _flip_point(float(position[0]), float(position[1]), width, height, flips)
+        # extrema are pixel indices: mark the pixel centre
+        x, y = _flip_point(position[0] + 0.5, position[1] + 0.5, width, height, flips)
         draw.line((x - 6, y, x + 6, y), fill=(7, 9, 10), width=4)
         draw.line((x, y - 6, x, y + 6), fill=(7, 9, 10), width=4)
         draw.line((x - 6, y, x + 6, y), fill=color, width=2)
@@ -207,7 +210,7 @@ def _append_color_bar(
         y = (height - 17) - int(round(fraction * (height - 33)))
         value = low + fraction * (high - low)
         draw.line((bar_left + bar_width + 2, y, bar_left + bar_width + 6, y), fill=(73, 88, 108))
-        text = _format_tick(value)
+        text = format_tick(value, low, high)
         if step == 6 and suffix:
             text = f"{text} {suffix}"
         draw.text(
@@ -218,9 +221,3 @@ def _append_color_bar(
             anchor="lm",
         )
     return combined
-
-
-def _format_tick(value: float) -> str:
-    if abs(value) >= 100 or float(value).is_integer():
-        return f"{value:.0f}"
-    return f"{value:.2f}"

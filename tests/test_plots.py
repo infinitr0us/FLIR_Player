@@ -79,7 +79,10 @@ def test_histogram_tab_whole_image_and_roi(qapp) -> None:
         panels.tabs.setCurrentWidget(panels.histogram)
         window._update_plots(window.current_packet, force=True)
         assert panels.histogram.canvas.ax.get_title() == "Whole image"
-        assert len(panels.histogram.canvas.ax.patches) == panels.histogram.BINS
+        bars = panels.histogram.canvas.ax.patches
+        # integer Counts use integer-aligned bins, so at most BINS bars (N17)
+        assert 0 < len(bars) <= panels.histogram.BINS
+        assert sum(bar.get_height() for bar in bars) == window.current_packet.data.size
 
         window._add_roi("rect", ((100.0, 100.0), (150.0, 140.0)))
         assert wait_until(qapp, lambda: len(window.current_packet.roi_stats) == 1)

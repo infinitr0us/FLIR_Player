@@ -20,9 +20,12 @@ rem Mark the new build unverified until its smoke test succeeds.
 python packaging\finalize_release.py
 if errorlevel 1 goto :error
 
-rem Smoke-test the built executable: open local\data\2.seq, verify playback advances
+rem Smoke-test the built executable: open local\data\2.seq, verify playback advances.
+rem Throw-away preferences keep builds out of the developer's recent files.
+set "FLIR_SETTINGS_FILE=%TEMP%\flir-build-smoke-settings.ini"
 release\FLIR_Thermal_Player.exe local\data\2.seq --smoke-test
 if errorlevel 1 goto :smoke_error
+set "FLIR_SETTINGS_FILE="
 
 python packaging\finalize_release.py --smoke-tested
 if errorlevel 1 goto :error

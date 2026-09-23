@@ -41,6 +41,21 @@ MOVIE_FORMATS: dict[str, str] = {
 }
 
 
+def series_frame_path(folder, base: str, index: int, fmt: str) -> Path:
+    """Destination of zero-based frame ``index`` in an image-series export."""
+    return Path(folder) / f"{base}_{index + 1:05d}{EXTENSIONS[fmt]}"
+
+
+def series_stats_path(folder, base: str) -> Path:
+    return Path(folder) / f"{base}_stats.csv"
+
+
+def bitmask_filename(roi_name: str) -> str:
+    """File name of an ROI's exported bitmask (§4.9.1.1, p. 61)."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in roi_name)
+    return f"{safe}_bitmask.png"
+
+
 def save_still(path: Path, rgb: np.ndarray, fmt: str) -> None:
     """Save a composed RGB image as PNG/BMP/JPEG."""
     image = Image.fromarray(rgb, mode="RGB")
@@ -158,7 +173,12 @@ def stats_csv_header(roi_names: list[str]) -> list[str]:
     return header + ["encoding", "scale", "offset", "processing", "analysis_revision"]
 
 
-def stats_csv_row(packet: FramePacket, unit_label: str, *, scale=(0.0, 0.0), fmt="") -> list:
+def stats_csv_row(packet: FramePacket, unit_label: str, *, rois=None, scale=(0.0, 0.0), fmt="") -> list:
+    """One CSV row; ``rois`` must be the shapes whose names built the header.
+
+    Columns are matched by ROI id, so an ROI without statistics (for example
+    one the SDK rejected) leaves blanks instead of shifting later columns.
+    """
     row = [
         packet.index + 1,
         packet.timestamp.isoformat(sep=" ") if packet.timestamp else "",
@@ -169,8 +189,10 @@ def stats_csv_row(packet: FramePacket, unit_label: str, *, scale=(0.0, 0.0), fmt
         f"{packet.std_dev:.6g}",
         packet.num_pixels,
     ]
-    for stats in packet.roi_stats:
-        row += [
+    by_id = {stats.id: stats for stats in packet.roi_stats}
+    for roi_id in ([shape.id for shape in rois] if rois is not None else list(by_id)):
+        stats = by_id.get(roi_id)
+        row += ["", "", "", ""] if stats is None else [
             f"{stats.minimum:.6g}",
             f"{stats.maximum:.6g}",
             f"{stats.mean:.6g}",
@@ -195,8 +217,12 @@ class StatsCsvWriter:
     def __init__(self, path: Path, header: list[str]) -> None:
         self.path = Path(path)
         self._handle = self.path.open("w", newline="", encoding="utf-8")
-        self._writer = csv.writer(self._handle)
-        self._writer.writerow(header)
+        try:
+            self._writer = csv.writer(self._handle)
+            self._writer.writerow(header)
+        except BaseException:
+            self._handle.close()  # the caller never receives a writer to close
+            raise
 
     def append(self, row: list) -> None:
         self._writer.writerow(row)

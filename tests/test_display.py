@@ -177,6 +177,7 @@ def test_custom_palette_register_roundtrip(tmp_path) -> None:
 
 
 def test_canvas_flip_mapping_roundtrip(qapp) -> None:
+    from PySide6.QtCore import QPointF
     from flir_player.widgets import ThermalCanvas
 
     canvas = ThermalCanvas()
@@ -189,13 +190,15 @@ def test_canvas_flip_mapping_roundtrip(qapp) -> None:
     height = canvas.rect().height()
     try:
         canvas.set_flips(True, False)
-        # raw x=0 must appear at the right edge of the widget
-        assert canvas._image_to_widget(0.0, 5.0).x() == pytest.approx(width * 19 / 20)
+        # raw pixel 0 (centre x=0.5) is drawn in the rightmost displayed column
+        assert canvas._image_to_widget(0.5, 5.0).x() == pytest.approx(width * 19.5 / 20)
+        assert canvas._pixel_at(QPointF(width - 1, 0))[0] == 0
         assert canvas._widget_to_image(canvas._image_to_widget(3.0, 4.0)) == pytest.approx(
             (3.0, 4.0)
         )
         canvas.set_flips(False, True)
-        assert canvas._image_to_widget(5.0, 0.0).y() == pytest.approx(height * 9 / 10)
+        assert canvas._image_to_widget(5.0, 0.5).y() == pytest.approx(height * 9.5 / 10)
+        assert canvas._pixel_at(QPointF(0, height - 1))[1] == 0
         canvas.set_flips(True, True)
         point = canvas._widget_to_image(canvas._image_to_widget(7.0, 8.0))
         assert point == pytest.approx((7.0, 8.0))

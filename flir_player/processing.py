@@ -202,7 +202,15 @@ class TemporalBuffer:
     sum/count arrays — O(pixels) per frame instead of O(depth × pixels).
     ``min``/``max`` reduce the ring in place; ``subtract`` uses the oldest
     frame in the window (unchanged semantics).
+
+    Where a value far larger than what remains leaves the window, that
+    pixel's running sum is recomputed exactly: float64 cancellation would
+    otherwise keep the large value's rounding error in later averages.
     """
+
+    # An evicted value this many times larger than the remaining sum plus the
+    # incoming value could leave errors beyond float32 precision.
+    _RESYNC_RATIO = 2.0 ** 20
 
     def __init__(self) -> None:
         self._ring: np.ndarray | None = None
@@ -224,6 +232,14 @@ class TemporalBuffer:
         return self._count
 
     def apply(self, data: np.ndarray, name: str, depth: int) -> np.ndarray:
+        """Add ``data`` as the newest frame and return the filter output."""
+        self.push(data, depth)
+        if name in TEMPORAL_FILTERS:
+            return self.result(name)
+        return data
+
+    def push(self, data: np.ndarray, depth: int) -> None:
+        """Add ``data`` as the newest frame of a ``depth``-frame window."""
         depth = max(2, int(depth))
         if (
             self._ring is None
@@ -239,35 +255,51 @@ class TemporalBuffer:
             self._depth = depth
         assert self._sum is not None and self._valid is not None
 
+        evicted = None
         if self._count == self._depth:
             # evict the oldest frame from the rolling statistics
             outgoing = self._ring[self._index]
-            np.subtract(
-                self._sum, np.where(np.isfinite(outgoing), outgoing, 0.0), out=self._sum
-            )
+            evicted = np.where(np.isfinite(outgoing), outgoing, 0.0)
+            np.subtract(self._sum, evicted, out=self._sum)
             np.subtract(self._valid, np.isfinite(outgoing), out=self._valid)
         else:
             self._count += 1
 
         slot = self._ring[self._index]
         np.copyto(slot, data, casting="unsafe")  # retain the processing dtype
-        np.add(self._sum, np.where(np.isfinite(slot), slot, 0.0), out=self._sum)
+        incoming = np.where(np.isfinite(slot), slot, 0.0)
+        np.add(self._sum, incoming, out=self._sum)
         np.add(self._valid, np.isfinite(slot), out=self._valid)
         self._index = (self._index + 1) % self._depth
+        if evicted is not None:
+            risky = np.abs(evicted) > self._RESYNC_RATIO * (np.abs(self._sum) + np.abs(incoming))
+            if risky.any():  # recompute only those pixels, exactly, from the window
+                window = self._window()[:, risky]
+                self._sum[risky] = np.where(np.isfinite(window), window, 0.0).sum(
+                    axis=0, dtype=np.float64)
 
+    def _window(self) -> np.ndarray:
+        return self._ring if self._count == self._depth else self._ring[: self._count]
+
+    def result(self, name: str) -> np.ndarray:
+        """Filter output for the window as it stands (newest frame last).
+
+        Rebuilding a result this way never changes the window, so a frame can
+        be re-served (metadata refresh, ROI edit) without replaying it.
+        """
+        newest = self._ring[(self._index - 1) % self._depth]
         if name == "subtract":
             # sliding subtraction: current minus oldest frame in the window
             oldest = self._ring[self._index] if self._count == self._depth else self._ring[0]
-            return data - oldest
+            return newest - oldest
         if name == "average":
             with np.errstate(invalid="ignore", divide="ignore"):
                 return self._sum / self._valid
-        window = self._ring if self._count == self._depth else self._ring[: self._count]
         if name == "min":
-            return np.nanmin(window, axis=0)
+            return np.nanmin(self._window(), axis=0)
         if name == "max":
-            return np.nanmax(window, axis=0)
-        return data
+            return np.nanmax(self._window(), axis=0)
+        return newest.copy()
 
 
 # --- app-side ROI statistics (used while the pipeline is active) ----------------------

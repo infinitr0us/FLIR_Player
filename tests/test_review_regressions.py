@@ -346,7 +346,8 @@ def test_f11_new_source_resets_thresholds(player, qapp):
     player.open_path(ROOT / "local/data/2.seq")
     assert wait_until(qapp, lambda: player.current_packet is not None and not player._busy)
     assert (player.seg_min, player.seg_max) == (player.current_packet.minimum, player.current_packet.maximum)
-    assert (player.iso_limit1, player.iso_limit2) == (player.current_packet.minimum, player.current_packet.maximum)
+    packet = player.current_packet  # re-seeded like first enabling (N01), never at the minimum
+    assert (player.iso_limit1, player.iso_limit2) == ((packet.minimum + packet.maximum) / 2, packet.maximum)
 
 
 def test_f14_numeric_tiff_mapping_and_controls(seq_source, qapp, tmp_path):

@@ -239,22 +239,33 @@ or products. References use the current unit, object parameters and available
 correction switches; an incompatible reference rejects the state change.
 
 Changing numerical analysis settings clears temporal plot history. Editing an
-ROI clears that ROI's history. Palette and zoom changes preserve it. Temperature
-overlay limits convert between compatible temperature units; subtraction uses
-temperature-difference conversion. Other numerical-domain or source changes
-reset the limits to the new frame's range.
+ROI clears that ROI's history. Palette and zoom changes preserve it. The fixed
+range, segmentation and isotherm limits follow the numerical domain: they are
+kept through object-parameter, correction, spatial-filter and temporal
+average/min/max changes, and convert between compatible temperature units
+(subtraction uses temperature-difference conversion). Point filters, other
+file operations, differences and incompatible unit or source changes re-seed
+them from the new frame (an isotherm restarts at the middle of the range).
 
-ROI statistics, histogram/profile sampling and masks share pixel coverage:
-boxes exclude the right/bottom endpoint, ellipses include pixel centers inside
-that box, and lines sample each major-axis pixel once. Profile distance is in
-image pixels. Plateau-equalized legends use the frame's actual color mapping.
+ROI coordinates are continuous image positions in which pixel *i* spans
+[*i*, *i*+1), in the live view, under flips and in exports. Boxes contain the
+pixels whose centers lie inside their outline, ellipses test those centers,
+and spots and line endpoints snap to, and measure, the pixel they are placed
+on. Lines sample each major-axis pixel once. The hover readout shows the pixel
+under the pointer and follows new frames and unit changes. Statistics,
+histogram/profile sampling and masks share this coverage; profile distance is
+in image pixels. Plateau-equalized legends use the frame's actual color
+mapping.
 
 Exports and extracts stage their output and publish only after successful
-completion. Existing paths are refused; choose a new filename. Source aliases
-are always rejected. Batch extraction allocates distinct names and saves a JSON
-report with the actual path and outcome for each input. Failed or cancelled jobs
-remove their own staging files. Closing waits responsively for SDK operations
-and writers to finish.
+completion. An existing file is replaced only after you confirm it (the Save
+dialog's own prompt counts), and a failed job restores what it replaced;
+export dialogs suggest unused names. Clip extraction still requires a new
+filename. Source aliases are always rejected. Publication works on drives
+without hard links (FAT32/exFAT). Batch extraction allocates distinct names and
+saves a JSON report with the actual path and outcome for each input. Failed or
+cancelled jobs remove their own staging files. Closing waits responsively for
+SDK operations and writers to finish.
 
 Numeric TIFF16 preserves unprocessed `uint16` Counts exactly. Other data is
 mapped over the selected range; TIFF `ImageDescription` records the scale,

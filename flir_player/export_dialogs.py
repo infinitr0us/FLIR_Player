@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QToolButton,
@@ -25,9 +27,44 @@ from PySide6.QtWidgets import (
 )
 
 from .compose import ExportOptions
-from .export import EXTENSIONS, MOVIE_FORMATS, STILL_FORMATS
+from .export import EXTENSIONS, MOVIE_FORMATS, STILL_FORMATS, series_frame_path, series_stats_path
+from .jobs import unique_destination
 from .models import VideoMetadata
 from .widgets import ChevronComboBox, FramelessDialog
+
+
+def _normalized(path) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def confirm_replace(parent, paths, confirmed=()) -> list[Path] | None:
+    """Ask before replacing existing outputs.
+
+    Returns None when the user declines, otherwise exactly the existing files
+    the user agreed to replace (empty when none exist); outputs that appear
+    later were never confirmed and stay protected. Paths already confirmed in
+    a native Save dialog, which asks about overwriting itself, are not asked
+    about twice.
+    """
+    existing = [Path(path) for path in paths if Path(path).exists()]
+    if not existing:
+        return []
+    asked = {_normalized(path) for path in confirmed if path}
+    unasked = [path for path in existing if _normalized(path) not in asked]
+    if unasked:
+        shown = "\n".join(path.name for path in unasked[:8])
+        if len(unasked) > 8:
+            shown += f"\n… and {len(unasked) - 8} more"
+        answer = QMessageBox.question(
+            parent,
+            "Replace existing files?",
+            f"{len(unasked)} output file(s) already exist:\n\n{shown}\n\nReplace them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+    return existing
 
 
 class _CompositionBox(QFrame):
@@ -103,7 +140,9 @@ class ExportImageDialog(FramelessDialog):
         self.format_combo.currentIndexChanged.connect(self._sync_extension)
         form.addRow("Format", self.format_combo)
 
-        default = (
+        self._replace: list[str] = []  # existing outputs the user agreed to replace
+        self._confirmed: list[str] = []  # paths whose overwrite the Save dialog confirmed
+        default = unique_destination(
             metadata.path.parent
             / f"{metadata.path.stem}_frame_{frame_index + 1:05d}{EXTENSIONS['png']}"
         )
@@ -144,7 +183,18 @@ class ExportImageDialog(FramelessDialog):
             self, "Choose output file", self.path_edit.text(), STILL_FORMATS[self._fmt()]
         )
         if path:
+            self._confirmed.append(path)
             self.path_edit.setText(path)
+
+    def accept(self) -> None:
+        params = self.parameters()
+        dest = Path(params["dest"])
+        outputs = [dest, dest.with_suffix(".csv")] if params["stats_sidecar"] else [dest]
+        replace = confirm_replace(self, outputs, self._confirmed)
+        if replace is None:
+            return  # stay in the dialog so the user can pick another name
+        self._replace = [str(path) for path in replace]
+        super().accept()
 
     def parameters(self) -> dict:
         dest = Path(self.path_edit.text()).expanduser()
@@ -155,6 +205,7 @@ class ExportImageDialog(FramelessDialog):
             "fmt": self._fmt(),
             "options": self.composition.options(),
             "stats_sidecar": self.sidecar_check.isChecked(),
+            "replace": list(self._replace),
         }
 
 
@@ -208,6 +259,7 @@ class ExportSeriesDialog(FramelessDialog):
         self.composition = _CompositionBox()
         layout.addWidget(self.composition)
         self.stats_check = QCheckBox("Write per-frame statistics (CSV)")
+        self._replace: list[str] = []  # existing outputs the user agreed to replace
         self.format_combo.currentIndexChanged.connect(lambda: self.composition.setEnabled(
             str(self.format_combo.currentData()) not in {"tiff16", "tiff_float"}))
         self.composition.setToolTip("Numeric TIFFs contain unflipped data without RGB composition")
@@ -238,6 +290,26 @@ class ExportSeriesDialog(FramelessDialog):
         valid = self.start_spin.value() <= self.end_spin.value()
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
 
+    def _existing_outputs(self, params: dict) -> list[Path]:
+        folder = Path(params["folder"]).expanduser()
+        try:
+            present = {os.path.normcase(name) for name in os.listdir(folder)}
+        except OSError:
+            return []  # a new or unreadable folder: the export reports real errors
+        outputs = [series_frame_path(folder, params["base_name"], index, params["fmt"])
+                   for index in range(params["start_frame"], params["end_frame"] + 1,
+                                      params["decimation"])]
+        if params["stats_csv"]:
+            outputs.append(series_stats_path(folder, params["base_name"]))
+        return [path for path in outputs if os.path.normcase(path.name) in present]
+
+    def accept(self) -> None:
+        replace = confirm_replace(self, self._existing_outputs(self.parameters()))
+        if replace is None:
+            return  # stay in the dialog so the user can change the base name
+        self._replace = [str(path) for path in replace]
+        super().accept()
+
     def parameters(self) -> dict:
         base = self.name_edit.text().strip() or "frames"
         return {
@@ -249,6 +321,7 @@ class ExportSeriesDialog(FramelessDialog):
             "fmt": str(self.format_combo.currentData()),
             "options": self.composition.options(),
             "stats_csv": self.stats_check.isChecked(),
+            "replace": list(self._replace),
         }
 
 
@@ -295,10 +368,15 @@ class ExportMovieDialog(FramelessDialog):
         form.addRow("End frame", self.end_spin)
         self.decimation_spin = QSpinBox()
         self.decimation_spin.setRange(1, max(1, total))
-        self.decimation_spin.setToolTip("1 keeps every frame, N keeps every Nth frame")
+        self.decimation_spin.setToolTip(
+            "1 keeps every frame, N keeps every Nth frame. The movie frame rate "
+            "is not divided by N, so a decimated movie plays N× faster."
+        )
         form.addRow("Keep every Nth", self.decimation_spin)
 
-        default = metadata.path.parent / f"{metadata.path.stem}.mp4"
+        self._replace: list[str] = []  # existing outputs the user agreed to replace
+        self._confirmed: list[str] = []  # paths whose overwrite the Save dialog confirmed
+        default = unique_destination(metadata.path.parent / f"{metadata.path.stem}.mp4")
         row, self.path_edit, browse = _path_row("Choose output file")
         self.path_edit.setText(str(default))
         browse.clicked.connect(self._browse)
@@ -335,11 +413,19 @@ class ExportMovieDialog(FramelessDialog):
             self, "Choose output file", self.path_edit.text(), MOVIE_FORMATS[self._fmt()]
         )
         if path:
+            self._confirmed.append(path)
             self.path_edit.setText(path)
 
     def _validate(self) -> None:
         valid = self.start_spin.value() <= self.end_spin.value()
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+
+    def accept(self) -> None:
+        replace = confirm_replace(self, [Path(self.parameters()["dest"])], self._confirmed)
+        if replace is None:
+            return  # stay in the dialog so the user can pick another name
+        self._replace = [str(path) for path in replace]
+        super().accept()
 
     def parameters(self) -> dict:
         dest = Path(self.path_edit.text()).expanduser()
@@ -353,6 +439,7 @@ class ExportMovieDialog(FramelessDialog):
             "end_frame": self.end_spin.value() - 1,
             "decimation": max(1, self.decimation_spin.value()),
             "options": self.composition.options(),
+            "replace": list(self._replace),
         }
 
 

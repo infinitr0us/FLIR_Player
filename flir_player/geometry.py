@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Canonical ROI coverage in integer image pixels.
 
-Endpoints are rounded/clamped like the SDK. Boxes are half open; ellipses test
-pixel centers inside that box. Lines sample each major-axis pixel once, nearest
-minor coordinate with half-pixel ties toward the smaller coordinate. Reversing
-a line reverses its profile order without changing its pixel set.
+ROI points are continuous image coordinates in which pixel ``i`` spans
+``[i, i + 1)``, the same convention the canvas draws with. Box and ellipse
+corners round to pixel boundaries, so boxes are half open and contain the
+pixels whose centres lie inside the outline; ellipses test those pixel centres.
+Spots and line endpoints select the pixel that contains them (floor). Lines
+sample each major-axis pixel once, nearest minor coordinate with half-pixel
+ties toward the smaller coordinate. Reversing a line reverses its profile
+order without changing its pixel set. Corners clamp to the image edges and
+points to its pixels.
 """
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from threading import local
 
@@ -40,12 +46,20 @@ def roi_coordinates(shape, height: int, width: int):
     return result
 
 
+def pixel_index(kind: str, x: float, y: float, width: int, height: int) -> tuple[int, int]:
+    """Integer position of one ROI point: the containing pixel (0..size-1)
+    for spots and line endpoints, the nearest pixel boundary (0..size) for
+    box/ellipse corners, so a box can reach the last row and column."""
+    if kind in ("cursor", "line"):
+        return (max(0, min(math.floor(x), width - 1)), max(0, min(math.floor(y), height - 1)))
+    return (max(0, min(int(round(x)), width)), max(0, min(int(round(y)), height)))
+
+
 def _coordinates(kind, points, height, width):
     empty = (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32))
     if width < 1 or height < 1:
         return empty
-    points = tuple((max(0, min(int(round(x)), width - 1)),
-                    max(0, min(int(round(y)), height - 1))) for x, y in points)
+    points = tuple(pixel_index(kind, x, y, width, height) for x, y in points)
     if kind == "cursor" and len(points) == 1:
         return np.array([points[0][1]], np.int32), np.array([points[0][0]], np.int32)
     if len(points) != 2:

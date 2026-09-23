@@ -8,6 +8,8 @@ All panels are passive: the main window pushes data in, panels only render it.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -119,7 +121,7 @@ class HistogramPlotPanel(_PlotPanel):
         if values.size == 0:
             self.show_message("No valid pixels")
             return
-        counts, edges = np.histogram(values, bins=self.BINS)
+        counts, edges = np.histogram(values, bins=histogram_bins(values, self.BINS))
         centers = (edges[:-1] + edges[1:]) / 2.0
         ax = self.canvas.ax
         ax.clear()
@@ -220,6 +222,19 @@ class TemporalPlotPanel(_PlotPanel):
         ax.relim()
         ax.autoscale_view()
         self.canvas.draw_idle()
+
+
+def histogram_bins(values: np.ndarray, bins: int):
+    """Integer-aligned bin edges for integer data (Counts), else ``bins``.
+
+    Equal-width bins over a few hundred integer values alternately hold one
+    and two of them, drawing a comb that is not in the data.
+    """
+    if values.dtype.kind not in "iu" or values.size == 0:
+        return bins
+    low, high = int(values.min()), int(values.max())
+    width = max(1, math.ceil((high - low + 1) / bins))
+    return np.arange(low, high + width + 1, width) - 0.5
 
 
 def envelope(

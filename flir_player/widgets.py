@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
@@ -56,7 +57,16 @@ from PySide6.QtWidgets import (
 from .settings import app_settings
 from .models import ROI_COLORS, CadenceInfo, UnitOption, VideoMetadata
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
-from .render import format_value, isotherm_color, lut_from_stops, palette_lut, palette_names
+from .render import (
+    format_spread,
+    format_tick,
+    format_value,
+    isotherm_color,
+    lut_from_stops,
+    palette_lut,
+    palette_names,
+    span_decimals,
+)
 
 
 # QtAwesome otherwise tries to persist its bundled fonts in the Windows user
@@ -419,7 +429,7 @@ class StatisticsPanel(QFrame):
                 format_value(minimum, suffix),
                 format_value(maximum, suffix),
                 format_value(mean, suffix),
-                f"{std_dev:.2f} {suffix}".strip(),
+                format_spread(std_dev, suffix),
                 str(num_pixels),
                 format_value(value, suffix) if value is not None else "—",
             )
@@ -465,6 +475,7 @@ class ThermalCanvas(QWidget):
         self._suffix = ""
         self._image_rect = QRect()
         self._probe: tuple[int, int, float] | None = None
+        self._hover_pos: QPointF | None = None  # last pointer position over the image
         self._message = "Open a FLIR recording to begin"
         self._rois: list = []
         self._selected_roi: int | None = None
@@ -506,9 +517,9 @@ class ThermalCanvas(QWidget):
         self._raw = raw
         self._suffix = suffix
         self._message = ""
-        self._probe = None
         self._marker_image = (None, None)
         self._marker_rois = ()
+        self._refresh_probe()
         self.update()
 
     def set_overlay_options(self, markers: bool) -> None:
@@ -519,6 +530,7 @@ class ThermalCanvas(QWidget):
         """Mirror the displayed image; coordinates stay in raw image space (§4.6.3)."""
         self._flip_h = bool(flip_h)
         self._flip_v = bool(flip_v)
+        self._refresh_probe()
         self.update()
 
     # --- zoom / pan ----------------------------------------------------------
@@ -566,9 +578,9 @@ class ThermalCanvas(QWidget):
         zero_pan_rect = self._rect_for(zoom, QPointF(0, 0))
         dx, dy = image_point
         if self._flip_h:
-            dx = self._raw.shape[1] - 1.0 - dx
+            dx = self._raw.shape[1] - dx
         if self._flip_v:
-            dy = self._raw.shape[0] - 1.0 - dy
+            dy = self._raw.shape[0] - dy
         wx = zero_pan_rect.left() + dx * zero_pan_rect.width() / self._raw.shape[1]
         wy = zero_pan_rect.top() + dy * zero_pan_rect.height() / self._raw.shape[0]
         self._zoom = float(zoom)
@@ -621,6 +633,7 @@ class ThermalCanvas(QWidget):
         self._pixmap = QPixmap()
         self._raw = None
         self._probe = None
+        self._hover_pos = None
         self._rois = []
         self._selected_roi = None
         self._draft = None
@@ -644,6 +657,7 @@ class ThermalCanvas(QWidget):
         self._roi_tool = tool
         self._draft = None
         self._restore_tool_cursor()
+        self._refresh_probe()  # the probe only exists for the select tool
         self.update()
 
     def _restore_tool_cursor(self) -> None:
@@ -667,28 +681,87 @@ class ThermalCanvas(QWidget):
 
     # --- coordinate mapping -------------------------------------------------
 
+    # Image coordinates are continuous: pixel i spans [i, i + 1), exactly as
+    # the pixmap is drawn. A flip therefore mirrors x to width - x; the
+    # discrete pixel index mirrors as width - 1 - i (see _pixel_at).
+
+    def _device_image_rect(self) -> tuple[int, int, int, int]:
+        """The image rectangle in whole device pixels: (left, top, width, height)."""
+        ratio = max(1e-6, self.devicePixelRatioF())
+        rect = self._image_rect
+        left, top = round(rect.left() * ratio), round(rect.top() * ratio)
+        right = round((rect.left() + rect.width()) * ratio)
+        bottom = round((rect.top() + rect.height()) * ratio)
+        return left, top, max(1, right - left), max(1, bottom - top)
+
+    def _image_target(self) -> QRectF:
+        """Logical rectangle the image is painted into, on whole device pixels.
+
+        Painting and every coordinate mapping use it, so the pixel picked is
+        the pixel drawn at any display scaling and window size.
+        """
+        ratio = max(1e-6, self.devicePixelRatioF())
+        left, top, width, height = self._device_image_rect()
+        return QRectF(left / ratio, top / ratio, width / ratio, height / ratio)
+
     def _widget_to_image(self, pos) -> tuple[float, float]:
         if self._raw is None or self._image_rect.width() <= 0 or self._image_rect.height() <= 0:
             return (0.0, 0.0)
-        x = (pos.x() - self._image_rect.left()) * self._raw.shape[1] / self._image_rect.width()
-        y = (pos.y() - self._image_rect.top()) * self._raw.shape[0] / self._image_rect.height()
-        x = max(0.0, min(x, self._raw.shape[1] - 1.0))
-        y = max(0.0, min(y, self._raw.shape[0] - 1.0))
+        width, height = self._raw.shape[1], self._raw.shape[0]
+        target = self._image_target()
+        x = (pos.x() - target.left()) * width / target.width()
+        y = (pos.y() - target.top()) * height / target.height()
+        x = max(0.0, min(x, float(width)))
+        y = max(0.0, min(y, float(height)))
         if self._flip_h:
-            x = self._raw.shape[1] - 1.0 - x
+            x = width - x
         if self._flip_v:
-            y = self._raw.shape[0] - 1.0 - y
+            y = height - y
         return (x, y)
+
+    def _pixel_at(self, pos) -> tuple[int, int]:
+        """Image pixel drawn under the screen pixel at ``pos``.
+
+        Found in display space at the screen pixel's centre (as the pixmap is
+        sampled), then mirrored as a discrete index, so a flip never picks the
+        neighbouring pixel on a boundary.
+        """
+        width, height = self._raw.shape[1], self._raw.shape[0]
+        ratio = max(1e-6, self.devicePixelRatioF())
+        left, top, device_width, device_height = self._device_image_rect()
+        # Work in device pixels (125 % / 150 % display scaling), at the centre
+        # of the device pixel under the logical position. ceil(v) - 1:
+        # nearest-neighbour scaling gives a device pixel whose centre sits
+        # exactly on a source boundary to the lower source pixel.
+        column = math.ceil((pos.x() * ratio + 0.5 - left) * width / device_width) - 1
+        row = math.ceil((pos.y() * ratio + 0.5 - top) * height / device_height) - 1
+        column = max(0, min(column, width - 1))
+        row = max(0, min(row, height - 1))
+        if self._flip_h:
+            column = width - 1 - column
+        if self._flip_v:
+            row = height - 1 - row
+        return (column, row)
+
+    def _pixel_center_at(self, pos) -> tuple[float, float]:
+        column, row = self._pixel_at(pos)
+        return (column + 0.5, row + 0.5)
+
+    def _snap_to_center(self, point: tuple[float, float]) -> tuple[float, float]:
+        width, height = self._raw.shape[1], self._raw.shape[0]
+        return (max(0, min(math.floor(point[0]), width - 1)) + 0.5,
+                max(0, min(math.floor(point[1]), height - 1)) + 0.5)
 
     def _image_to_widget(self, x: float, y: float) -> QPointF:
         if self._raw is None:
             return QPointF()
         if self._flip_h:
-            x = self._raw.shape[1] - 1.0 - x
+            x = self._raw.shape[1] - x
         if self._flip_v:
-            y = self._raw.shape[0] - 1.0 - y
-        wx = self._image_rect.left() + x * self._image_rect.width() / self._raw.shape[1]
-        wy = self._image_rect.top() + y * self._image_rect.height() / self._raw.shape[0]
+            y = self._raw.shape[0] - y
+        target = self._image_target()
+        wx = target.left() + x * target.width() / self._raw.shape[1]
+        wy = target.top() + y * target.height() / self._raw.shape[0]
         return QPointF(wx, wy)
 
     # --- painting -------------------------------------------------------------
@@ -702,7 +775,7 @@ class ThermalCanvas(QWidget):
 
         self._image_rect = self._rect_for(self._current_zoom(), self._pan)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-        painter.drawPixmap(self._image_rect, self._pixmap)
+        painter.drawPixmap(self._image_target(), self._pixmap, QRectF(self._pixmap.rect()))
 
         if self._probe is not None and self._raw is not None and self._roi_tool == "select":
             self._paint_probe(painter)
@@ -803,7 +876,7 @@ class ThermalCanvas(QWidget):
     def _paint_marker(self, painter: QPainter, position, color: QColor) -> None:
         if position is None:
             return
-        center = self._image_to_widget(*position)
+        center = self._image_to_widget(position[0] + 0.5, position[1] + 0.5)  # pixel centre
         for width, pen_color in ((5, QColor("#07090A")), (2, color)):
             painter.setPen(QPen(pen_color, width))
             painter.drawLine(
@@ -841,8 +914,8 @@ class ThermalCanvas(QWidget):
 
     def _paint_probe(self, painter: QPainter) -> None:
         px, py, value = self._probe
-        screen_x = self._image_rect.left() + int((px + 0.5) * self._image_rect.width() / self._raw.shape[1])
-        screen_y = self._image_rect.top() + int((py + 0.5) * self._image_rect.height() / self._raw.shape[0])
+        centre = self._image_to_widget(px + 0.5, py + 0.5)  # flip-aware pixel centre
+        screen_x, screen_y = int(centre.x()), int(centre.y())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(QPen(QColor("#07090A"), 4))
         painter.drawEllipse(QPoint(screen_x, screen_y), 7, 7)
@@ -1045,9 +1118,16 @@ class ThermalCanvas(QWidget):
                 self.update()
             return
         if self._image_rect.contains(wpos.toPoint()):
-            point = self._widget_to_image(wpos)
+            point = self._draft_point(self._roi_tool, wpos)
             self._draft = (self._roi_tool, point, point)
             self.update()
+
+    def _draft_point(self, kind: str, wpos) -> tuple[float, float]:
+        # Spots and line endpoints measure the pixel they sit in: place them
+        # on the centre of the pixel under the pointer, where they are drawn.
+        if kind in ("cursor", "line"):
+            return self._pixel_center_at(wpos)
+        return self._widget_to_image(wpos)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         wpos = event.position()
@@ -1070,7 +1150,7 @@ class ThermalCanvas(QWidget):
             return
         if self._draft is not None:
             kind, anchor, _ = self._draft
-            self._draft = (kind, anchor, self._widget_to_image(wpos))
+            self._draft = (kind, anchor, self._draft_point(kind, wpos))
             self.update()
             return
         if self._drag is not None and self._drag_shape is not None:
@@ -1080,17 +1160,37 @@ class ThermalCanvas(QWidget):
         if self._roi_tool != "select":
             return
         if self._raw is None or not self._image_rect.contains(wpos.toPoint()):
+            self._hover_pos = None
             if self._probe is not None:
                 self._probe = None
                 self.probe_changed.emit(None)
                 self.update()
             return
-        x, y = self._widget_to_image(wpos)
-        xi, yi = int(x), int(y)
-        value = float(self._raw[yi, xi])
-        self._probe = (xi, yi, value)
+        self._hover_pos = QPointF(wpos)
+        self._probe = self._probe_at(wpos)
         self.probe_changed.emit(self._probe)
         self.update()
+
+    def _probe_at(self, wpos) -> tuple[int, int, float]:
+        xi, yi = self._pixel_at(wpos)
+        return (xi, yi, float(self._raw[yi, xi]))
+
+    def _refresh_probe(self) -> None:
+        """Resample the probe when the data under a still pointer changes.
+
+        New frames, units and flips replace what the pointer is over without
+        a mouse event; the inspector's readout must follow them.
+        """
+        previous = self._probe
+        self._probe = None
+        pos = self._hover_pos
+        if (pos is not None and self._raw is not None and not self._pixmap.isNull()
+                and self._roi_tool == "select"):
+            self._image_rect = self._rect_for(self._current_zoom(), self._pan)
+            if self._image_rect.contains(pos.toPoint()):
+                self._probe = self._probe_at(pos)
+        if self._probe is not None or previous is not None:
+            self.probe_changed.emit(self._probe)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton and self._pan_drag is not None:
@@ -1146,16 +1246,19 @@ class ThermalCanvas(QWidget):
     def _dragged_shape(self, image_pos: tuple[float, float]):
         drag = self._drag
         original = drag["orig"]
+        pixel_points = original.kind in ("cursor", "line")
         if drag["handle"] == "body":
             dx = image_pos[0] - drag["start"][0]
             dy = image_pos[1] - drag["start"][1]
-            dx, dy = self._clamped_delta(original.points, dx, dy)
+            if pixel_points:  # whole-pixel steps keep spots/endpoints on centres
+                dx, dy = round(dx), round(dy)
+            dx, dy = self._clamped_delta(original.points, dx, dy, 0.5 if pixel_points else 0.0)
             points = tuple((x + dx, y + dy) for x, y in original.points)
             return replace(original, points=points)
         if drag["handle"] in {"p0", "p1"} and len(original.points) == 2:
             index = 0 if drag["handle"] == "p0" else 1
             points = list(original.points)
-            points[index] = image_pos
+            points[index] = self._snap_to_center(image_pos) if pixel_points else image_pos
             return replace(original, points=tuple(points))
         # corner handles on rect/ellipse: anchor opposite corner
         first, second = original.points
@@ -1178,14 +1281,15 @@ class ThermalCanvas(QWidget):
         return replace(original, points=(anchor, image_pos))
 
     def _clamped_delta(
-        self, points, dx: float, dy: float
+        self, points, dx: float, dy: float, margin: float = 0.0
     ) -> tuple[float, float]:
+        """Largest move keeping every point within [margin, size - margin]."""
         if self._raw is None:
             return (0.0, 0.0)
-        max_x, max_y = self._raw.shape[1] - 1.0, self._raw.shape[0] - 1.0
+        max_x, max_y = self._raw.shape[1] - margin, self._raw.shape[0] - margin
         for x, y in points:
-            dx = max(-x, min(dx, max_x - x))
-            dy = max(-y, min(dy, max_y - y))
+            dx = max(margin - x, min(dx, max_x - x))
+            dy = max(margin - y, min(dy, max_y - y))
         return (dx, dy)
 
     def keyPressEvent(self, event) -> None:
@@ -1196,6 +1300,7 @@ class ThermalCanvas(QWidget):
         super().keyPressEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._hover_pos = None
         if self._probe is not None:
             self._probe = None
             self.probe_changed.emit(None)
@@ -1373,7 +1478,7 @@ class ColorScaleWidget(QWidget):
             value = self._minimum + fraction * (self._maximum - self._minimum)
             painter.setPen(QPen(QColor("#49586C"), 1))
             painter.drawLine(bar.right() + 3, y, bar.right() + 8, y)
-            label = self._format_tick(value)
+            label = format_tick(value, self._minimum, self._maximum)
             painter.setPen(QColor("#97A1AF"))
             painter.drawText(
                 QRectF(bar.right() + 13, y - 11, 58, 22),
@@ -1398,12 +1503,6 @@ class ColorScaleWidget(QWidget):
             painter.setPen(QPen(QColor("#07090A"), 1))
             painter.setBrush(color)
             painter.drawPath(handle)
-
-    @staticmethod
-    def _format_tick(value: float) -> str:
-        if abs(value) >= 100 or float(value).is_integer():
-            return f"{value:.0f}"
-        return f"{value:.2f}"
 
     # --- isotherm dragging ---------------------------------------------------------
 
@@ -1447,14 +1546,14 @@ class ObjectParametersPanel(QFrame):
 
     # key, label, minimum, maximum, decimals, multiplier from display to SDK units
     FIELDS: tuple[tuple[str, str, float, float, int, float], ...] = (
-        ("emissivity", "Emissivity", 0.0, 1.0, 2, 1.0),
+        ("emissivity", "Emissivity", 0.0, 1.0, 3, 1.0),
         ("reflected_temp", "Reflected Temp (K)", 0.0, 1000.0, 1, 1.0),
         ("atmosphere_temp", "Atmosphere Temp (K)", 0.0, 1000.0, 1, 1.0),
-        ("est_atmospheric_transmission", "Atm. Transmission", 0.0, 1.0, 2, 1.0),
+        ("est_atmospheric_transmission", "Atm. Transmission", 0.0, 1.0, 3, 1.0),
         ("distance", "Distance (m)", 0.0, 100000.0, 1, 1.0),
-        ("relative_humidity", "Rel. Humidity (%)", 0.0, 100.0, 0, 0.01),
+        ("relative_humidity", "Rel. Humidity (%)", 0.0, 100.0, 1, 0.01),
         ("ext_optics_temp", "Ext. Optics Temp (K)", 0.0, 1000.0, 1, 1.0),
-        ("ext_optics_transmission", "Ext. Optics Transm.", 0.0, 1.0, 2, 1.0),
+        ("ext_optics_transmission", "Ext. Optics Transm.", 0.0, 1.0, 3, 1.0),
     )
 
     def __init__(self, parent=None) -> None:
@@ -2037,6 +2136,9 @@ class InspectorPanel(QWidget):
             spin.setDecimals(2)
             spin.setValue(float(value))
         spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        # Typed values apply on Enter/focus-out, not per keystroke: each
+        # applied filter state recomputes the frame and its temporal window.
+        spin.setKeyboardTracking(False)
         spin.setMinimumWidth(64)
         spin.setMaximumWidth(80)
         spin.setProperty("compact", True)
@@ -2048,6 +2150,30 @@ class InspectorPanel(QWidget):
 
     def set_reference_label(self, text: str) -> None:
         self.reference_label.setText(text or "No reference")
+
+    def select_unit(self, key: str) -> None:
+        """Show ``key`` as the current unit without requesting a change."""
+        index = self.unit_combo.findData(key)
+        if index >= 0:
+            self.unit_combo.blockSignals(True)
+            self.unit_combo.setCurrentIndex(index)
+            self.unit_combo.blockSignals(False)
+
+    def set_processing(self, state: dict) -> None:
+        """Show a processing state (point/spatial/temporal) without emitting it."""
+        for combo, spin, key in (
+            (self.point_combo, self.point_spin, "point"),
+            (self.spatial_combo, self.spatial_spin, "spatial"),
+            (self.temporal_combo, self.temporal_spin, "temporal"),
+        ):
+            name, value = state.get(key, ("none", spin.value()))
+            combo.blockSignals(True)
+            spin.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(name)))
+            spin.setValue(int(value) if isinstance(spin, QSpinBox) else float(value))
+            combo.blockSignals(False)
+            spin.blockSignals(False)
+        self._filters_changed(update_only=True)
 
     def reset_processing(self) -> None:
         """Restore Processing controls to their inactive defaults (new file)."""
@@ -2188,6 +2314,15 @@ class InspectorPanel(QWidget):
         self.palette_invert_check.blockSignals(True)
         self.palette_invert_check.setChecked(bool(inverted))
         self.palette_invert_check.blockSignals(False)
+
+    def set_value_precision(self, low: float, high: float) -> None:
+        """Give the value controls enough decimals for the data range
+        (Counts need 2, radiance around 0.003 needs 7)."""
+        decimals = span_decimals(high - low, significant=4, minimum=2)
+        for spin in (self.minimum_spin, self.maximum_spin, self.seg_min_spin,
+                     self.seg_max_spin, self.iso_limit1_spin, self.iso_limit2_spin):
+            spin.setDecimals(decimals)
+            spin.setSingleStep(10.0 ** (1 - decimals))
 
     def set_fixed_values(self, minimum: float, maximum: float) -> None:
         for spin, value in ((self.minimum_spin, minimum), (self.maximum_spin, maximum)):
@@ -2663,9 +2798,9 @@ class GradientStripWidget(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._dragging is not None:
+            # _stops keeps its own order (stops() sorts a copy), so the
+            # pressed stop stays selected for "Color…" and "Remove Stop".
             self._dragging = None
-            # Re-sync selection with the sorted stop order.
-            self._selected = None
             self.stops_changed.emit()
             self.update()
             event.accept()
@@ -2790,12 +2925,10 @@ class ReferenceDialog(FramelessDialog):
         frame_label = QLabel("Frame")
         frame_label.setObjectName("FieldLabel")
         row.addWidget(frame_label)
+        self._metadata = metadata
         self.frame_spin = QSpinBox()
         self.frame_spin.setRange(1, max(1, metadata.num_frames))
         self.frame_spin.setValue(1)
-        self.frame_spin.setToolTip(
-            "1-based; clamped to the frame count of the chosen file"
-        )
         row.addWidget(self.frame_spin)
         row.addSpacing(12)
         op_label = QLabel("Operation")
@@ -2822,6 +2955,28 @@ class ReferenceDialog(FramelessDialog):
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+        self.path_edit.textChanged.connect(self._sync_frame_range)
+        self._sync_frame_range()
+
+    def _sync_frame_range(self) -> None:
+        """Bound the frame by the open recording only when it is the reference.
+
+        Another file's length is known only once the decoder opens it, so any
+        frame is accepted and clamped there; the reference label then shows
+        the frame actually used.
+        """
+        try:
+            same = Path(self.path_edit.text().strip()).expanduser().resolve() == self._metadata.path
+        except (OSError, RuntimeError, ValueError):
+            same = False
+        if same:
+            self.frame_spin.setMaximum(max(1, self._metadata.num_frames))
+            self.frame_spin.setToolTip("1-based frame of the open recording")
+        else:
+            self.frame_spin.setMaximum(2_147_483_647)
+            self.frame_spin.setToolTip(
+                "1-based; frames past the end of the chosen recording use its last frame"
+            )
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2961,6 +3116,8 @@ class TimelineSlider(QSlider):
         self._range_start: int | None = None
         self._range_end: int | None = None
         self._dragging_marker: str | None = None
+        self._jump_drag = False
+        self._jump_offset = 0.0  # pointer-to-handle distance while dragging the handle
 
     # --- play-range state ---------------------------------------------------
 
@@ -3087,6 +3244,18 @@ class TimelineSlider(QSlider):
                 self._dragging_marker = marker
                 event.accept()
                 return
+            # Jump to the click and keep dragging from there, as video
+            # timelines do. QSlider would page-step here without any signal
+            # the transport seeks on, leaving handle and frame apart. A press
+            # on the handle itself drags it from where it is (no jump).
+            x = event.position().x()
+            handle_x = self._value_to_x(self.value())
+            self._jump_offset = x - handle_x if abs(x - handle_x) <= self._HANDLE_RADIUS else 0.0
+            self._jump_drag = True
+            self.setSliderDown(True)
+            self.setSliderPosition(self._x_to_value(x - self._jump_offset))
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -3100,6 +3269,10 @@ class TimelineSlider(QSlider):
             self._emit_range()
             event.accept()
             return
+        if self._jump_drag:
+            self.setSliderPosition(self._x_to_value(event.position().x() - self._jump_offset))
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -3107,6 +3280,12 @@ class TimelineSlider(QSlider):
             self._dragging_marker = None
             self.update()
             self._emit_range()
+            event.accept()
+            return
+        if self._jump_drag and event.button() == Qt.MouseButton.LeftButton:
+            self._jump_drag = False
+            self.setSliderPosition(self._x_to_value(event.position().x() - self._jump_offset))
+            self.setSliderDown(False)  # sliderReleased → the transport seeks
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -3165,6 +3344,7 @@ class TransportBar(QWidget):
         self.slider.setEnabled(False)
         self.slider.sliderReleased.connect(lambda: self.seek_requested.emit(self.slider.value()))
         self.slider.valueChanged.connect(self._slider_value_changed)
+        self.slider.actionTriggered.connect(self._slider_action)
         layout.addWidget(self.slider, 1)
 
         self.total_time = QLabel("00:00.000")
@@ -3302,3 +3482,9 @@ class TransportBar(QWidget):
     def _slider_value_changed(self, value: int) -> None:
         if self.slider.isSliderDown():
             self.scrub_preview.emit(value)
+
+    def _slider_action(self, _action: int) -> None:
+        # Wheel, keyboard and page steps move the handle without a drag; seek
+        # to where they put it (sliderPosition is already updated here).
+        if not self.slider.isSliderDown():
+            self.seek_requested.emit(self.slider.sliderPosition())

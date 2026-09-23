@@ -26,10 +26,11 @@ from PySide6.QtWidgets import (
 )
 
 from .decoder import DecoderThread
-from .analysis import threshold_conversion
-from .jobs import OutputTransaction
+from .analysis import value_transition
+from .jobs import OutputTransaction, unique_destination
 from .compose import compose_frame
 from .export import (
+    bitmask_filename,
     frame_burn_label,
     save_frame,
     stats_csv_header,
@@ -41,12 +42,14 @@ from .export_dialogs import (
     ExportImageDialog,
     ExportMovieDialog,
     ExportSeriesDialog,
+    confirm_replace,
 )
 from .extract import ExtractDialog
+from .geometry import roi_coordinates
 from .settings import app_settings
 from .models import FramePacket, RoiShape, UnitOption, VideoMetadata, StatisticsSnapshot
 from .plots import line_profile_values, roi_values
-from .processing import median_max_size, ProcessingState
+from .processing import median_max_size
 from .render import (
     CUSTOM_PALETTE_STOPS,
     DisplayState,
@@ -123,6 +126,8 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._request_sequence = 0
         self._active_request_id = 0
+        self._open_request_id = 0  # generation of the latest open; older ones are stale
+        self._state_request_id = 0  # latest measurement/processing change sent
         self._playback_outstanding = False  # a playback frame request is in flight
         self._ready: deque[FramePacket] = deque()  # due-order presentation queue
         self._latest_decoded: FramePacket | None = None  # newest playback arrival
@@ -212,6 +217,8 @@ class MainWindow(QMainWindow):
         self.decoder.export_finished.connect(self._on_export_finished)
         self.decoder.busy_changed.connect(self._set_busy)
         self.decoder.failed.connect(self._on_decode_failed)
+        self.decoder.open_failed.connect(self._on_open_failed)
+        self.decoder.state_failed.connect(self._on_state_failed)
         self.decoder.start()
 
         if initial_path:
@@ -418,7 +425,7 @@ class MainWindow(QMainWindow):
         if resolved.suffix.lower() not in SUPPORTED_EXTENSIONS:
             self._show_error(
                 "Unsupported file",
-                "Choose a FLIR SEQ, ATS, SFMOV, or CSQ recording.",
+                "Choose a FLIR SEQ, ATS, SFMOV, CSQ, FFF, PTW or radiometric TIFF recording.",
             )
             return
         if not resolved.is_file():
@@ -445,7 +452,8 @@ class MainWindow(QMainWindow):
         self.color_scale.clear()
         self.canvas.clear_frame("Opening recording…")
         self._set_busy(True, "Opening recording…")
-        self.decoder.request_open(str(resolved))
+        self._open_request_id = self._activate_request()
+        self.decoder.request_open(str(resolved), self._open_request_id)
 
     def toggle_playback(self) -> None:
         if self.current_packet is None or self.metadata is None or self._busy:
@@ -609,16 +617,18 @@ class MainWindow(QMainWindow):
 
     def _change_unit(self, key: str) -> None:
         if self.current_packet is None or self._busy:
+            if self.current_packet is not None:  # keep the combo on the unit in force
+                self.inspector.select_unit(self.current_packet.unit.key)
             return
         self.pause_playback(invalidate=True)
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_unit(key, self.current_packet.index, request_id)
 
     def _apply_object_parameters(self, values: dict | None) -> None:
         if self.current_packet is None or self._busy:
             return
         self.pause_playback(invalidate=True)
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_object_params(values, self.current_packet.index, request_id)
 
     def _reset_object_parameters(self) -> None:
@@ -629,9 +639,23 @@ class MainWindow(QMainWindow):
 
     # --- ROI management --------------------------------------------------------
 
+    def _covers_pixels(self, kind: str, points) -> bool:
+        """False for boxes/ellipses that round to zero width or height.
+
+        The worker drops such shapes, so keeping them would leave the canvas,
+        the statistics and every exported CSV disagreeing about the ROI set.
+        """
+        if self.metadata is None:
+            return False
+        probe = RoiShape(0, kind, tuple((float(x), float(y)) for x, y in points), "")
+        ys, _xs = roi_coordinates(probe, self.metadata.height, self.metadata.width)
+        return ys.size > 0
+
     def _add_roi(self, kind: str, points: tuple) -> None:
         if self.current_packet is None or kind not in ROI_KIND_LABELS:
             return
+        if not self._covers_pixels(kind, points):
+            return  # like a too-short drag: nothing measurable was drawn
         self._roi_name_counts[kind] = self._roi_name_counts.get(kind, 0) + 1
         name = f"{ROI_KIND_LABELS[kind]} {self._roi_name_counts[kind]}"
         shape = RoiShape(
@@ -655,6 +679,9 @@ class MainWindow(QMainWindow):
         self._update_plots(self.current_packet, force=True, accumulate=False)
 
     def _replace_roi(self, shape: RoiShape) -> None:
+        if not self._covers_pixels(shape.kind, shape.points):
+            self.canvas.set_rois(self._rois, self._selected_roi_id)  # snap back
+            return
         for index, existing in enumerate(self._rois):
             if existing.id == shape.id:
                 self._rois[index] = shape
@@ -925,13 +952,15 @@ class MainWindow(QMainWindow):
         )
         dest = Path(params["dest"])
         try:
-            with OutputTransaction([metadata.path]) as job:
+            # Only the files the dialog confirmed may be replaced.
+            with OutputTransaction([metadata.path], replace=params.get("replace", ())) as job:
                 frame_path = job.stage(dest)
                 csv_path = job.stage(dest.with_suffix(".csv")) if params["stats_sidecar"] else None
                 save_frame(frame_path, params["fmt"], composed, packet.data, (low, high), packet=packet, source=metadata)
                 if csv_path is not None:
                     write_stats_csv(csv_path, stats_csv_header([shape.name for shape in rois]),
-                        [stats_csv_row(packet, packet.unit.label, scale=(low, high), fmt=params["fmt"])])
+                        [stats_csv_row(packet, packet.unit.label, rois=rois, scale=(low, high),
+                                       fmt=params["fmt"])])
                 job.commit()
             self.title_bar.export_button.setToolTip(f"Saved {dest.name}")
         except Exception as exc:
@@ -946,8 +975,12 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(
             self, "Choose bitmask output folder", str(self.metadata.path.parent)
         )
-        if folder:
-            self.decoder.request_export_bitmasks(folder)
+        if not folder:
+            return
+        replace = confirm_replace(
+            self, [Path(folder) / bitmask_filename(shape.name) for shape in self._rois])
+        if replace is not None:
+            self.decoder.request_export_bitmasks(folder, overwrite=replace)  # confirmed paths
 
     def _open_export_movie_dialog(self) -> None:
         if self.metadata is None or self._busy or self.current_packet is None:
@@ -1035,7 +1068,7 @@ class MainWindow(QMainWindow):
             return
         packet, metadata = snapshot.packet, snapshot.metadata
         rows = self.bottom_panel.statistics.to_rows()
-        default_name = (
+        default_name = unique_destination(
             metadata.path.parent
             / f"{metadata.path.stem}_frame_{packet.index + 1:05d}_stats.csv"
         )
@@ -1050,8 +1083,11 @@ class MainWindow(QMainWindow):
         output = Path(path)
         if output.suffix.lower() != ".csv":
             output = output.with_suffix(".csv")
+        replace = confirm_replace(self, [output], confirmed=[path])  # Save dialog asked already
+        if replace is None:
+            return
         try:
-            with OutputTransaction([metadata.path]) as job:
+            with OutputTransaction([metadata.path], replace=replace) as job:
                 with job.stage(output).open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(["Source", str(metadata.path)])
@@ -1099,12 +1135,16 @@ class MainWindow(QMainWindow):
         if not name:
             self._show_error("Invalid palette", "The palette needs a name.")
             return
+        if name in CUSTOM_PALETTE_STOPS and not (existing and name == current):
+            self._show_error("Invalid palette", f"A custom palette named “{name}” already exists.")
+            return
         try:
             register_custom_palette(name, dialog.palette_stops())
         except ValueError as exc:
             self._show_error("Invalid palette", str(exc))
             return
-        if existing and name != current:
+        if existing and name != current:  # a rename retires the old entry everywhere
+            unregister_custom_palette(current)
             self.inspector.remove_palette(current)
         self.inspector.add_palette(name, select=True)
 
@@ -1183,7 +1223,7 @@ class MainWindow(QMainWindow):
         if self.current_packet is None or self._busy:
             return
         self.pause_playback(invalidate=True)
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_corrections(nuc, bp, self.current_packet.index, request_id)
 
     # --- processing pipeline (reference file operation + filters) -----------------
@@ -1196,7 +1236,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != ReferenceDialog.DialogCode.Accepted:
             return
         self._reference_params = dialog.parameters()
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_reference(
             self._reference_params, self.current_packet.index, request_id
         )
@@ -1206,19 +1246,22 @@ class MainWindow(QMainWindow):
             return
         self.pause_playback(invalidate=True)
         self._reference_params = None
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_reference(None, self.current_packet.index, request_id)
 
     def _change_filters(self, state: dict) -> None:
+        if self.current_packet is not None and self._busy:
+            self.inspector.set_processing(self._filters_state)  # not sent: undo the edit
+            return
         self._filters_state = {
             "point": tuple(state.get("point", ("none", 1.0))),
             "spatial": tuple(state.get("spatial", ("none", 3))),
             "temporal": tuple(state.get("temporal", ("none", 5))),
         }
-        if self.current_packet is None or self._busy:
+        if self.current_packet is None:
             return
         self.pause_playback(invalidate=True)
-        request_id = self._activate_request()
+        request_id = self._activate_state_request()
         self.decoder.request_filters(
             self._filters_state, self.current_packet.index, request_id
         )
@@ -1423,6 +1466,8 @@ class MainWindow(QMainWindow):
         options: tuple[UnitOption, ...],
         packet: FramePacket,
     ) -> None:
+        if packet.request_id != self._open_request_id:
+            return  # a later open superseded this one; the worker has moved on
         self.metadata = metadata
         self._add_recent_file(metadata.path)
         self._active_request_id = packet.request_id
@@ -1437,10 +1482,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_median_size_cap(
             median_max_size(metadata.width * metadata.height)
         )
-        self.fixed_minimum = packet.minimum
-        self.fixed_maximum = packet.maximum
-        self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
-        self._sync_thresholds(packet, None)
+        self._sync_value_controls(packet, None)  # a new source re-seeds them
         self._present_packet(packet)
 
     def _on_frame_ready(self, packet: FramePacket) -> None:
@@ -1493,11 +1535,7 @@ class MainWindow(QMainWindow):
 
     def _on_unit_ready(self, option: UnitOption, packet: FramePacket) -> None:
         if packet.request_id != self._active_request_id:
-            return
-        self._sync_thresholds(packet, self.current_packet)
-        self.fixed_minimum = packet.minimum
-        self.fixed_maximum = packet.maximum
-        self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
+            return  # value controls follow the next presented packet instead
         self._present_packet(packet)
 
     def _present_packet(self, packet: FramePacket) -> None:
@@ -1506,28 +1544,38 @@ class MainWindow(QMainWindow):
             self._temporal.clear()
             self.bottom_panel.temporal.setToolTip("History cleared: analysis settings changed")
             self.bottom_panel.temporal.history_note.setText("History cleared: settings changed")
-            if previous.unit.key == packet.unit.key:
-                self._sync_thresholds(packet, None)
+            # Driven by the presented data, not by acknowledgements, so a unit
+            # change overtaken by a seek still converts the value controls.
+            transition = value_transition(previous.unit.key, previous.processing,
+                                          packet.unit.key, packet.processing)
+            if transition != (1.0, 0.0):
+                self._sync_value_controls(packet, transition)
         self.current_packet = packet
         self._render_current_frame()
 
-    def _sync_thresholds(self, packet: FramePacket, previous: FramePacket | None) -> None:
-        conversion = threshold_conversion(previous.unit.key, packet.unit.key,
-            packet.processing or ProcessingState()) if previous is not None else None
-        if conversion is None:
-            self.seg_min, self.seg_max = packet.minimum, packet.maximum
-            self.iso_limit1, self.iso_limit2 = packet.minimum, packet.maximum
+    def _sync_value_controls(self, packet: FramePacket, transition) -> None:
+        """Carry fixed range and thresholds into a new numerical domain.
+
+        ``transition`` is an affine (factor, offset) from ``value_transition``;
+        None re-seeds from the frame the way first enabling each control does
+        (an isotherm at the frame minimum would paint the whole image).
+        """
+        if transition is None:
+            low, high = packet.minimum, packet.maximum
+            self.fixed_minimum, self.fixed_maximum = low, high
+            self.seg_min, self.seg_max = low, high
+            self.iso_limit1, self.iso_limit2 = (low + high) / 2.0, high
         else:
-            factor, offset = conversion
+            factor, offset = transition
+            self.fixed_minimum, self.fixed_maximum = (
+                factor * self.fixed_minimum + offset, factor * self.fixed_maximum + offset)
             self.seg_min, self.seg_max = (factor * self.seg_min + offset, factor * self.seg_max + offset)
-            self.iso_limit1, self.iso_limit2 = (factor * self.iso_limit1 + offset, factor * self.iso_limit2 + offset)
-        for spin, value in ((self.inspector.seg_min_spin, self.seg_min),
-                            (self.inspector.seg_max_spin, self.seg_max),
-                            (self.inspector.iso_limit1_spin, self.iso_limit1),
-                            (self.inspector.iso_limit2_spin, self.iso_limit2)):
-            spin.blockSignals(True)
-            spin.setValue(value)
-            spin.blockSignals(False)
+            self.iso_limit1, self.iso_limit2 = (
+                factor * self.iso_limit1 + offset, factor * self.iso_limit2 + offset)
+        self.inspector.set_value_precision(packet.minimum, packet.maximum)
+        self.inspector.set_fixed_values(self.fixed_minimum, self.fixed_maximum)
+        self.inspector.set_segmentation_values(self.seg_min, self.seg_max)
+        self.inspector.set_isotherm_values(self.iso_limit1, self.iso_limit2)
 
     def _render_current_frame(self) -> None:
         if self.current_packet is None or self.metadata is None:
@@ -1620,6 +1668,45 @@ class MainWindow(QMainWindow):
             self.canvas.clear_frame("Unable to open this recording")
         self._show_error("FLIR decoding error", message)
 
+    def _on_open_failed(self, open_id: int, message: str) -> None:
+        if open_id != self._open_request_id:
+            return  # failure of an open the user has already replaced
+        self._on_decode_failed(message)
+
+    def _on_state_failed(self, request_id: int, message: str, state: dict | None) -> None:
+        """Report a rejected state change and put the controls back.
+
+        A rejection that a newer change has already superseded leaves the
+        controls alone: they describe that newer change, whose own result (or
+        rejection) follows. Otherwise the controls go back to the state in
+        force and the frame is fetched again under it: an earlier change may
+        have succeeded while its frame was superseded by the rejected one.
+        """
+        if getattr(self, "_closing", False):
+            return
+        self._show_error("FLIR decoding error", message)
+        if state is None or request_id != self._state_request_id:
+            return
+        self._restore_state(state)
+        if self.current_packet is not None:
+            refresh = self._activate_request()
+            self.decoder.request_frame(
+                self.current_packet.index,
+                refresh,
+                need_clip=self.show_clipping,
+                need_metadata=self._metadata_tab_active(),
+            )
+
+    def _restore_state(self, state: dict) -> None:
+        """Show the measurement/processing state in force in the controls."""
+        self.inspector.select_unit(state["unit"])
+        self.inspector.set_object_parameters(state["object_parameters"])
+        self.inspector.set_corrections(state["corrections"])
+        self._reference_params = state["reference"]
+        self.inspector.set_reference_label(state["reference_label"])
+        self._filters_state = {key: tuple(value) for key, value in state["processing"].items()}
+        self.inspector.set_processing(self._filters_state)
+
     def _export(self, kind: str) -> None:
         if self.current_packet is None or self.metadata is None:
             return
@@ -1632,7 +1719,7 @@ class MainWindow(QMainWindow):
             "csv": "CSV table (*.csv)",
         }
         extension = suffix_map[kind]
-        default_name = (
+        default_name = unique_destination(
             metadata.path.parent
             / f"{metadata.path.stem}_frame_{packet.index + 1:05d}{extension}"
         )
@@ -1647,8 +1734,11 @@ class MainWindow(QMainWindow):
         output = Path(path)
         if output.suffix.lower() != extension:
             output = output.with_suffix(extension)
+        replace = confirm_replace(self, [output], confirmed=[path])  # Save dialog asked already
+        if replace is None:
+            return
         try:
-            with OutputTransaction([metadata.path]) as job:
+            with OutputTransaction([metadata.path], replace=replace) as job:
                 stage = job.stage(output)
                 if kind == "png":
                     if image.isNull() or not image.save(str(stage), "PNG"):
@@ -1656,7 +1746,11 @@ class MainWindow(QMainWindow):
                 elif kind == "npy":
                     np.save(stage, packet.data)
                 else:
-                    np.savetxt(stage, packet.data, delimiter=",", fmt="%.6f")
+                    # Round-trip exact: %.6f kept only ~4 digits of radiance.
+                    kind_code = packet.data.dtype.kind
+                    fmt = "%d" if kind_code in "iu" else (
+                        "%.17g" if packet.data.dtype == np.float64 else "%.9g")
+                    np.savetxt(stage, packet.data, delimiter=",", fmt=fmt)
                 job.commit()
             self.title_bar.export_button.setToolTip(f"Saved {output.name}")
         except Exception as exc:
@@ -1682,6 +1776,13 @@ class MainWindow(QMainWindow):
     def _activate_request(self) -> int:
         request_id = self._next_request_id()
         self._active_request_id = request_id
+        return request_id
+
+    def _activate_state_request(self) -> int:
+        """Request id for a unit/parameter/correction/reference/filter change;
+        a rejection only resets the controls if no newer change was sent."""
+        request_id = self._activate_request()
+        self._state_request_id = request_id
         return request_id
 
     def _next_request_id(self) -> int:
