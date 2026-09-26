@@ -162,8 +162,13 @@ def test_n08_probe_follows_frames_flips_and_tools(qapp):
     assert emitted[-1] == (3, 2, 43.0)
     canvas.set_frame(rgb, np.arange(200, dtype=float).reshape(10, 20) * 10, "°C")
     assert emitted[-1] == (3, 2, 430.0)
+    # the readout stays live in the drawing tools (2026-09-26 polish)
     canvas.set_roi_tool("rect")
-    assert emitted[-1] is None
+    assert canvas._probe == (3, 2, 430.0)
+    pos = QPointF(45, 25)  # displayed pixel (4, 2)
+    canvas.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, pos, pos, Qt.MouseButton.NoButton,
+                                      Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+    assert emitted[-1] == (4, 2, 440.0)
     canvas.close()
 
 
@@ -357,23 +362,23 @@ def test_n09_failed_job_restores_replaced_files(tmp_path, monkeypatch, links):
 
 
 def test_n09_dialogs_ask_before_replacing_and_default_to_new_names(qapp, tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
     from flir_player.export_dialogs import ExportImageDialog, ExportMovieDialog, ExportSeriesDialog
+    from flir_player.widgets import MessageDialog
     recording = (tmp_path / "rec.seq").resolve()
     metadata = _metadata(30, recording)
     (tmp_path / "rec_frame_00001.png").write_bytes(b"x")
     (tmp_path / "rec.mp4").write_bytes(b"x")
     answers = []
-    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: answers.pop(0)))
+    monkeypatch.setattr(MessageDialog, "question", staticmethod(lambda *a, **k: answers.pop(0)))
     image = ExportImageDialog(metadata, 0)
     movie = ExportMovieDialog(metadata)
     assert Path(image.path_edit.text()).name == "rec_frame_00001 (2).png"
     assert Path(movie.path_edit.text()).name == "rec (2).mp4"
     image.path_edit.setText(str(tmp_path / "rec_frame_00001.png"))
-    answers.append(QMessageBox.StandardButton.No)
+    answers.append(False)
     image.accept()
     assert image.result() != image.DialogCode.Accepted and not image.parameters()["replace"]
-    answers.append(QMessageBox.StandardButton.Yes)
+    answers.append(True)
     image.accept()
     assert image.result() == image.DialogCode.Accepted and image.parameters()["replace"]
     series = ExportSeriesDialog(metadata)
@@ -382,7 +387,7 @@ def test_n09_dialogs_ask_before_replacing_and_default_to_new_names(qapp, tmp_pat
     series.start_spin.setValue(1)
     series.end_spin.setValue(3)
     (tmp_path / "rec_00002.png").write_bytes(b"x")
-    answers.append(QMessageBox.StandardButton.Yes)
+    answers.append(True)
     series.accept()
     assert series.result() == series.DialogCode.Accepted and series.parameters()["replace"]
     assert not answers
@@ -391,12 +396,12 @@ def test_n09_dialogs_ask_before_replacing_and_default_to_new_names(qapp, tmp_pat
 
 
 def test_n09_bitmasks_can_be_replaced_after_confirmation(player, qapp, tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QFileDialog
+    from flir_player.widgets import MessageDialog
     player._add_roi("rect", ((10, 10), (50, 50)))
     assert wait_until(qapp, lambda: player.current_packet.roi_stats and not player._busy)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
-    monkeypatch.setattr(QMessageBox, "question",
-                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(MessageDialog, "question", staticmethod(lambda *a, **k: True))
     results = []
     player.decoder.export_finished.connect(lambda ok, message: results.append((ok, message)))
     for expected in (1, 2):

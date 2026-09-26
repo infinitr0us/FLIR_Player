@@ -19,7 +19,7 @@ os.environ["FLIR_SETTINGS_FILE"] = str(Path(_settings_dir.name) / "preferences.i
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from flir_player.style import APP_STYLESHEET, install_ui_fonts
+from flir_player.style import apply_app_theme
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +111,7 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401
 @pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance() or QApplication([])
-    app.setStyle("Fusion")
-    install_ui_fonts()
-    app.setStyleSheet(APP_STYLESHEET)
+    apply_app_theme(app)
     return app
 
 

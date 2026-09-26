@@ -17,7 +17,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from flir_player.main_window import MainWindow
-from flir_player.style import APP_STYLESHEET, install_ui_fonts
+from flir_player.style import apply_app_theme
 
 
 def parser() -> argparse.ArgumentParser:
@@ -34,9 +34,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     app = QApplication([])
-    app.setStyle("Fusion")
-    install_ui_fonts()
-    app.setStyleSheet(APP_STYLESHEET)
+    apply_app_theme(app)
     window = MainWindow()
     window.resize(args.width, args.height)
     window.show()

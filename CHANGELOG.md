@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.5.1 — 2026-09-26
+
+This release polishes the interface: the cursor readout works in every ROI
+tool and describes the ROI being drawn, the window chrome behaves like a
+native window, and every dialog is themed. Measurements, exports and file
+formats are unchanged.
+
+### ROIs and the cursor readout
+
+- The coordinates and value under the pointer are shown with every ROI tool,
+  not only Select. A second line gives the geometry of the ROI being drawn,
+  moved, resized or hovered, in the pixels its statistics measure: box and
+  ellipse pixel ranges and size (ellipses also their pixel count), line
+  endpoints, length and angle, spot position and value.
+- The readout stays on screen when zoomed in, moves out of the pointer's way,
+  and shortens long ROI names rather than running off the view.
+- Esc cancels an ROI being drawn or edited. The outline being drawn has a
+  dark edge, so it shows on hot imagery.
+- In Select mode the pointer shows what a press will do: move, resize, pan
+  (when zoomed) or jump the minimap.
+- The shape tools have outline icons: the ellipse no longer looks like a
+  filled dot, nor the line like "=".
+
+### Window and timeline
+
+- The timeline handle is no longer cut off at the top, nor are the play-range
+  markers. The handle lights up on hover, the markers show a resize pointer,
+  and hovering the timeline shows the frame and time there.
+- Minimize, maximize and close share one 46 × 55 click target with no gaps;
+  close turns white on red.
+- The frameless window resizes from every edge and corner, not only the
+  bottom-right grip.
+- The frame and time readouts reserve their full width, so the timeline no
+  longer shifts as digits are added during playback.
+
+### Dialogs and feedback
+
+- Message boxes and progress dialogs use the themed title row of the other
+  dialogs instead of a native (light, in Windows light mode) title bar. Error
+  text wraps inside long paths and can be copied exactly. "Replace existing
+  files?" defaults to No. A cancelled export says "Cancelling…" until the job
+  has stopped.
+- The app declares itself dark to Windows, so windows that keep a native frame
+  (the colour picker) get a dark title bar too.
+- Saves, exports, extractions and loaded ROI sets are confirmed by a brief
+  notice on the image; they used to change only the Export button's tooltip.
+  Messages such as "Draw an ROI first" are visible too.
+- Spin boxes with steppers (movie, series, extract, reference and Excel
+  dialogs) show themed arrows instead of dark blocks; the Batch Extract list
+  is no longer a white box; browse buttons show a folder icon; disabled
+  checked boxes are muted instead of accent-coloured.
+- Error messages appear over the player, not wherever Windows centres them.
+
+### Inspector and analysis panel
+
+- Control groups are evenly spaced, and the Segmentation / Isotherm limit
+  fields line up with the other inputs.
+- The Temporal tab labels its statistic picker instead of repeating the tab's
+  name.
+- The image has keyboard focus at startup, so the Open button no longer sits
+  in its focus ring.
+
+### Under the hood
+
+- `geometry.area_extent` gives the exact pixel extent and count of a box or
+  ellipse in O(rows); it agrees with `roi_coordinates` on every tested shape
+  and takes 0.1 ms for a full-frame 1280 × 1024 ellipse (28 ms via the
+  coordinates).
+- `style.apply_app_theme` sets up style, fonts, stylesheet and colour scheme
+  in one place; `MessageDialog` and `ProgressDialog` replace `QMessageBox`
+  and `QProgressDialog`.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.5.0...v0.5.1)
+
 ## 0.5.0 — 2026-09-26
 
 This release adds an Excel workbook export for comparing IR with

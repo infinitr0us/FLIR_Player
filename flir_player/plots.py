@@ -50,13 +50,13 @@ class PlotCanvas(FigureCanvasQTAgg):
 
 
 class _PlotPanel(QFrame):
-    """Base: PlotCanvas with an optional header row (title + controls).
+    """Base: PlotCanvas with an optional header row of controls.
 
-    Panels whose tab name and in-plot title already say what they are pass
-    title=None and skip the header to avoid a redundant heading.
+    No heading: the tab name and the in-plot title already say what each
+    panel shows. The header row appears with the first control added.
     """
 
-    def __init__(self, title: str | None = None, parent=None) -> None:
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 6, 12, 8)
@@ -64,13 +64,7 @@ class _PlotPanel(QFrame):
 
         self._header = QHBoxLayout()
         self._header.setSpacing(8)
-        self._header_added = title is not None
-        if title is not None:
-            self.title_label = QLabel(title)
-            self.title_label.setObjectName("FieldLabel")
-            self._header.addWidget(self.title_label)
-            self._header.addStretch(1)
-            layout.addLayout(self._header)
+        self._header_added = False
 
         self.canvas = PlotCanvas()
         layout.addWidget(self.canvas)
@@ -94,9 +88,6 @@ class _PlotPanel(QFrame):
 class ProfilePlotPanel(_PlotPanel):
     """Values along a line ROI (§4.7.1.2)."""
 
-    def __init__(self, parent=None) -> None:
-        super().__init__(None, parent)
-
     def set_profile(self, distances: np.ndarray, values: np.ndarray, label: str, suffix: str) -> None:
         ax = self.canvas.ax
         ax.clear()
@@ -112,9 +103,6 @@ class HistogramPlotPanel(_PlotPanel):
     """Value distribution of an ROI or the whole image (§4.7.1.4)."""
 
     BINS = 128
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(None, parent)
 
     def set_values(self, values: np.ndarray, label: str, suffix: str) -> None:
         values = values[np.isfinite(values)]
@@ -144,17 +132,25 @@ class TemporalPlotPanel(_PlotPanel):
     )
 
     def __init__(self, parent=None) -> None:
-        super().__init__("Temporal", parent)
+        # No "Temporal" heading: the tab says it. The header holds the
+        # controls, labelled, with the history note on the right.
+        super().__init__(parent)
+        caption = QLabel("Statistic")
+        caption.setObjectName("FieldLabel")
+        self.add_header_widget(caption)
         self.stat_combo = QComboBox()
         for label, _attr in self.STATISTICS:
             self.stat_combo.addItem(label, label)
         self.stat_combo.setMinimumWidth(120)
+        self.stat_combo.setToolTip("ROI statistic plotted against time")
         self.add_header_widget(self.stat_combo)
 
         self.clear_button = QToolButton()
         self.clear_button.setObjectName("TransportButton")
         self.clear_button.setText("Clear")
+        self.clear_button.setToolTip("Clear the collected history")
         self.add_header_widget(self.clear_button)
+        self._header.addStretch(1)
         self.history_note = QLabel()
         self.history_note.setObjectName("FieldLabel")
         self.add_header_widget(self.history_note)

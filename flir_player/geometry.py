@@ -55,6 +55,47 @@ def pixel_index(kind: str, x: float, y: float, width: int, height: int) -> tuple
     return (max(0, min(int(round(x)), width)), max(0, min(int(round(y)), height)))
 
 
+def area_extent(kind: str, points, height: int, width: int):
+    """(x_min, x_max, y_min, y_max, pixel count) of a box or ellipse ROI, or
+    None when it covers no pixel.
+
+    Exactly the pixels ``roi_coordinates`` returns, found in O(rows) without
+    building them, for readouts that follow the pointer while a large ellipse
+    is drawn (a full-frame ellipse takes ~30 ms through ``roi_coordinates``).
+    """
+    if width < 1 or height < 1 or len(points) != 2:
+        return None
+    (x0, y0), (x1, y1) = (pixel_index(kind, x, y, width, height) for x, y in points)
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    if right == left or bottom == top:
+        return None
+    if kind == "rect":
+        return (left, right - 1, top, bottom - 1, (right - left) * (bottom - top))
+    rows = np.arange(top, bottom, dtype=np.int64)
+    row_term = ((2 * rows + 1 - top - bottom) / (bottom - top)) ** 2
+
+    def inside(xs):  # the test of _coordinates, evaluated in the same float64 steps
+        return ((2 * xs + 1 - left - right) / (right - left)) ** 2 + row_term[:, None] <= 1.0
+
+    # The test is monotonic in |2x + 1 - left - right|, so each row is one
+    # interval symmetric about the centre. Estimate its right end, then settle
+    # it with the exact test over a window around the estimate.
+    first = (left + right) // 2  # innermost column right of the centre
+    estimate = np.floor((right - left) * np.sqrt(np.clip(1.0 - row_term, 0.0, None)) / 2.0
+                        + (left + right - 1) / 2.0).astype(np.int64)
+    window = np.clip(estimate[:, None] + np.arange(-3, 4), first, right - 1)
+    ok = inside(window)
+    has = ok.any(axis=1)
+    if not has.any():
+        return None
+    x_max = np.where(ok, window, first - 1).max(axis=1)[has]
+    x_min = left + right - 1 - x_max
+    covered = rows[has]
+    return (int(x_min.min()), int(x_max.max()), int(covered[0]), int(covered[-1]),
+            int((x_max - x_min + 1).sum()))
+
+
 def _coordinates(kind, points, height, width):
     empty = (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32))
     if width < 1 or height < 1:

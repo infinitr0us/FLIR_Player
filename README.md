@@ -80,7 +80,9 @@ all decoding work off the GUI thread.
   threshold times, ROI maps, and saved ROI sets (with the ignition frame) for
   reuse across tests.
 - Dynamic per-frame scaling or a user-defined fixed range.
-- Live cursor coordinates and radiometric value inspection.
+- Live cursor coordinates and radiometric value inspection in every ROI tool,
+  plus the pixel extent of the ROI being drawn, edited or hovered (box and
+  ellipse pixel ranges and size; line endpoints, length and angle).
 - PNG display export plus raw NumPy and CSV export.
 - Drag-and-drop opening, full-screen inspection, tooltips, and keyboard shortcuts.
 - A byte-budgeted frame cache (64 MiB by default); the application never loads

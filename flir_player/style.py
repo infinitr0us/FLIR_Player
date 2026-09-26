@@ -6,7 +6,22 @@ import os
 from pathlib import Path
 from string import Template
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
+
+
+def apply_app_theme(app) -> None:
+    """Fusion, the UI fonts, the stylesheet, and the dark colour scheme.
+
+    The app is always dark. Declaring that to Qt gives windows that keep a
+    native frame (the colour picker; any stray top-level) a dark Windows title
+    bar even when Windows itself is in light mode, and gives anything the
+    stylesheet does not cover a dark palette. Themed surfaces are unaffected.
+    """
+    app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    app.setStyle("Fusion")
+    install_ui_fonts()
+    app.setStyleSheet(APP_STYLESHEET)
 
 
 def install_ui_fonts() -> None:
@@ -60,6 +75,9 @@ TOKENS.update(
         "CHECK_ICON": (_ICONS_DIR / "check.svg").as_posix(),
         "CHEVRON_ICON": (_ICONS_DIR / "chevron-down.svg").as_posix(),
         "CHEVRON_DISABLED_ICON": (_ICONS_DIR / "chevron-down-disabled.svg").as_posix(),
+        "CHEVRON_UP_ICON": (_ICONS_DIR / "chevron-up.svg").as_posix(),
+        "CHEVRON_UP_DISABLED_ICON": (_ICONS_DIR / "chevron-up-disabled.svg").as_posix(),
+        "CHECK_DISABLED_ICON": (_ICONS_DIR / "check-disabled.svg").as_posix(),
     }
 )
 
@@ -110,10 +128,13 @@ QLabel#Filename {
     font-size: 13px;
 }
 
-QToolButton#CaptionButton {
+/* Window caption buttons: one 46 x 55 click target each, flush with each
+   other and with the title bar's bottom hairline, as on native Windows. */
+QToolButton#CaptionButton, QToolButton#CloseButton {
     background: transparent;
     border: none;
     border-radius: 0;
+    padding: 0;
     min-width: 46px;
     max-width: 46px;
     min-height: 55px;
@@ -502,6 +523,54 @@ QComboBox::down-arrow:disabled {
     image: url("$CHEVRON_DISABLED_ICON");
 }
 
+/* Spin box steppers (dialog spins that keep their buttons). Unstyled, the
+   Fusion primitives render as dark slabs on the themed fill. */
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 20px;
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+}
+
+QAbstractSpinBox::up-button {
+    subcontrol-position: top right;
+    margin: 4px 4px 0 0;
+}
+
+QAbstractSpinBox::down-button {
+    subcontrol-position: bottom right;
+    margin: 0 4px 4px 0;
+}
+
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {
+    background: $BORDER_CTRL;
+}
+
+QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed {
+    background: $CONTROL_PRESSED;
+}
+
+QAbstractSpinBox::up-arrow {
+    image: url("$CHEVRON_UP_ICON");
+    width: 9px;
+    height: 9px;
+}
+
+QAbstractSpinBox::down-arrow {
+    image: url("$CHEVRON_ICON");
+    width: 9px;
+    height: 9px;
+}
+
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off {
+    image: url("$CHEVRON_UP_DISABLED_ICON");
+}
+
+QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off {
+    image: url("$CHEVRON_DISABLED_ICON");
+}
+
 QComboBox QAbstractItemView {
     background: $CARD;
     border: 1px solid $BORDER_CTRL;
@@ -753,6 +822,33 @@ QTableCornerButton::section {
     border-bottom: 1px solid $BORDER;
 }
 
+/* ---------------- Lists (batch extract recordings) ---------------- */
+
+/* QListWidget only: combo-box popups are list views with their own rules. */
+QListWidget {
+    background: $CARD;
+    border: 1px solid $BORDER;
+    border-radius: $R_PANEL;
+    padding: 4px;
+    outline: none;
+}
+
+QListWidget::item {
+    min-height: 26px;
+    padding: 0 8px;
+    border-radius: 4px;
+    color: $TEXT_SECONDARY;
+}
+
+QListWidget::item:hover {
+    background: $CONTROL_HOVER;
+}
+
+QListWidget::item:selected {
+    background: $ACCENT_TINT;
+    color: $TEXT;
+}
+
 /* ---------------- Inspector scroll area ---------------- */
 
 QScrollArea#InspectorScroll {
@@ -828,6 +924,18 @@ QCheckBox::indicator:checked {
     image: url("$CHECK_ICON");
 }
 
+/* A disabled box keeps showing its state, but not as an active accent. */
+QCheckBox::indicator:disabled {
+    background: $CARD;
+    border-color: $BORDER;
+}
+
+QCheckBox::indicator:checked:disabled {
+    background: $CONTROL_HOVER;
+    border-color: $BORDER_CTRL;
+    image: url("$CHECK_DISABLED_ICON");
+}
+
 QCheckBox:disabled {
     color: $FAINT;
 }
@@ -875,6 +983,15 @@ QDialog QLabel {
 QWidget#DialogTitleBar {
     background: transparent;
     border-bottom: 1px solid $BORDER;
+}
+
+/* Message dialog text: a read-only text view that reads as a label */
+QTextEdit#MessageText {
+    background: transparent;
+    border: none;
+    color: $TEXT_SECONDARY;
+    selection-background-color: $ACCENT_TINT;
+    selection-color: $TEXT;
 }
 
 QLabel#DialogTitle {

@@ -29,6 +29,8 @@ ROI_COLORS: tuple[str, ...] = (
     "#FF9E64",
 )
 
+ROI_KIND_LABELS: dict[str, str] = {"rect": "Box", "ellipse": "Ellipse", "line": "Line", "cursor": "Spot"}
+
 
 @dataclass(frozen=True, slots=True)
 class CadenceInfo:

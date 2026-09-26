@@ -10,8 +10,10 @@ from typing import Iterable
 import numpy as np
 import qtawesome as qta
 import qtawesome.iconic_font as qta_font
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QAccessible,
+    QAccessibleEvent,
     QColor,
     QFont,
     QIcon,
@@ -21,6 +23,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,8 +40,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QMenu,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizeGrip,
@@ -49,13 +54,16 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from .settings import app_settings
-from .models import ROI_COLORS, CadenceInfo, UnitOption, VideoMetadata
+from .geometry import area_extent, pixel_index
+from .models import ROI_COLORS, ROI_KIND_LABELS, CadenceInfo, UnitOption, VideoMetadata
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
 from .render import (
     format_spread,
@@ -101,6 +109,16 @@ def awesome_icon(name: str, color: str = ICON_TEXT) -> QIcon:
     return qta.icon(name, color=color, color_disabled=ICON_DISABLED, scale_factor=0.88)
 
 
+def browse_button(tooltip: str) -> QToolButton:
+    """Folder button beside a path field (dialogs), in the title bar's Open style."""
+    button = QToolButton()
+    button.setObjectName("FilledButton")
+    button.setIcon(awesome_icon("fa6s.folder-open", ICON_SECONDARY))
+    button.setIconSize(QSize(15, 15))
+    button.setToolTip(tooltip)
+    return button
+
+
 def value_table_item(text: str) -> QTableWidgetItem:
     """Table value cell: tabular font, full text on tooltip when long."""
     item = QTableWidgetItem(text)
@@ -117,6 +135,105 @@ class ChevronComboBox(QComboBox):
     """
 
 
+CAPTION_WIDTH = 46
+TITLE_BAR_HEIGHT = 56
+CAPTION_HEIGHT = TITLE_BAR_HEIGHT - 1  # the bar's bottom hairline stays visible
+WINDOW_EDGE_RESERVE = 4  # control-free strip on the window's right edge (EdgeResizeGrip)
+
+
+class CaptionButton(QToolButton):
+    """Minimize / maximize / close button of the frameless title bar.
+
+    All three share one fixed click target. The close glyph turns white on
+    its red hover fill, as native Windows caption buttons do.
+    """
+
+    def __init__(self, icon_name: str, close: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self._close = close
+        self._hovered = False
+        self.setObjectName("CloseButton" if close else "CaptionButton")
+        self.setFixedSize(CAPTION_WIDTH, CAPTION_HEIGHT)
+        self.setIconSize(QSize(15, 15))
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # window chrome, not a tab stop
+        self.set_glyph(icon_name)
+
+    def set_glyph(self, icon_name: str) -> None:
+        self._icon_name = icon_name
+        self._apply_icon()
+
+    def _apply_icon(self) -> None:
+        color = "#FFFFFF" if self._close and self._hovered else ICON_SECONDARY
+        self.setIcon(awesome_icon(self._icon_name, color))
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self._apply_icon()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self._apply_icon()
+        super().leaveEvent(event)
+
+
+class EdgeResizeGrip(QWidget):
+    """Invisible strip on an edge (or corner) of the frameless main window
+    that starts a native resize, restoring the border a framed window has.
+
+    It lies over the window's outer THICKNESS pixels, which hold no control:
+    layout margins, and a strip the inspector reserves beside its scroll bar
+    (WINDOW_EDGE_RESERVE). As on native Windows, the top edge and corners
+    take the top few pixels of the caption buttons; the right edge starts
+    below the title bar so Close keeps its full width. Hidden while
+    maximized or full screen.
+    """
+
+    THICKNESS = WINDOW_EDGE_RESERVE
+    CORNER = 8
+    _LEFT, _RIGHT = Qt.Edge.LeftEdge, Qt.Edge.RightEdge
+    _TOP, _BOTTOM = Qt.Edge.TopEdge, Qt.Edge.BottomEdge
+    ALL_EDGES = (
+        _LEFT, _RIGHT, _TOP, _BOTTOM,
+        _TOP | _LEFT, _TOP | _RIGHT, _BOTTOM | _LEFT, _BOTTOM | _RIGHT,
+    )
+
+    def __init__(self, window: QWidget, edges) -> None:
+        super().__init__(window)
+        self.edges = edges
+        horizontal = bool(edges & (self._LEFT | self._RIGHT))
+        vertical = bool(edges & (self._TOP | self._BOTTOM))
+        if horizontal and vertical:
+            falling = edges in (self._TOP | self._LEFT, self._BOTTOM | self._RIGHT)
+            shape = Qt.CursorShape.SizeFDiagCursor if falling else Qt.CursorShape.SizeBDiagCursor
+        else:
+            shape = Qt.CursorShape.SizeHorCursor if horizontal else Qt.CursorShape.SizeVerCursor
+        self.setCursor(shape)
+        self.place()
+
+    def place(self) -> None:
+        width, height = self.parentWidget().width(), self.parentWidget().height()
+        t, c = self.THICKNESS, self.CORNER
+        if self.edges == self._LEFT:
+            self.setGeometry(0, c, t, max(0, height - 2 * c))
+        elif self.edges == self._RIGHT:
+            self.setGeometry(width - t, TITLE_BAR_HEIGHT, t, max(0, height - TITLE_BAR_HEIGHT - c))
+        elif self.edges in (self._TOP, self._BOTTOM):
+            self.setGeometry(c, 0 if self.edges == self._TOP else height - t, max(0, width - 2 * c), t)
+        else:  # corner square, larger than the edge strips for an easy diagonal grab
+            self.setGeometry(0 if self.edges & self._LEFT else width - c,
+                             0 if self.edges & self._TOP else height - c, c, c)
+        self.raise_()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None and handle.startSystemResize(self.edges):
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class TitleBar(QWidget):
     open_requested = Signal()
     export_requested = Signal()
@@ -125,7 +242,7 @@ class TitleBar(QWidget):
         super().__init__(parent)
         self.setObjectName("TitleBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(56)
+        self.setFixedHeight(TITLE_BAR_HEIGHT)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 0, 0, 0)
@@ -169,22 +286,23 @@ class TitleBar(QWidget):
         layout.addWidget(self.export_button)
 
         layout.addSpacing(8)
-        self.minimize_button = self._caption_button("fa6s.minus")
-        self.maximize_button = self._caption_button("fa6s.window-maximize")
-        self.close_button = self._caption_button("fa6s.xmark", close=True)
+        # Caption buttons sit flush, share one click-target size, and stop
+        # above the title bar's bottom hairline (ends at CAPTION_HEIGHT).
+        captions = QHBoxLayout()
+        captions.setContentsMargins(0, 0, 0, 0)
+        captions.setSpacing(0)
+        self.minimize_button = CaptionButton("fa6s.minus")
+        self.maximize_button = CaptionButton("fa6s.window-maximize")
+        self.close_button = CaptionButton("fa6s.xmark", close=True)
+        self.minimize_button.setToolTip("Minimize")
+        self.maximize_button.setToolTip("Maximize")
+        self.close_button.setToolTip("Close")
         self.minimize_button.clicked.connect(lambda: self.window().showMinimized())
         self.maximize_button.clicked.connect(self.toggle_maximized)
         self.close_button.clicked.connect(lambda: self.window().close())
-        layout.addWidget(self.minimize_button)
-        layout.addWidget(self.maximize_button)
-        layout.addWidget(self.close_button)
-
-    def _caption_button(self, icon_name: str, close: bool = False) -> QToolButton:
-        button = QToolButton()
-        button.setObjectName("CloseButton" if close else "CaptionButton")
-        button.setIcon(awesome_icon(icon_name, ICON_SECONDARY))
-        button.setIconSize(QSize(15, 15))
-        return button
+        for button in (self.minimize_button, self.maximize_button, self.close_button):
+            captions.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(captions)
 
     def set_filename(self, filename: str) -> None:
         self.filename_label.setText(filename or "No recording")
@@ -207,12 +325,11 @@ class TitleBar(QWidget):
         self.update_maximize_icon()
 
     def update_maximize_icon(self) -> None:
-        icon_name = (
-            "fa6s.window-restore"
-            if self.window().isMaximized()
-            else "fa6s.window-maximize"
+        maximized = self.window().isMaximized()
+        self.maximize_button.set_glyph(
+            "fa6s.window-restore" if maximized else "fa6s.window-maximize"
         )
-        self.maximize_button.setIcon(awesome_icon(icon_name, ICON_SECONDARY))
+        self.maximize_button.setToolTip("Restore Down" if maximized else "Maximize")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -231,12 +348,15 @@ class TitleBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
-ROI_TOOLS: tuple[tuple[str, str, str], ...] = (
-    ("select", "fa6s.arrow-pointer", "Select / edit ROI"),
-    ("rect", "fa6s.vector-square", "Box ROI"),
-    ("ellipse", "fa6s.circle", "Ellipse ROI"),
-    ("line", "fa6s.grip-lines", "Line ROI"),
-    ("cursor", "fa6s.crosshairs", "Spot ROI (click to pin)"),
+# tool, icon, icon size, tooltip. The shape tools share one outline family
+# (Phosphor bold, whose glyphs need 20px to match the Font Awesome weight), so
+# the ellipse no longer reads as a filled dot and the line as an "=" grip.
+ROI_TOOLS: tuple[tuple[str, str, int, str], ...] = (
+    ("select", "fa6s.arrow-pointer", 17, "Select / edit ROI (drag to move, corners to resize)"),
+    ("rect", "ph.square-bold", 20, "Box ROI (drag on the image)"),
+    ("ellipse", "ph.circle-bold", 20, "Ellipse ROI (drag on the image)"),
+    ("line", "ph.line-segment-bold", 20, "Line ROI (drag on the image)"),
+    ("cursor", "fa6s.crosshairs", 17, "Spot ROI (click to pin)"),
 )
 
 _HANDLE_HIT_PX = 9
@@ -263,11 +383,11 @@ class AnalysisToolbar(QFrame):
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         self._buttons: dict[str, QToolButton] = {}
-        for tool, icon_name, tooltip in ROI_TOOLS:
+        for tool, icon_name, icon_size, tooltip in ROI_TOOLS:
             button = QToolButton()
             button.setObjectName("AnalysisButton")
             button.setIcon(awesome_icon(icon_name, ICON_TEXT))
-            button.setIconSize(QSize(17, 17))
+            button.setIconSize(QSize(icon_size, icon_size))
             button.setToolTip(tooltip)
             button.setCheckable(True)
             button.clicked.connect(lambda checked=False, t=tool: self.tool_changed.emit(t))
@@ -495,10 +615,33 @@ class ThermalCanvas(QWidget):
         self._deselect_pending = False
         self._minimap_rect = QRect()
         self._minimap_drag = False
+        self.readout_rect = QRect()  # where the cursor readout was last painted
+        self._notice = ""
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(self.clear_notice)
 
     @property
     def image(self) -> QImage:
         return self._image
+
+    def show_notice(self, text: str, timeout_ms: int | None = None) -> None:
+        """Brief confirmation (e.g. "Saved …") shown at the bottom of the view,
+        long enough to read it (longer messages stay longer)."""
+        self._notice = " ".join(str(text).split())  # one line
+        if timeout_ms is None:
+            timeout_ms = min(10_000, 3000 + 40 * len(self._notice))
+        self._notice_timer.start(timeout_ms)
+        self.update()
+
+    def clear_notice(self) -> None:
+        self._notice = ""
+        self._notice_timer.stop()
+        self.update()
+
+    @property
+    def notice(self) -> str:
+        return self._notice
 
     def set_message(self, message: str) -> None:
         self._message = message
@@ -654,10 +797,11 @@ class ThermalCanvas(QWidget):
         self.update()
 
     def set_roi_tool(self, tool: str) -> None:
+        # The cursor readout stays live in every tool: while placing an ROI is
+        # exactly when the position and value under the pointer matter.
         self._roi_tool = tool
         self._draft = None
         self._restore_tool_cursor()
-        self._refresh_probe()  # the probe only exists for the select tool
         self.update()
 
     def _restore_tool_cursor(self) -> None:
@@ -771,20 +915,25 @@ class ThermalCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#06080B"))
         if self._pixmap.isNull():
             self._paint_empty_state(painter)
+            self._paint_notice(painter)
             return
 
         self._image_rect = self._rect_for(self._current_zoom(), self._pan)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawPixmap(self._image_target(), self._pixmap, QRectF(self._pixmap.rect()))
 
+        # The ring marks the probed pixel for the select tool; drawing tools
+        # already show a crosshair pointer there.
         if self._probe is not None and self._raw is not None and self._roi_tool == "select":
-            self._paint_probe(painter)
+            self._paint_probe_ring(painter)
         self._paint_rois(painter)
         if self._show_markers:
             self._paint_markers(painter)
         if self._zoom is not None:
             self._paint_minimap(painter)
             self._paint_zoom_indicator(painter)
+        self._paint_readout(painter)
+        self._paint_notice(painter)
 
     def _paint_minimap(self, painter: QPainter) -> None:
         """Overview thumbnail with the current viewport rectangle (§4.8.4)."""
@@ -858,8 +1007,8 @@ class ThermalCanvas(QWidget):
         path = QPainterPath()
         path.addRoundedRect(QRectF(text_rect), 5, 5)
         painter.fillPath(path, QColor(9, 13, 15, 200))
-        painter.setPen(QPen(QColor("#242D3A"), 1))
-        painter.drawPath(path)
+        # strokePath: an outline never picks up a brush left set by earlier painting
+        painter.strokePath(path, QPen(QColor("#242D3A"), 1))
         painter.setPen(QColor("#C7CED8"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
 
@@ -912,8 +1061,8 @@ class ThermalCanvas(QWidget):
             self.EMPTY_HINT,
         )
 
-    def _paint_probe(self, painter: QPainter) -> None:
-        px, py, value = self._probe
+    def _paint_probe_ring(self, painter: QPainter) -> None:
+        px, py, _value = self._probe
         centre = self._image_to_widget(px + 0.5, py + 0.5)  # flip-aware pixel centre
         screen_x, screen_y = int(centre.x()), int(centre.y())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -921,18 +1070,150 @@ class ThermalCanvas(QWidget):
         painter.drawEllipse(QPoint(screen_x, screen_y), 7, 7)
         painter.setPen(QPen(QColor(ICON_ACCENT), 2))
         painter.drawEllipse(QPoint(screen_x, screen_y), 7, 7)
-        text = f"x {px}  y {py}  ·  {format_value(value, self._suffix)}"
+
+    def _readout_entries(self) -> list[tuple[str, str]]:
+        """The readout badge rows as (ROI name, details): the pixel under the
+        pointer, then the geometry of the ROI being drawn or edited (or the
+        hovered / selected one while the pointer is over the view)."""
+        entries = []
+        if self._probe is not None:
+            px, py, value = self._probe
+            entries.append(("", f"x {px}  y {py}  ·  {format_value(value, self._suffix)}"))
+        shape = self._readout_shape()
+        if shape is not None:
+            details = self._roi_geometry_details(shape[1], shape[2])
+            if details:
+                entries.append((shape[0], details))
+        return entries
+
+    def readout_lines(self) -> list[str]:
+        return [f"{name}  {details}" if name else details
+                for name, details in self._readout_entries()]
+
+    def _readout_shape(self) -> tuple[str, str, tuple] | None:
+        """(name, kind, points) of the ROI the readout describes, if any."""
+        if self._raw is None:
+            return None
+        if self._draft is not None:
+            kind, anchor, current = self._draft
+            if kind == "cursor":
+                return None  # a spot being placed is the probed pixel itself
+            return (ROI_KIND_LABELS.get(kind, kind), kind, (anchor, current))
+        if self._drag is not None and self._drag_shape is not None:
+            shape = self._drag_shape
+            return (shape.name, shape.kind, shape.points)
+        if self._hover_pos is None:
+            return None
+        roi_id = self._selected_roi
+        if self._roi_tool == "select":
+            hit = self._hit_roi(self._hover_pos)
+            if hit is not None:
+                roi_id = hit[0]  # the ROI a press would grab
+        shape = next((s for s in self._rois if s.id == roi_id), None)
+        if shape is not None:
+            return (shape.name, shape.kind, shape.points)
+        return None
+
+    def roi_geometry_text(self, name: str, kind: str, points) -> str:
+        details = self._roi_geometry_details(kind, points)
+        return f"{name}  {details}" if details else ""
+
+    def _roi_geometry_details(self, kind: str, points) -> str:
+        """Integer pixel geometry of an ROI, as its statistics measure it:
+        the x / y ranges are the pixels it covers (geometry.area_extent)."""
+        height, width = self._raw.shape[0], self._raw.shape[1]
+        if kind == "cursor" and len(points) == 1:
+            x, y = pixel_index(kind, *points[0], width, height)
+            return f"x {x}  y {y}  ·  {format_value(float(self._raw[y, x]), self._suffix)}"
+        if len(points) != 2:
+            return ""
+        (x0, y0), (x1, y1) = (pixel_index(kind, x, y, width, height) for x, y in points)
+        if kind == "line":
+            dx, dy = x1 - x0, y1 - y0
+            angle = math.degrees(math.atan2(-dy, dx)) if (dx or dy) else 0.0  # y points down
+            return f"({x0}, {y0}) → ({x1}, {y1})  ·  {math.hypot(dx, dy):.1f} px  ·  {angle:.1f}°"
+        # A box covers its whole pixel-rounded outline; an ellipse's size is
+        # its diameter (Ø), and it covers fewer pixels than its outline box.
+        size = f"{abs(x1 - x0)} × {abs(y1 - y0)} px"
+        if kind == "ellipse":
+            size = "Ø " + size
+        extent = area_extent(kind, points, height, width)
+        if extent is None:
+            return f"{size}  ·  no pixels"
+        x_min, x_max, y_min, y_max, count = extent
+        ranges = f"x {x_min}–{x_max}  y {y_min}–{y_max}  ·  {size}"
+        return ranges if kind == "rect" else f"{ranges}  ·  {count} pixels"
+
+    def _paint_readout(self, painter: QPainter) -> None:
+        entries = self._readout_entries()
+        if not entries:
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setFont(QFont("Consolas", 10))
         metrics = painter.fontMetrics()
-        text_rect = metrics.boundingRect(text).adjusted(-10, -6, 10, 6)
-        text_rect.moveTopLeft(QPoint(self._image_rect.left() + 14, self._image_rect.top() + 14))
+        # Top-left of the part of the image on screen (it may be zoomed or
+        # panned past the widget edge); it moves to the bottom-left while
+        # the pointer is under it, so it never hides the pixel being read.
+        visible = self._image_rect.intersected(self.rect())
+        if visible.isEmpty():
+            visible = self.rect()
+        room = max(40, self.width() - (visible.left() + 14) - 14 - 20)
+        lines = [self._fit_readout_line(metrics, name, details, room) for name, details in entries]
+        line_height = metrics.height() + 2
+        width = max(metrics.horizontalAdvance(line) for line in lines)
+        box = QRect(0, 0, width + 20, line_height * len(lines) + 10)
+        box.moveTopLeft(QPoint(visible.left() + 14, visible.top() + 14))
+        if self._hover_pos is not None and box.adjusted(-16, -16, 16, 16).contains(
+                self._hover_pos.toPoint()):
+            box.moveBottomLeft(QPoint(visible.left() + 14, visible.bottom() - 14))
+        self.readout_rect = QRect(box)
         path = QPainterPath()
-        path.addRoundedRect(QRectF(text_rect), 6, 6)
+        path.addRoundedRect(QRectF(box), 6, 6)
         painter.fillPath(path, QColor(9, 13, 15, 225))
-        painter.setPen(QPen(QColor("#242D3A"), 1))
-        painter.drawPath(path)
-        painter.setPen(QColor("#F4F6F7"))
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+        # not drawPath: a selected ROI's handles leave its colour as the brush
+        painter.strokePath(path, QPen(QColor("#242D3A"), 1))
+        for row, line in enumerate(lines):
+            painter.setPen(QColor("#F4F6F7") if row == 0 and self._probe is not None
+                           else QColor("#C7CED8"))
+            painter.drawText(QRect(box.left() + 10, box.top() + 5 + row * line_height,
+                                   width + 2, line_height),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, line)
+
+    @staticmethod
+    def _fit_readout_line(metrics, name: str, details: str, room: int) -> str:
+        """One badge row within ``room`` pixels: a long ROI name is elided
+        first so the measurements stay readable, then the row itself."""
+        text = f"{name}  {details}" if name else details
+        if name and metrics.horizontalAdvance(text) > room:
+            name_room = room - metrics.horizontalAdvance(f"  {details}")
+            name = metrics.elidedText(name, Qt.TextElideMode.ElideRight, max(0, name_room))
+            text = f"{name}  {details}" if name else details
+        if metrics.horizontalAdvance(text) > room:
+            text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, room)
+        return text
+
+    def _paint_notice(self, painter: QPainter) -> None:
+        if not self._notice:
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = QFont("Segoe UI", 10)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(self._notice, Qt.TextElideMode.ElideMiddle,
+                                  max(80, self.width() - 80))
+        box = QRect(0, 0, metrics.horizontalAdvance(text) + 36, metrics.height() + 16)
+        box.moveCenter(QPoint(self.width() // 2, 0))
+        box.moveBottom(self.height() - 20)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(box), 8, 8)
+        painter.fillPath(path, QColor(24, 32, 41, 240))
+        painter.strokePath(path, QPen(QColor("#333E4D"), 1))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(ICON_ACCENT))
+        painter.drawEllipse(QPointF(box.left() + 14, box.center().y() + 0.5), 3, 3)
+        painter.setPen(QColor("#E9EDF2"))
+        painter.drawText(box.adjusted(24, 0, -10, 0),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
 
     def _paint_rois(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -945,9 +1226,11 @@ class ThermalCanvas(QWidget):
         if self._draft is not None:
             kind, anchor, current = self._draft
             preview = ("cursor", (current,)) if kind == "cursor" else (kind, (anchor, current))
-            pen = QPen(QColor(ICON_ACCENT), 1, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
+            # dark underlay: a bare 1px amber dash vanishes on hot (bright) imagery
+            painter.setPen(QPen(QColor("#07090A"), 3))
+            self._draw_roi_geometry(painter, preview[0], preview[1])
+            painter.setPen(QPen(QColor(ICON_ACCENT), 1.5, Qt.PenStyle.DashLine))
             self._draw_roi_geometry(painter, preview[0], preview[1])
 
     def _paint_roi_shape(self, painter: QPainter, shape, color: QColor, selected: bool) -> None:
@@ -966,6 +1249,7 @@ class ThermalCanvas(QWidget):
                 painter.drawRect(
                     int(handle_pos.x()) - 4, int(handle_pos.y()) - 4, 8, 8
                 )
+            painter.setBrush(Qt.BrushStyle.NoBrush)  # the handle fill must not leak
 
     def _draw_roi_geometry(self, painter: QPainter, kind: str, points) -> None:
         if kind == "cursor" and len(points) == 1:
@@ -1002,8 +1286,7 @@ class ThermalCanvas(QWidget):
         path = QPainterPath()
         path.addRoundedRect(QRectF(text_rect), 4, 4)
         painter.fillPath(path, QColor(9, 13, 15, 200))
-        painter.setPen(QPen(color, 1))
-        painter.drawPath(path)
+        painter.strokePath(path, QPen(color, 1))
         painter.setPen(QColor("#F4F6F7"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, shape.name)
 
@@ -1151,25 +1434,52 @@ class ThermalCanvas(QWidget):
         if self._draft is not None:
             kind, anchor, _ = self._draft
             self._draft = (kind, anchor, self._draft_point(kind, wpos))
-            self.update()
-            return
-        if self._drag is not None and self._drag_shape is not None:
+        elif self._drag is not None and self._drag_shape is not None:
             self._drag_shape = self._dragged_shape(self._widget_to_image(wpos))
-            self.update()
-            return
-        if self._roi_tool != "select":
-            return
+        else:
+            self._update_hover_cursor(wpos)
+        self._track_pointer(wpos)
+        self.update()
+
+    def _track_pointer(self, wpos) -> None:
+        """Keep the cursor readout on the pixel under the pointer, in any tool."""
         if self._raw is None or not self._image_rect.contains(wpos.toPoint()):
             self._hover_pos = None
             if self._probe is not None:
                 self._probe = None
                 self.probe_changed.emit(None)
-                self.update()
             return
         self._hover_pos = QPointF(wpos)
         self._probe = self._probe_at(wpos)
         self.probe_changed.emit(self._probe)
-        self.update()
+
+    _HOVER_CURSORS = {
+        "body": Qt.CursorShape.SizeAllCursor,
+        "nw": Qt.CursorShape.SizeFDiagCursor,
+        "se": Qt.CursorShape.SizeFDiagCursor,
+        "ne": Qt.CursorShape.SizeBDiagCursor,
+        "sw": Qt.CursorShape.SizeBDiagCursor,
+        "p0": Qt.CursorShape.CrossCursor,
+        "p1": Qt.CursorShape.CrossCursor,
+    }
+
+    def _update_hover_cursor(self, wpos) -> None:
+        """Say what a press would do: move/resize an ROI, pan, or jump the minimap."""
+        if self._raw is None:
+            return
+        if self._zoom is not None and self._minimap_rect.contains(wpos.toPoint()):
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        if self._roi_tool != "select":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        hit = self._hit_roi(wpos)
+        if hit is not None:
+            self.setCursor(self._HOVER_CURSORS.get(hit[1], Qt.CursorShape.SizeAllCursor))
+        elif self._zoom is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)  # a drag pans
+        else:
+            self.unsetCursor()
 
     def _probe_at(self, wpos) -> tuple[int, int, float]:
         xi, yi = self._pixel_at(wpos)
@@ -1184,8 +1494,7 @@ class ThermalCanvas(QWidget):
         previous = self._probe
         self._probe = None
         pos = self._hover_pos
-        if (pos is not None and self._raw is not None and not self._pixmap.isNull()
-                and self._roi_tool == "select"):
+        if pos is not None and self._raw is not None and not self._pixmap.isNull():
             self._image_rect = self._rect_for(self._current_zoom(), self._pan)
             if self._image_rect.contains(pos.toPoint()):
                 self._probe = self._probe_at(pos)
@@ -1292,7 +1601,30 @@ class ThermalCanvas(QWidget):
             dy = max(margin - y, min(dy, max_y - y))
         return (dx, dy)
 
+    def _gesture_active(self) -> bool:
+        return self._draft is not None or self._drag is not None
+
+    def event(self, event) -> bool:
+        # Esc is the window's "leave full screen" shortcut; while an ROI is
+        # being drawn or edited it cancels that gesture instead.
+        if (event.type() == QEvent.Type.ShortcutOverride
+                and event.key() == Qt.Key.Key_Escape and self._gesture_active()):
+            event.accept()
+            return True
+        return super().event(event)
+
+    def cancel_gesture(self) -> None:
+        """Drop the ROI being drawn, or put back the one being moved/resized."""
+        self._draft = None
+        self._drag = None
+        self._drag_shape = None
+        self.update()
+
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._gesture_active():
+            self.cancel_gesture()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Delete and self._selected_roi is not None:
             self.roi_delete_requested.emit(self._selected_roi)
             event.accept()
@@ -1711,6 +2043,8 @@ class InspectorPanel(QWidget):
     reference_cleared = Signal()
     filters_changed = Signal(dict)
 
+    GROUP_GAP = 12  # extra space above each control group (Unit, Color Map, …)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("Inspector")
@@ -1720,7 +2054,8 @@ class InspectorPanel(QWidget):
         self._busy = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # the scroll bar stays clear of the window's right resize edge
+        layout.setContentsMargins(0, 0, WINDOW_EDGE_RESERVE, 0)
         layout.setSpacing(0)
 
         scroll = QScrollArea()
@@ -1826,7 +2161,9 @@ class InspectorPanel(QWidget):
         self.range_panel.setEnabled(False)
         layout.addWidget(self.range_panel)
 
-        layout.addSpacing(8)
+        # Every control group below starts one GROUP_GAP after the previous
+        # group, as Unit, Color Map and Range Mode do above.
+        layout.addSpacing(self.GROUP_GAP)
 
         layout.addWidget(self._field_label("Enhancement"))
         self.enhancement_combo = ChevronComboBox()
@@ -1856,6 +2193,7 @@ class InspectorPanel(QWidget):
         layout.addWidget(self.pe_row)
         self.pe_row.setVisible(False)
 
+        layout.addSpacing(self.GROUP_GAP)
         layout.addWidget(self._field_label("Segmentation"))
         self.segmentation_check = QCheckBox("Enable")
         self.segmentation_check.setToolTip(
@@ -1875,6 +2213,7 @@ class InspectorPanel(QWidget):
         self.seg_max_spin.editingFinished.connect(self._segmentation_changed)
         layout.addLayout(seg_row)
 
+        layout.addSpacing(self.GROUP_GAP)
         layout.addWidget(self._field_label("Isotherm"))
         self.isotherm_combo = ChevronComboBox()
         for label, mode in (
@@ -1903,6 +2242,7 @@ class InspectorPanel(QWidget):
         self.iso_limit2_spin.setVisible(False)
         layout.addLayout(iso_row)
 
+        layout.addSpacing(self.GROUP_GAP)
         layout.addWidget(self._field_label("Overlays"))
         overlay_row = QHBoxLayout()
         overlay_row.setSpacing(12)
@@ -1918,6 +2258,7 @@ class InspectorPanel(QWidget):
         self.markers_check.toggled.connect(self._overlays_changed)
         layout.addLayout(overlay_row)
 
+        layout.addSpacing(self.GROUP_GAP)
         layout.addWidget(self._field_label("Image"))
         flip_row = QHBoxLayout()
         flip_row.setSpacing(8)
@@ -1941,6 +2282,8 @@ class InspectorPanel(QWidget):
         layout.addLayout(flip_row)
 
         self.corrections_heading = self._field_label("Corrections")
+        # a margin, not a spacer: the gap must vanish with the hidden heading
+        self.corrections_heading.setContentsMargins(0, self.GROUP_GAP, 0, 0)
         layout.addWidget(self.corrections_heading)
         self.corrections_row = QWidget()
         corrections_layout = QHBoxLayout(self.corrections_row)
@@ -2254,12 +2597,13 @@ class InspectorPanel(QWidget):
 
     @staticmethod
     def _compact_spin() -> QDoubleSpinBox:
+        # Fills its half of the row, like the Fixed Range fields; a capped
+        # width left it floating in the middle of the column, off the grid.
         spin = QDoubleSpinBox()
         spin.setRange(-1.0e12, 1.0e12)
         spin.setDecimals(2)
         spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         spin.setMinimumWidth(72)
-        spin.setMaximumWidth(88)
         spin.setProperty("compact", True)
         return spin
 
@@ -2589,6 +2933,195 @@ class FramelessDialog(QDialog):
         self.body.addLayout(row)
 
 
+class MessageDialog(FramelessDialog):
+    """Themed message box: QMessageBox keeps a native title bar, which is
+    light whenever Windows is in light mode.
+
+    Use the QMessageBox-like helpers: ``critical`` / ``warning`` /
+    ``information`` show a message; ``question`` asks and returns True for Yes
+    (No is the default button, so Enter never confirms by accident).
+    """
+
+    _KINDS = {
+        "critical": ("fa6s.circle-xmark", "#E5484D"),
+        "warning": ("fa6s.triangle-exclamation", ICON_ACCENT),
+        "information": ("fa6s.circle-info", "#4CC2FF"),
+        "question": ("fa6s.circle-question", ICON_ACCENT),
+    }
+
+    def __init__(self, kind: str, title: str, text: str, parent=None) -> None:
+        super().__init__(title, parent)
+        self.kind = kind
+        # never narrower than the (already width-capped) text needs, even on
+        # screens where Qt would cap an auto-sized window at 2/3 of their width
+        self.body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        row.setContentsMargins(0, 6, 0, 6)
+        icon_name, color = self._KINDS[kind]
+        icon = QLabel()
+        icon.setPixmap(awesome_icon(icon_name, color).pixmap(26, 26))
+        row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+        row.addWidget(self._text_view(text), 1)
+        self.body.addLayout(row)
+
+        question = kind == "question"
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No
+            if question else QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.body.addWidget(buttons)
+        default = buttons.button(QDialogButtonBox.StandardButton.No if question
+                                 else QDialogButtonBox.StandardButton.Ok)
+        if not question:
+            default.setProperty("accent", True)
+        default.setDefault(True)
+        default.setFocus()
+
+    TEXT_WIDTH = (300, 520)  # min / max width of the message text
+    TEXT_MAX_HEIGHT = 360  # longer messages scroll
+
+    def _text_view(self, text: str) -> QTextEdit:
+        """Selectable, copyable message text that wraps anywhere.
+
+        A QLabel wraps only at spaces, so an error naming a long path would be
+        cut off; a read-only text view wraps inside the path instead, and a
+        copied path stays exactly as written.
+        """
+        view = QTextEdit()
+        view.setObjectName("MessageText")
+        view.setReadOnly(True)
+        view.setFrameShape(QFrame.Shape.NoFrame)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        view.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                     | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        view.ensurePolished()  # lay out in the stylesheet font
+        view.setPlainText(text)
+        document = view.document()
+        document.setDocumentMargin(0)
+        # the unwrapped layout's width, in the font the document really uses
+        view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        widest = math.ceil(document.idealWidth())
+        low, high = self.TEXT_WIDTH
+        width = max(low, min(high, widest + 4))
+        # A fixed wrap width: wrapping to the viewport would re-wrap once
+        # shown (e.g. narrower by a scroll bar) and outgrow the height below.
+        view.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
+        view.setLineWrapColumnOrWidth(width)
+        height = math.ceil(document.size().height()) + 2
+        if height > self.TEXT_MAX_HEIGHT:  # scroll: the scroll bar goes beside the text
+            gutter = view.verticalScrollBar().sizeHint().width() + 4
+            wrap = min(width, high - gutter)
+            view.setLineWrapColumnOrWidth(wrap)
+            width, height = wrap + gutter, self.TEXT_MAX_HEIGHT
+        else:
+            view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view.setFixedSize(width, height)
+        self.text_view = view
+        return view
+
+    def text(self) -> str:
+        return self.text_view.toPlainText()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self.kind in ("critical", "warning"):
+            # as QMessageBox does: screen readers announce it, Windows plays its alert sound
+            QAccessible.updateAccessibility(QAccessibleEvent(self, QAccessible.Event.Alert))
+
+    @classmethod
+    def critical(cls, parent, title: str, text: str) -> None:
+        cls("critical", title, text, parent).exec()
+
+    @classmethod
+    def warning(cls, parent, title: str, text: str) -> None:
+        cls("warning", title, text, parent).exec()
+
+    @classmethod
+    def information(cls, parent, title: str, text: str) -> None:
+        cls("information", title, text, parent).exec()
+
+    @classmethod
+    def question(cls, parent, title: str, text: str) -> bool:
+        return cls("question", title, text, parent).exec() == QDialog.DialogCode.Accepted
+
+
+class ProgressDialog(FramelessDialog):
+    """Themed, window-modal progress for long jobs (exports, extraction).
+
+    Stands in for QProgressDialog (native title bar) with the subset of its
+    API the player uses. Cancel, Esc and the title bar's close button all
+    request cancellation; the dialog then says so and stays up until the job
+    reports that it has stopped, and the owner calls ``reset``.
+    """
+
+    canceled = Signal()
+
+    def __init__(self, title: str, label: str, parent=None) -> None:
+        super().__init__(title, parent)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setMinimumWidth(400)
+        self._canceled = False
+        self.label = QLabel(label)
+        self.label.setWordWrap(True)
+        self.body.addWidget(self.label)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self.body.addWidget(self.bar)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel)
+        row.addWidget(self.cancel_button)
+        self.body.addLayout(row)
+        self.show()
+
+    def setMaximum(self, maximum: int) -> None:  # noqa: N802 (QProgressDialog API)
+        self.bar.setMaximum(int(maximum))
+
+    def maximum(self) -> int:
+        return self.bar.maximum()
+
+    def setValue(self, value: int) -> None:  # noqa: N802
+        self.bar.setValue(int(value))
+
+    def value(self) -> int:
+        return self.bar.value()
+
+    def setLabelText(self, text: str) -> None:  # noqa: N802
+        self.label.setText(text)
+
+    def wasCanceled(self) -> bool:  # noqa: N802
+        return self._canceled
+
+    def cancel(self) -> None:
+        if self._canceled:
+            return
+        self._canceled = True
+        self.cancel_button.setEnabled(False)
+        self.label.setText("Cancelling…")
+        self.canceled.emit()
+
+    def reject(self) -> None:
+        self.cancel()  # Esc / close: cancel the job; the owner closes the dialog
+
+    def closeEvent(self, event) -> None:
+        self.cancel()
+        if event.spontaneous():
+            event.ignore()  # the user's Alt+F4: stay up, saying "Cancelling…"
+            return
+        # Qt closing every window (application quit, session end): refusing
+        # here would abort the quit before the owner's own shutdown handling.
+        # Accept directly: QDialog.closeEvent closes via reject(), which stays up.
+        event.accept()
+
+    def reset(self) -> None:
+        self.hide()
+
+
 class MetadataPickerDialog(FramelessDialog):
     """Checkbox list selecting which frame metadata entries are displayed."""
 
@@ -2913,9 +3446,7 @@ class ReferenceDialog(FramelessDialog):
         file_row.setSpacing(8)
         self.path_edit = QLineEdit(str(metadata.path))
         file_row.addWidget(self.path_edit, 1)
-        browse = QToolButton()
-        browse.setText("…")
-        browse.setToolTip("Choose a recording")
+        browse = browse_button("Choose a recording")
         browse.clicked.connect(self._browse)
         file_row.addWidget(browse)
         layout.addLayout(file_row)
@@ -3108,8 +3639,14 @@ class TimelineSlider(QSlider):
     range_changed = Signal(int, int)
 
     _HANDLE_RADIUS = 8
+    _HANDLE_HOVER_RADIUS = 9
     _GROOVE_HEIGHT = 6
+    _MARKER_HEIGHT = 8  # play-range triangles stand this far above the groove
     _MARKER_HIT_PX = 7
+    # Everything painted must fit: the hovered handle, and the markers plus
+    # their 1px outline above the groove (the stylesheet's handle metrics
+    # would size the widget to 15px and clip the top of the handle).
+    _HEIGHT = 2 * max(_HANDLE_HOVER_RADIUS + 1, _GROOVE_HEIGHT // 2 + _MARKER_HEIGHT + 2)
 
     def __init__(self, orientation, parent=None) -> None:
         super().__init__(orientation, parent)
@@ -3118,6 +3655,15 @@ class TimelineSlider(QSlider):
         self._dragging_marker: str | None = None
         self._jump_drag = False
         self._jump_offset = 0.0  # pointer-to-handle distance while dragging the handle
+        self._hover_x: float | None = None
+        self.hover_text = None  # optional callable: value -> tooltip text
+        self.setMouseTracking(True)
+
+    def sizeHint(self) -> QSize:
+        return QSize(super().sizeHint().width(), self._HEIGHT)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(super().minimumSizeHint().width(), self._HEIGHT)
 
     # --- play-range state ---------------------------------------------------
 
@@ -3188,7 +3734,7 @@ class TimelineSlider(QSlider):
             x1 = self._value_to_x(play_range[1])
             band = QRectF(
                 x0,
-                groove.center().y() - 5.0,
+                groove.top() + groove.height() / 2.0 - 5.0,
                 max(2.0, x1 - x0),
                 10.0,
             )
@@ -3205,18 +3751,26 @@ class TimelineSlider(QSlider):
             for value in play_range:
                 self._paint_marker(painter, self._value_to_x(value), groove, enabled)
 
-        handle_color = QColor("#F5A524") if enabled else QColor("#5F6B7A")
+        hot = enabled and (self.isSliderDown() or self._over_handle())
+        if not enabled:
+            handle_color = QColor("#5F6B7A")
+        elif self.isSliderDown():
+            handle_color = QColor("#D98E0F")
+        else:
+            handle_color = QColor("#FFB93E" if hot else "#F5A524")
+        radius = self._HANDLE_HOVER_RADIUS if hot else self._HANDLE_RADIUS
         painter.setBrush(handle_color)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(
-            QPointF(handle_x, groove.center().y()),
-            self._HANDLE_RADIUS,
-            self._HANDLE_RADIUS,
-        )
+        painter.drawEllipse(QPointF(handle_x, groove.top() + groove.height() / 2.0), radius, radius)
         painter.end()
 
+    def _over_handle(self) -> bool:
+        if self._hover_x is None:
+            return False
+        return abs(self._hover_x - self._value_to_x(self.value())) <= self._HANDLE_RADIUS + 2
+
     def _paint_marker(self, painter: QPainter, x: float, groove: QRect, enabled: bool) -> None:
-        top = groove.top() - 8
+        top = groove.top() - self._MARKER_HEIGHT
         marker = QPainterPath()
         marker.moveTo(QPointF(x, groove.top() - 1))
         marker.lineTo(QPointF(x - 5, top))
@@ -3273,7 +3827,33 @@ class TimelineSlider(QSlider):
             self.setSliderPosition(self._x_to_value(event.position().x() - self._jump_offset))
             event.accept()
             return
+        if event.buttons() == Qt.MouseButton.NoButton:
+            self._hover(event.position())
+            return
         super().mouseMoveEvent(event)
+
+    def _hover(self, pos: QPointF) -> None:
+        """Hover feedback: lit handle, resize cursor on markers, frame tooltip."""
+        was_hot = self._over_handle()
+        self._hover_x = pos.x()
+        if was_hot != self._over_handle():
+            self.update()
+        if not self.isEnabled():
+            return
+        if self._marker_at(pos.x()) is not None:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.unsetCursor()
+        if self.hover_text is not None:
+            QToolTip.showText(self.mapToGlobal(QPoint(int(pos.x()), 0)),
+                              self.hover_text(self._x_to_value(pos.x())), self)
+
+    def leaveEvent(self, event) -> None:
+        self._hover_x = None
+        self.unsetCursor()
+        QToolTip.hideText()
+        self.update()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._dragging_marker is not None:
@@ -3286,6 +3866,7 @@ class TimelineSlider(QSlider):
             self._jump_drag = False
             self.setSliderPosition(self._x_to_value(event.position().x() - self._jump_offset))
             self.setSliderDown(False)  # sliderReleased → the transport seeks
+            self.update()  # back from the pressed handle colour
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -3359,10 +3940,12 @@ class TransportBar(QWidget):
         badge_layout.setContentsMargins(16, 0, 16, 0)
         self.frame_label = QLabel("Frame — / —")
         self.frame_label.setObjectName("FrameLabel")
+        self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         badge_layout.addWidget(self.frame_label)
         badge.setMinimumHeight(40)
         badge.setMinimumWidth(146)
         layout.addWidget(badge)
+        self._badge = badge
 
         self.speed_combo = ChevronComboBox()
         self.speed_combo.setMinimumWidth(92)
@@ -3457,7 +4040,20 @@ class TransportBar(QWidget):
 
         self.total_time.setText(format_time(duration))
         self.frame_label.setText(f"Frame 1 / {num_frames}")
+        # Reserve the widest readouts this recording can show, so the
+        # timeline does not shift each time a digit is added during playback.
+        self.current_time.setMinimumWidth(max(78, self._text_width(self.current_time,
+                                                                   format_time(duration))))
+        self.total_time.setMinimumWidth(max(78, self._text_width(self.total_time,
+                                                                 format_time(duration))))
+        widest = f"Frame {num_frames} / {num_frames}"
+        self._badge.setMinimumWidth(max(146, self._text_width(self.frame_label, widest) + 32))
         self.set_enabled(True)
+
+    @staticmethod
+    def _text_width(label: QLabel, text: str) -> int:
+        label.ensurePolished()  # the stylesheet font (tabular Consolas), not the default
+        return label.fontMetrics().horizontalAdvance(text) + 2
 
     def set_frame(self, index: int, num_frames: int, seconds: float) -> None:
         from .render import format_time

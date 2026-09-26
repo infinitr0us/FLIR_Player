@@ -19,8 +19,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
     QMenu,
-    QMessageBox,
-    QProgressDialog,
     QVBoxLayout,
     QWidget,
 )
@@ -49,7 +47,14 @@ from .excel_export import RoiSet, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
 from .geometry import roi_coordinates
 from .settings import app_settings
-from .models import FramePacket, RoiShape, UnitOption, VideoMetadata, StatisticsSnapshot
+from .models import (
+    ROI_KIND_LABELS,
+    FramePacket,
+    RoiShape,
+    StatisticsSnapshot,
+    UnitOption,
+    VideoMetadata,
+)
 from .plots import line_profile_values, roi_values
 from .processing import median_max_size
 from .render import (
@@ -68,8 +73,11 @@ from .widgets import (
     AnalysisToolbar,
     BottomPanel,
     ColorScaleWidget,
+    EdgeResizeGrip,
     InspectorPanel,
+    MessageDialog,
     PaletteEditorDialog,
+    ProgressDialog,
     ReferenceDialog,
     ThermalCanvas,
     TitleBar,
@@ -88,7 +96,6 @@ SUPPORTED_EXTENSIONS = {
     ".tiff",
 }
 
-ROI_KIND_LABELS = {"rect": "Box", "ellipse": "Ellipse", "line": "Line", "cursor": "Spot"}
 _CLOSING_WINDOWS = set()  # Retain Python owners until their SDK threads finish.
 
 RECENT_FILES_LIMIT = 8
@@ -143,8 +150,8 @@ class MainWindow(QMainWindow):
         self._roi_next_id = 1
         self._roi_name_counts: dict[str, int] = {}
         self._selected_roi_id: int | None = None
-        self._extract_progress: QProgressDialog | None = None
-        self._export_progress: QProgressDialog | None = None
+        self._extract_progress: ProgressDialog | None = None
+        self._export_progress: ProgressDialog | None = None
         self.show_clipping = True
         self.show_markers = False
         self.flip_h = False
@@ -205,6 +212,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_ui()
         self._install_shortcuts()
+        # Start with the image focused, not the first button in tab order (the
+        # Open button would sit in its amber focus ring from launch on).
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
         self.transport.set_loop(self.loop_playback)
         self.transport.set_constant_rate(self.constant_rate)
 
@@ -267,6 +277,13 @@ class MainWindow(QMainWindow):
 
         self.transport = TransportBar()
         root_layout.addWidget(self.transport)
+        self.transport.slider.hover_text = self._timeline_hover_text
+
+        # The frameless window has no native border to resize from.
+        self._resize_grips = [
+            EdgeResizeGrip(self, edges)
+            for edges in EdgeResizeGrip.ALL_EDGES
+        ]
 
         export_menu = QMenu(self)
         display_action = export_menu.addAction("Rendered frame (PNG)")
@@ -614,6 +631,13 @@ class MainWindow(QMainWindow):
         if self.metadata is not None:
             self.seek_to(self.metadata.num_frames - 1)
 
+    def _timeline_hover_text(self, index: int) -> str:
+        if self.metadata is None:
+            return ""
+        # the same nominal-rate time the scrub preview shows while dragging
+        seconds = self.metadata.fallback_seconds_for_frame(index)
+        return f"Frame {index + 1}  ·  {format_time(seconds)}"
+
     def _preview_scrub(self, index: int) -> None:
         if self.metadata is None:
             return
@@ -898,14 +922,12 @@ class MainWindow(QMainWindow):
         if dialog.exec() == ExtractDialog.DialogCode.Accepted:
             self._start_extract(dialog.parameters())
 
+    def _progress_dialog(self, title: str, label: str) -> ProgressDialog:
+        return ProgressDialog(title, label, self)
+
     def _start_extract(self, params: dict) -> None:
-        self._extract_progress = QProgressDialog(
-            "Extracting clip…", "Cancel", 0, 1, self
-        )
-        self._extract_progress.setWindowTitle("Extract Clip")
-        self._extract_progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._extract_progress.setMinimumDuration(0)
-        self._extract_progress.setValue(0)
+        self._extract_dest = Path(params["dest"]).name
+        self._extract_progress = self._progress_dialog("Extract Clip", "Extracting clip…")
         self._extract_progress.canceled.connect(self.decoder.cancel_extract)
         self.decoder.request_extract(params)
 
@@ -924,7 +946,7 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
             self._extract_progress = None
         if ok:
-            self.title_bar.export_button.setToolTip("Clip extracted")
+            self._notify(message or f"Extracted {getattr(self, '_extract_dest', 'the clip')}")
         elif message and message != "Extraction cancelled":
             self._show_error("Extract failed", message)
 
@@ -975,7 +997,7 @@ class MainWindow(QMainWindow):
                         [stats_csv_row(packet, packet.unit.label, rois=rois, scale=(low, high),
                                        fmt=params["fmt"])])
                 job.commit()
-            self.title_bar.export_button.setToolTip(f"Saved {dest.name}")
+            self._notify(f"Saved {dest.name}")
         except Exception as exc:
             self._show_error("Export failed", f"{type(exc).__name__}: {exc}")
 
@@ -983,7 +1005,7 @@ class MainWindow(QMainWindow):
         if self.current_packet is None or self._busy:
             return
         if not self._rois:
-            self.title_bar.export_button.setToolTip("Draw an ROI first")
+            self._notify("Draw an ROI first: bitmasks are written one per ROI")
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Choose bitmask output folder", str(self.metadata.path.parent)
@@ -1074,7 +1096,7 @@ class MainWindow(QMainWindow):
         if self.metadata is None:
             return
         if not self._rois:
-            self.title_bar.export_button.setToolTip("Draw an ROI first")
+            self._notify("Draw an ROI first: there is no ROI set to save")
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save ROI set", str(roi_set_path(self.metadata.path)),
@@ -1086,7 +1108,7 @@ class MainWindow(QMainWindow):
             self._ignition_frames[str(self.metadata.path)] = self.current_packet.index
         try:
             save_roi_set(path, self._roi_set())
-            self.title_bar.export_button.setToolTip(f"Saved {Path(path).name}")
+            self._notify(f"Saved {Path(path).name}")
         except OSError as exc:
             self._show_error("Save ROI set", f"{type(exc).__name__}: {exc}")
 
@@ -1114,7 +1136,7 @@ class MainWindow(QMainWindow):
             self._ignition_frames[str(self.metadata.path)] = roi_set.ignition_frame
         skipped = len(roi_set.rois) - len(kept)
         note = f" ({skipped} outside this image skipped)" if skipped else ""
-        self.title_bar.export_button.setToolTip(f"Loaded {len(kept)} ROI(s){note}")
+        self._notify(f"Loaded {len(kept)} ROI(s){note}")
         self._push_rois()
 
     def _export_payload(self, params: dict) -> dict:
@@ -1131,13 +1153,12 @@ class MainWindow(QMainWindow):
     def _start_export(self, params: dict, title: str) -> None:
         if params.get("kind") in {"movie", "series"}:
             params = self._export_payload(params)
-        self._export_progress = QProgressDialog(
-            f"{title}…", "Cancel", 0, 1, self
-        )
-        self._export_progress.setWindowTitle(title)
-        self._export_progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._export_progress.setMinimumDuration(0)
-        self._export_progress.setValue(0)
+        # what to confirm when the job itself reports nothing
+        self._export_done_text = {
+            "movie": f"Saved {Path(str(params.get('dest', ''))).name}",
+            "series": f"Saved the image series in {Path(str(params.get('dest', ''))).name}",
+        }.get(params.get("kind"), f"{title} finished")
+        self._export_progress = self._progress_dialog(title, f"{title}…")
         self._export_progress.canceled.connect(self.decoder.cancel_extract)
         if params.get("kind") == "excel":
             self.decoder.request_export_excel(params)
@@ -1161,7 +1182,7 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
             self._export_progress = None
         if ok:
-            self.title_bar.export_button.setToolTip(message or "Export finished")
+            self._notify(message or getattr(self, "_export_done_text", "Export finished"))
         elif message and message != "Export cancelled":
             self._show_error("Export failed", message)
 
@@ -1202,7 +1223,7 @@ class MainWindow(QMainWindow):
                     writer.writerow([])
                     writer.writerows(rows)
                 job.commit()
-            self.title_bar.export_button.setToolTip(f"Saved {output.name}")
+            self._notify(f"Saved {output.name}")
         except Exception as exc:
             self._show_error("Statistics export failed", f"{type(exc).__name__}: {exc}")
 
@@ -1855,7 +1876,7 @@ class MainWindow(QMainWindow):
                         "%.17g" if packet.data.dtype == np.float64 else "%.9g")
                     np.savetxt(stage, packet.data, delimiter=",", fmt=fmt)
                 job.commit()
-            self.title_bar.export_button.setToolTip(f"Saved {output.name}")
+            self._notify(f"Saved {output.name}")
         except Exception as exc:
             self._show_error("Export failed", f"{type(exc).__name__}: {exc}")
 
@@ -1892,9 +1913,15 @@ class MainWindow(QMainWindow):
         self._request_sequence += 1
         return self._request_sequence
 
-    @staticmethod
-    def _show_error(title: str, message: str) -> None:
-        QMessageBox.critical(None, title, message)
+    def _show_error(self, title: str, message: str) -> None:
+        # Owned by the player window: centred over it, and never by a job's
+        # progress dialog, which the job's completion deletes (taking an
+        # unread message with it).
+        MessageDialog.critical(self, title, message)
+
+    def _notify(self, text: str) -> None:
+        """Visible confirmation of a finished action (saved file, loaded ROIs)."""
+        self.canvas.show_notice(text)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         urls = event.mimeData().urls()
@@ -1912,7 +1939,18 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event: QEvent) -> None:
         if event.type() == QEvent.Type.WindowStateChange:
             self.title_bar.update_maximize_icon()
+            self._place_resize_grips()
         super().changeEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_resize_grips()
+
+    def _place_resize_grips(self) -> None:
+        resizable = not (self.isMaximized() or self.isFullScreen())
+        for grip in getattr(self, "_resize_grips", ()):
+            grip.place()
+            grip.setVisible(resizable)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.pause_playback(invalidate=True)

@@ -11,7 +11,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
-from .style import APP_STYLESHEET, install_ui_fonts
+from .style import apply_app_theme
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,9 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("FLIR Thermal Player")
     app.setOrganizationName("Local")
-    app.setStyle("Fusion")
-    install_ui_fonts()
-    app.setStyleSheet(APP_STYLESHEET)
+    apply_app_theme(app)
     app.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
 
     window = MainWindow(args.recording)

@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -35,7 +34,7 @@ from .export_dialogs import _path_row, confirm_replace
 from .geometry import roi_coordinates
 from .jobs import unique_destination
 from .models import RoiShape, VideoMetadata
-from .widgets import ChevronComboBox, FramelessDialog
+from .widgets import ChevronComboBox, FramelessDialog, MessageDialog
 
 _SHEETS = (("tc", "TC Compare"), ("summary", "Summary"), ("charts", "Charts"),
            ("roimap", "ROI map"), ("validation", "Validation (vs SDK)"))
@@ -278,7 +277,7 @@ class ExcelExportDialog(FramelessDialog):
             return
         recording = Path(path).resolve()
         if recording == self.metadata.path.resolve() or any(o["path"] == recording for o in self._others):
-            QMessageBox.information(self, "Add recording", "That recording is already in the list.")
+            MessageDialog.information(self, "Add recording", "That recording is already in the list.")
             return
         sidecar = roi_set_path(recording)
         if not sidecar.exists():
@@ -286,7 +285,7 @@ class ExcelExportDialog(FramelessDialog):
                 self, f"ROI set for {recording.name}", str(recording.parent),
                 "ROI sets (*.rois.json *.json);;All files (*.*)")
             if not chosen:
-                QMessageBox.information(
+                MessageDialog.information(
                     self, "Add recording",
                     f"{recording.name} has no saved ROI set. Open it in the player, draw its ROIs, "
                     "set the ignition frame and use Export → Save ROI set…, then add it here.")
@@ -295,10 +294,10 @@ class ExcelExportDialog(FramelessDialog):
         try:
             roi_set = load_roi_set(sidecar)
         except (OSError, ValueError, KeyError) as exc:
-            QMessageBox.warning(self, "Add recording", f"Could not read the ROI set: {exc}")
+            MessageDialog.warning(self, "Add recording", f"Could not read the ROI set: {exc}")
             return
         if not roi_set.rois:
-            QMessageBox.warning(self, "Add recording", "The ROI set contains no ROIs.")
+            MessageDialog.warning(self, "Add recording", "The ROI set contains no ROIs.")
             return
         entry = {"path": recording, "rois": roi_set.rois, "ignition": roi_set.ignition_frame or 0}
         self._others.append(entry)

@@ -16,7 +16,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_DIR = PROJECT_ROOT / "release"

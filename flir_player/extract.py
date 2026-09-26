@@ -13,13 +13,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QSpinBox,
-    QToolButton,
     QWidget,
 )
 
 from .models import VideoMetadata
 from .jobs import validate_destination, unique_destination
-from .widgets import FramelessDialog
+from .widgets import FramelessDialog, browse_button
 
 
 class ExtractDialog(FramelessDialog):
@@ -75,9 +74,7 @@ class ExtractDialog(FramelessDialog):
         default_name = unique_destination(metadata.path.parent / f"{metadata.path.stem}_extract.ats", [metadata.path])
         self.output_edit = QLineEdit(str(default_name))
         output_row.addWidget(self.output_edit, 1)
-        browse = QToolButton()
-        browse.setText("…")
-        browse.setToolTip("Choose output file")
+        browse = browse_button("Choose output file")
         browse.clicked.connect(self._browse_output)
         output_row.addWidget(browse)
         form.addRow("Output", output_row)

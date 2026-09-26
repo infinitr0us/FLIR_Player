@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QMessageBox,
     QPushButton,
     QSpinBox,
     QToolButton,
@@ -30,7 +29,7 @@ from .compose import ExportOptions
 from .export import EXTENSIONS, MOVIE_FORMATS, STILL_FORMATS, series_frame_path, series_stats_path
 from .jobs import unique_destination
 from .models import VideoMetadata
-from .widgets import ChevronComboBox, FramelessDialog
+from .widgets import ChevronComboBox, FramelessDialog, MessageDialog, browse_button
 
 
 def _normalized(path) -> str:
@@ -55,14 +54,11 @@ def confirm_replace(parent, paths, confirmed=()) -> list[Path] | None:
         shown = "\n".join(path.name for path in unasked[:8])
         if len(unasked) > 8:
             shown += f"\n… and {len(unasked) - 8} more"
-        answer = QMessageBox.question(
+        if not MessageDialog.question(
             parent,
             "Replace existing files?",
             f"{len(unasked)} output file(s) already exist:\n\n{shown}\n\nReplace them?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return None
     return existing
 
@@ -117,9 +113,7 @@ def _path_row(browse_tooltip: str) -> tuple[QHBoxLayout, QLineEdit, QToolButton]
     row.setSpacing(8)
     edit = QLineEdit()
     row.addWidget(edit, 1)
-    browse = QToolButton()
-    browse.setText("…")
-    browse.setToolTip(browse_tooltip)
+    browse = browse_button(browse_tooltip)
     row.addWidget(browse)
     return row, edit, browse
 
