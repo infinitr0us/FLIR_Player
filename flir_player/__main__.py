@@ -72,16 +72,41 @@ def main(argv: list[str] | None = None) -> int:
                         window.current_packet is not None
                         and window.current_packet.index > initial_index
                     )
-                    finish(0 if advanced else 5)
+                    if not advanced:
+                        finish(5)
+                        return
+                    window.pause_playback(invalidate=True)
+                    exercise_excel()
 
                 QTimer.singleShot(1200, verify)
 
             QTimer.singleShot(120, start)
 
+        def exercise_excel() -> None:
+            """Write a tiny workbook through the real export job (bundling check)."""
+            import tempfile
+
+            from .excel_export import ExportOptions
+            from .models import RoiShape
+
+            metadata = window.metadata
+            dest = Path(tempfile.gettempdir()) / "flir-smoke-export.xlsx"
+            dest.unlink(missing_ok=True)
+            spot = RoiShape(1, "cursor", ((metadata.width / 2, metadata.height / 2),), "Smoke")
+            window.decoder.export_finished.connect(
+                lambda ok, _message: finish(0 if ok and dest.is_file() else 6))
+            window.decoder.request_export_excel({
+                "kind": "excel", "dest": str(dest), "replace": [], "parameters_from": "file",
+                "sources": [{"path": str(metadata.path), "label": "smoke", "rois": (spot,),
+                             "ignition_frame": 0, "current": True}],
+                "options": ExportOptions(start_s=0.0, end_s=2.0, step_s=1.0,
+                                         sheets=frozenset({"validation"})),
+            })
+
         window.decoder.opened.connect(exercise_playback)
         window.decoder.failed.connect(lambda _message: finish(2))
         window.decoder.open_failed.connect(lambda _open_id, _message: finish(2))
-        QTimer.singleShot(20000, lambda: finish(3))
+        QTimer.singleShot(60000, lambda: finish(3))
 
     return app.exec()
 

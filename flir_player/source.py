@@ -19,6 +19,8 @@ except ModuleNotFoundError:  # Let this module import without the SDK present.
     _SDK_AVAILABLE = False
 import numpy as np
 
+from .calibration import set_unit_safely
+from .sdktime import TimestampRepair
 from .models import (
     CadenceInfo,
     FramePacket,
@@ -299,6 +301,7 @@ class FlirVideoSource:
         self._pretemporal: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
         self._pretemporal_bytes = 0
         self._provenance: tuple[int, tuple] | None = None  # (revision, provenance)
+        self._clock = TimestampRepair(None)  # ATS year repair (see sdktime)
 
     def _invalidate_processing(self) -> None:
         self.revision += 1
@@ -315,6 +318,14 @@ class FlirVideoSource:
     @property
     def is_open(self) -> bool:
         return self._im is not None
+
+    def sdk_handle(self) -> Any | None:
+        """The open ImagerFile, for jobs on this (the owning) thread only.
+
+        Borrowers must restore its unit, scale and object parameters
+        (``calibration.preserved_state``).
+        """
+        return self._im
 
     @property
     def metadata(self) -> VideoMetadata:
@@ -339,6 +350,7 @@ class FlirVideoSource:
             raise FileNotFoundError(f"Recording not found: {resolved}")
 
         try:
+            self._clock = TimestampRepair(resolved)
             self._im = fnv.file.ImagerFile(str(resolved))
             if self._im.num_frames <= 0:
                 raise ValueError("The recording contains no frames")
@@ -380,6 +392,8 @@ class FlirVideoSource:
                 camera_model=str(getattr(source_info, "camera_model", "") or ""),
                 camera_serial=str(getattr(source_info, "camera_serial", "") or ""),
                 source_details=_cadence_rows(cadence, float(nominal_fps))
+                + ((("Recording date", "From the file's modification time (the ATS clock has no year)"),)
+                   if self._clock.repaired else ())
                 + _source_details(self._im),
                 cadence=cadence,
             )
@@ -399,17 +413,13 @@ class FlirVideoSource:
 
         previous = self._unit_spec
         try:
-            self._im.unit = spec.sdk_unit
-            if spec.temperature_type is not None:
-                self._im.temp_type = spec.temperature_type
+            set_unit_safely(self._im, spec.sdk_unit, spec.temperature_type)
             self._unit_spec = spec
             self._reload_reference()
         except Exception:
             self._unit_spec = previous
             if previous is not None:
-                self._im.unit = previous.sdk_unit
-                if previous.temperature_type is not None:
-                    self._im.temp_type = previous.temperature_type
+                set_unit_safely(self._im, previous.sdk_unit, previous.temperature_type)
             raise
         self._invalidate_processing()
         return spec.option
@@ -647,16 +657,19 @@ class FlirVideoSource:
         return tuple(lines.get(stats.id, stats) for stats in sdk_stats)
 
     def _clip_mask(self, shape: tuple[int, ...]) -> np.ndarray | None:
-        """Boolean mask of pixels the SDK flags as clipped/invalid (status bit 1).
+        """Boolean mask of pixels the SDK clamped to its clip range.
 
-        Returns None when nothing is clipped so callers can skip overlay work.
+        In temperature units the SDK status is 1 outside the calibrated range
+        (extrapolated), 2 when clamped at the low clip limit and 4 when clamped
+        at the high limit, which includes saturated pixels. Returns None when
+        nothing is clipped so callers can skip overlay work.
         """
         if self._im is None:
             return None
         status = np.array(self._im.status, copy=False)
         if status.size != int(np.prod(shape)):
             return None
-        clipped = (status.reshape(shape) & 2) != 0
+        clipped = (status.reshape(shape) & (2 | 4)) != 0
         return clipped if clipped.any() else None
 
     def _frame_metadata_entries(self) -> tuple[tuple[str, str], ...]:
@@ -733,9 +746,7 @@ class FlirVideoSource:
             if self._unit_spec is not None:
                 if not im.has_unit(self._unit_spec.sdk_unit):
                     raise ValueError("The reference does not support the selected unit")
-                im.unit = self._unit_spec.sdk_unit
-                if self._unit_spec.temperature_type is not None:
-                    im.temp_type = self._unit_spec.temperature_type
+                set_unit_safely(im, self._unit_spec.sdk_unit, self._unit_spec.temperature_type)
             if not same_file:
                 # Reference pixels use the same measurement parameters and
                 # available correction switches as the current recording.
@@ -1026,7 +1037,7 @@ class FlirVideoSource:
         if self._im is None:
             return None
         value = getattr(self._im.frame_info, "time", None)
-        return value if isinstance(value, datetime) else None
+        return self._clock(value) if isinstance(value, datetime) else None
 
     @staticmethod
     def _duration(start: datetime | None, end: datetime | None) -> float:

@@ -44,6 +44,8 @@ from .export_dialogs import (
     ExportSeriesDialog,
     confirm_replace,
 )
+from .excel_dialog import ExcelExportDialog
+from .excel_export import RoiSet, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
 from .geometry import roi_coordinates
 from .settings import app_settings
@@ -179,6 +181,8 @@ class MainWindow(QMainWindow):
             "temporal": ("none", 5),
         }
         self._reference_params: dict | None = None
+        self._object_params: dict | None = None  # latest measurement-parameter snapshot
+        self._ignition_frames: dict[str, int] = {}  # recording path → ignition frame (0-based)
         self._temporal: dict[int, dict[int, tuple[float, object]]] = {}
         self._plot_clock = QElapsedTimer()
         self._stats_clock = QElapsedTimer()
@@ -271,6 +275,11 @@ class MainWindow(QMainWindow):
         csv_action = export_menu.addAction("Raw values (CSV)")
         bitmask_action = export_menu.addAction("ROI bitmasks…")
         export_menu.addSeparator()
+        excel_action = export_menu.addAction("Excel workbook (live temperatures)…")
+        excel_action.setToolTip("Raw counts at the ROIs with emissivity-adjustable temperature formulas")
+        save_rois_action = export_menu.addAction("Save ROI set…")
+        load_rois_action = export_menu.addAction("Load ROI set…")
+        export_menu.addSeparator()
         movie_action = export_menu.addAction("Export movie…")
         series_action = export_menu.addAction("Export image series…")
         export_menu.addSeparator()
@@ -281,6 +290,9 @@ class MainWindow(QMainWindow):
         array_action.triggered.connect(lambda: self._export("npy"))
         csv_action.triggered.connect(lambda: self._export("csv"))
         bitmask_action.triggered.connect(self._export_bitmasks)
+        excel_action.triggered.connect(self._open_excel_dialog)
+        save_rois_action.triggered.connect(self._save_roi_set)
+        load_rois_action.triggered.connect(self._load_roi_set)
         movie_action.triggered.connect(self._open_export_movie_dialog)
         series_action.triggered.connect(self._open_export_series_dialog)
         extract_action.triggered.connect(self._open_extract_dialog)
@@ -635,6 +647,7 @@ class MainWindow(QMainWindow):
         self._apply_object_parameters(None)
 
     def _on_object_params_ready(self, snapshot: dict) -> None:
+        self._object_params = dict(snapshot)
         self.inspector.set_object_parameters(snapshot)
 
     # --- ROI management --------------------------------------------------------
@@ -1016,6 +1029,94 @@ class MainWindow(QMainWindow):
             return
         self._start_export(params, "Batch Extract")
 
+    # --- Excel workbook and ROI sets ---------------------------------------------
+
+    def _ignition_frame(self) -> int | None:
+        """Ignition frame of the open recording: this session's, else its ROI set's."""
+        if self.metadata is None:
+            return None
+        key = str(self.metadata.path)
+        if key in self._ignition_frames:
+            return self._ignition_frames[key]
+        sidecar = roi_set_path(self.metadata.path)
+        if sidecar.exists():
+            try:
+                frame = load_roi_set(sidecar).ignition_frame
+            except (OSError, ValueError, KeyError):
+                frame = None
+            if frame is not None and 0 <= frame < self.metadata.num_frames:
+                return frame
+        return None
+
+    def _roi_set(self) -> RoiSet:
+        metadata = self.metadata
+        return RoiSet(rois=tuple(self._rois), ignition_frame=self._ignition_frame(),
+                      recording=metadata.path.name, size=(metadata.width, metadata.height))
+
+    def _open_excel_dialog(self) -> None:
+        if self.metadata is None or self.current_packet is None or self._busy:
+            return
+        self.pause_playback(invalidate=True)
+        dialog = ExcelExportDialog(self.metadata, tuple(self._rois), self.current_packet.index,
+                                   ignition_frame=self._ignition_frame(), parent=self)
+        if dialog.exec() != ExcelExportDialog.DialogCode.Accepted:
+            return
+        params = dialog.parameters()
+        self._ignition_frames[str(self.metadata.path)] = params["sources"][0]["ignition_frame"]
+        if params["save_sidecar"] and self._rois:
+            try:
+                save_roi_set(roi_set_path(self.metadata.path), self._roi_set())
+            except OSError as exc:
+                self._show_error("ROI set", f"Could not save the ROI set next to the recording: {exc}")
+        self._start_export(params, "Export Excel Workbook")
+
+    def _save_roi_set(self) -> None:
+        if self.metadata is None:
+            return
+        if not self._rois:
+            self.title_bar.export_button.setToolTip("Draw an ROI first")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save ROI set", str(roi_set_path(self.metadata.path)),
+            "ROI sets (*.rois.json);;All files (*.*)")
+        if not path:
+            return
+        if self.current_packet is not None and self._ignition_frame() is None:
+            # Remember where the user is: usually the moment of ignition.
+            self._ignition_frames[str(self.metadata.path)] = self.current_packet.index
+        try:
+            save_roi_set(path, self._roi_set())
+            self.title_bar.export_button.setToolTip(f"Saved {Path(path).name}")
+        except OSError as exc:
+            self._show_error("Save ROI set", f"{type(exc).__name__}: {exc}")
+
+    def _load_roi_set(self) -> None:
+        if self.metadata is None or self.current_packet is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load ROI set", str(self.metadata.path.parent),
+            "ROI sets (*.rois.json *.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            roi_set = load_roi_set(path)
+        except (OSError, ValueError, KeyError) as exc:
+            self._show_error("Load ROI set", f"{type(exc).__name__}: {exc}")
+            return
+        kept = [shape for shape in roi_set.rois if self._covers_pixels(shape.kind, shape.points)]
+        self._clear_rois()
+        for shape in kept:
+            self._rois.append(RoiShape(id=self._roi_next_id, kind=shape.kind, points=shape.points,
+                                       name=shape.name))
+            self._roi_next_id += 1
+            self._roi_name_counts[shape.kind] = self._roi_name_counts.get(shape.kind, 0) + 1
+        if roi_set.ignition_frame is not None and roi_set.recording == self.metadata.path.name                 and 0 <= roi_set.ignition_frame < self.metadata.num_frames:
+            self._ignition_frames[str(self.metadata.path)] = roi_set.ignition_frame
+        skipped = len(roi_set.rois) - len(kept)
+        note = f" ({skipped} outside this image skipped)" if skipped else ""
+        self.title_bar.export_button.setToolTip(f"Loaded {len(kept)} ROI(s){note}")
+        self._push_rois()
+
     def _export_payload(self, params: dict) -> dict:
         """Attach the current display/ROI state to a movie/series request."""
         packet = self.current_packet
@@ -1038,7 +1139,9 @@ class MainWindow(QMainWindow):
         self._export_progress.setMinimumDuration(0)
         self._export_progress.setValue(0)
         self._export_progress.canceled.connect(self.decoder.cancel_extract)
-        if params.get("kind") in {"movie", "series"}:
+        if params.get("kind") == "excel":
+            self.decoder.request_export_excel(params)
+        elif params.get("kind") in {"movie", "series"}:
             self.decoder.request_export_sequence(params)
         else:
             self.decoder.request_batch_extract(params)

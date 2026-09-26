@@ -271,6 +271,11 @@ class DecoderThread(QThread):
         self._tokens.append(token)
         self._commands.put(("batch_extract", dict(params, _token=token)))
 
+    def request_export_excel(self, params: dict) -> None:
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("export_excel", dict(params, _token=token)))
+
     def request_export_bitmasks(self, folder: str, overwrite=()) -> None:
         """``overwrite``: existing bitmask files the user agreed to replace."""
         self._commands.put(("export_bitmasks", {"folder": str(folder),
@@ -404,6 +409,12 @@ class DecoderThread(QThread):
                         ok, message = self._run_batch_extract(payload)
                         self.export_finished.emit(ok, message)
                         self.busy_changed.emit(False, "")
+                    elif command == "export_excel":
+                        self._abort = payload["_token"]()
+                        self.busy_changed.emit(True, "Exporting Excel workbook…")
+                        ok, message = self._run_export_excel(source, payload)
+                        self.export_finished.emit(ok, message)
+                        self.busy_changed.emit(False, "")
                     elif command == "export_bitmasks":
                         self.busy_changed.emit(True, "Exporting ROI bitmasks…")
                         written = source.export_roi_bitmasks(
@@ -427,7 +438,7 @@ class DecoderThread(QThread):
                     message = f"{type(exc).__name__}: {exc}"
                     if command == "extract":
                         self.extract_finished.emit(False, message)
-                    elif command in {"export_sequence", "batch_extract", "export_bitmasks"}:
+                    elif command in {"export_sequence", "batch_extract", "export_bitmasks", "export_excel"}:
                         self.export_finished.emit(False, message)
                     elif command == "open":
                         self.open_failed.emit(payload[1], message)
@@ -521,6 +532,41 @@ class DecoderThread(QThread):
             return False, f"{type(exc).__name__}: {exc}"
         finally:
             source._temporal, source._last_frame_index = old_ring, old_index
+
+    def _run_export_excel(self, source: FlirVideoSource, payload: dict) -> tuple[bool, str]:
+        """Excel workbook of raw counts; the open recording's handle is lent.
+
+        Other recordings are opened (and closed) by the job. The lent handle
+        gets its unit, scale and object parameters back; the player's own
+        processing state is untouched because raw counts bypass it.
+        """
+        from . import __version__
+        from .excel_export import SourceSpec, run_export
+
+        if not source.is_open:
+            return False, "No recording is open"
+        current = Path(source.metadata.path).resolve()
+        specs = []
+        for entry in payload["sources"]:
+            path = Path(entry["path"]).resolve()
+            parameters = None
+            if entry.get("current") and payload.get("parameters_from") == "player":
+                parameters = source.read_object_parameters()
+            specs.append(SourceSpec(path=path, rois=tuple(entry["rois"]),
+                                    ignition_frame=int(entry["ignition_frame"]),
+                                    label=str(entry.get("label", "")), parameters=parameters))
+        try:
+            message = run_export(
+                payload["dest"], specs, payload["options"],
+                handles={current: source.sdk_handle()},
+                progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
+                abort=lambda: self._job_aborted(payload),
+                replace=payload.get("replace", ()), tool_version=__version__)
+            return True, message
+        except JobCancelled:
+            return False, "Export cancelled"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
     def _run_batch_extract(self, payload: dict) -> tuple[bool, str]:
         """Preflight unique destinations and persist an outcome for every input."""

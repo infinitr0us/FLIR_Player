@@ -24,7 +24,7 @@ attach proprietary FLIR recordings or SDK binaries.
 **Environment**
 - OS and version: [e.g. Windows 11 23H2]
 - Python version: [e.g. 3.11.7]
-- FLIR File SDK version: [e.g. FileSDK 5.0.1]
+- FLIR File SDK version: [e.g. FileSDK 2026.1.2]
 - Recording format involved: [SEQ / ATS / CSQ / SFMOV / other]
 - Running from source or the packaged `.exe`:
 

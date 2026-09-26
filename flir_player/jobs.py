@@ -236,13 +236,20 @@ class OutputTransaction:
 
 
 def extract_recording(im, source, dest, options, *, progress=None, abort=None):
-    """SDK extraction with latched cancellation and job-owned cleanup."""
+    """SDK extraction with latched cancellation and job-owned cleanup.
+
+    ``progress`` receives completed frames (1 … total) whatever the SDK
+    counts from: FileSDK 5.0.1 reports 1 … total, 2024.7 and later 0 … total − 1.
+    """
     aborted = False
+    offset = None  # 1 for zero-based SDK callbacks, decided by the first one
 
     def callback(current, total):
-        nonlocal aborted
+        nonlocal aborted, offset
+        if offset is None:
+            offset = 1 if int(current) == 0 else 0
         if progress is not None:
-            progress(current, total)
+            progress(min(int(current) + offset, int(total)), total)
         aborted = aborted or bool(abort and abort())
         return aborted
 

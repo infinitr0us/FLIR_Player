@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.5.0 — 2026-09-26
+
+This release adds an Excel workbook export for comparing IR with
+thermocouples in fire tests, and moves to FLIR File SDK 2026.1.2.
+
+### Excel workbook
+
+- *Export → Excel workbook (live temperatures)…* writes the raw counts at the
+  ROIs of one or more recordings (e.g. several cameras filming one test),
+  sampled every *x* seconds or every frame.
+  - Rows are seconds from each recording's ignition frame, so cameras aligned
+    by hand at ignition line up.
+  - Temperatures are live Excel formulas: changing emissivity, reflected or
+    atmosphere temperature, humidity, transmission or an external window
+    recalculates every value, chart and summary.
+  - Settings can be changed globally, per recording or per ROI.
+- The formulas use the recording's own calibration: the FFF CameraInfo record
+  of SEQ/CSQ files. It is verified against the File SDK, including under
+  changed parameters, before live formulas are written. The Validation sheet
+  repeats that check inside the workbook. Parameter combinations outside the
+  calibration curve give `#N/A`, not a number.
+- Area ROIs keep every pixel, giving an exact mean temperature. Areas above
+  400 pixels keep 128 bins of equal apparent-temperature width instead (mean
+  within 0.01 K). Extremes and percentiles convert exactly. The export fits
+  its pixel storage to Excel's 16,384-column limit.
+- Samples outside the calibrated range are shown grey and saturated ones red,
+  independent of emissivity. Optionally, values are clamped like FLIR's
+  software, on counts, so spots and area means clamp alike.
+- TC Compare sheet: paste logger data and map each ROI to a thermocouple. It
+  gives IR − TC, the emissivity that would make them agree (above 1 means no
+  emissivity can) and the best-fit emissivity over a time window. For areas,
+  both come from the mean radiance.
+- Summary sheet: baseline, peak and time of peak, rise, time to three
+  thresholds, the share of flagged samples, and TC statistics. Also Charts
+  (grouped by ROI name across recordings), ROI Map, Source (calibration
+  provenance) and a Start Here sheet.
+- ROI sets (*Export → Save / Load ROI set…*) keep the ROIs and the ignition
+  frame next to the recording, for reuse across tests and for multi-camera
+  workbooks.
+
+### FLIR File SDK 2026.1.2
+
+- **The player is tested with FileSDK 2026.1.2 and recommends it.** On the
+  sample recordings it returns bit-identical frames, statuses and statistics
+  to 5.0.1.
+- **The upgrade removes a 5.0.1 crash.** With 5.0.1, switching units on
+  recordings with a ResearchIR user calibration crashed the process in 4 of 4
+  unit-cycling runs; 2026.1.2 passed all runs.
+- **The DLLs load by themselves now.** The player loads the SDK's native DLLs
+  from `fnv/_lib` on import, because the 2026.1 extension modules cannot find
+  them. `FLIR_SDK_DEBUG=<file>` logs the preload.
+- **ATS/SFMOV dates are repaired.** Their clocks carry no year and the SDK
+  dates them in 1976, a day early after February. The player takes the year
+  from the file's modification time and notes this in the Source panel.
+- **Extraction progress counts completed frames with any SDK.** 2024.7 and
+  later count from 0.
+- The newer SDK also shows two more ATS header entries, `ClockFrequency` and
+  `DBMFPixelCount`.
+
+### Fixes
+
+- The clipping overlay also marks pixels the SDK clamped at the high limit
+  (saturated), not only those clamped at the low limit.
+
+### Packaging
+
+- **The executable bundles the newest Visual C++ runtime** on the build
+  machine (Windows' own or PySide6's) instead of the Conda environment's
+  14.27. FileSDK 2026.1 needs 14.40 or newer.
+- **The build smoke test ran inside the activated Conda environment**, where
+  Conda's DLLs could mask a missing bundled one. It also treated crashes as
+  passes, because a crash's negative exit code slips past `if errorlevel 1`.
+  It now runs with a Windows-only `PATH`, requires an exit code of exactly 0,
+  tests `1.ats` as well as `2.seq` when present, and exports a workbook.
+
+### Under the hood
+
+- New Qt-free modules: `radiometry` (FLIR measurement formula), `fff`
+  (CameraInfo parser), `calibration` (SDK verification), `excel_export`
+  (sampling), `workbook` (XlsxWriter layout) and `sdktime` (ATS dates).
+- New dependency: XlsxWriter; tests use openpyxl.
+- Opt-in `tests/test_excel_live.py` (`FLIR_EXCEL_LIVE=1`) checks the formulas
+  in Microsoft Excel itself.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.4.2...v0.5.0)
+
 ## 0.4.2 — 2026-09-23
 
 This release fixes the findings of a whole-package review of 0.4.1: side

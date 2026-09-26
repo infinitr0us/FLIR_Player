@@ -70,6 +70,15 @@ all decoding work off the GUI thread.
 - ROI bitmask export (one PNG mask per ROI, via the File SDK).
 - Batch extract of multiple ATS recordings into a folder, with an honest
   per-file report (the SDK extracts from ATS sources only).
+- Excel workbook export for thermocouple comparisons: raw counts at the ROIs
+  of one or several recordings (e.g. several cameras) on a shared timeline in
+  seconds from each recording's ignition frame, with temperatures as live
+  Excel formulas. Changing emissivity, reflected temperature, transmission or
+  an external window in the workbook recalculates every value, chart and
+  summary; a Validation sheet shows the formulas reproduce the File SDK.
+  Also: a TC Compare sheet with matching emissivity, a Summary with peaks and
+  threshold times, ROI maps, and saved ROI sets (with the ignition frame) for
+  reuse across tests.
 - Dynamic per-frame scaling or a user-defined fixed range.
 - Live cursor coordinates and radiometric value inspection.
 - PNG display export plus raw NumPy and CSV export.
@@ -90,14 +99,29 @@ obtain it from FLIR yourself and install it into your Python environment before
 running the player.
 
 - Download the `FileSDK` wheel matching your platform and Python version
-  (this project targets **64-bit Python 3.11 on Windows**).
+  (this project targets **64-bit Python 3.11 on Windows**). The player is
+  tested with **FileSDK 2026.1.2** (recommended) and still runs with 5.0.1.
 - Install it into your environment, for example:
 
   ```powershell
-  pip install FileSDK-5.0.1-cp311-cp311-win_amd64.whl
+  pip uninstall FileSDK   # when replacing an older version
+  pip install FileSDK-2026.1.2-cp311-cp311-win_amd64.whl
   ```
 
 Everything else the player needs is in `requirements.txt`.
+
+Notes on FileSDK 2026.1:
+
+- Its extension modules cannot find their own native DLLs. The player loads
+  them from `fnv/_lib` when the `flir_player` package is imported, so scripts
+  that use both must import `flir_player` before `fnv`.
+- Its DLLs need the Visual C++ runtime 14.40 or newer. The packaged
+  executable bundles the newest copy found on the build machine; see
+  *Standalone Windows release*.
+- ATS/SFMOV clocks carry no year, and the SDK dates them in 1976. The player
+  takes the year from the file's modification time and says so in the Source
+  panel.
+- Set `FLIR_SDK_DEBUG=<log file>` to record what the DLL preload did.
 
 ## Run it
 
@@ -126,14 +150,27 @@ ours to redistribute. Build it locally instead, and only share the resulting
 binary with users your FLIR SDK license permits.
 
 To build the executable from this checkout, double-click `build_exe.bat` or
-run it from a terminal. The script installs/verifies the Python dependencies,
-runs PyInstaller (the specification explicitly includes the FLIR native DLLs
-and the imageio-ffmpeg encoder binary, and excludes Anaconda's incompatible
-legacy ICU shadow DLL), then regenerates `release/BUILD_INFO.txt`,
-`release/SHA256SUMS.txt`, and `release/README.txt` via
-`packaging/finalize_release.py`, and smoke-tests the built executable against
-the sample recording `local/data/2.seq`. Only a successful smoke test marks the
-release metadata as verified. A build that fails the smoke test exits with code 2.
+run it from a terminal. The script:
+
+1. installs/verifies the Python dependencies;
+2. runs PyInstaller;
+3. regenerates `release/BUILD_INFO.txt`, `release/SHA256SUMS.txt` and
+   `release/README.txt` via `packaging/finalize_release.py`;
+4. smoke-tests the built executable against the sample recordings
+   `local/data/2.seq` and, when present, `local/data/1.ats`.
+
+The PyInstaller specification explicitly includes the FLIR native DLLs and the
+imageio-ffmpeg encoder binary, and excludes Anaconda's incompatible legacy ICU
+shadow DLL. It also replaces the Conda environment's Visual C++ runtime
+(14.27) with the newest copy found (Windows' own or PySide6's), because
+FileSDK 2026.1 needs 14.40 or newer. The build log lists the runtime it
+bundled.
+
+The smoke test opens each recording, checks that playback advances and exports
+an Excel workbook. It runs with a Windows-only `PATH`, so nothing from Conda can
+stand in for a missing bundled DLL, and requires an exit code of exactly 0.
+Only a successful smoke test marks the release metadata as verified. A build
+that fails the smoke test exits with code 2.
 
 The executable contains FLIR File SDK components. Check the FLIR SDK license
 and the EAR notice in the installed `fnv` package before redistributing it
@@ -278,6 +315,45 @@ the displayed statistics snapshot, including when the table is paused.
 
 Tests use temporary INI preferences and do not write the application's registry
 settings. Set `FLIR_SETTINGS_FILE` to an INI path to isolate another run.
+
+## Excel workbook (raw counts with live temperatures)
+
+*Export → Excel workbook (live temperatures)…* writes raw counts at the ROIs of
+the open recording, and of any other recordings added in the dialog (each with
+a saved ROI set), to an `.xlsx` workbook. Temperatures are Excel formulas over
+those counts, so they follow the Settings sheet:
+
+- **Settings:** emissivity, reflected temperature, atmosphere temperature and
+  humidity, automatic or manual transmission, and an external window, with
+  optional per-recording and per-ROI overrides. Also the display unit and
+  whether values beyond the calibration are clamped like FLIR's software.
+- **Data / Counts / Pixels:** one row per sample (every *x* seconds or every
+  frame) in seconds from each recording's ignition frame. Spots store their
+  count. Areas store min/max/mean counts plus every pixel's count (exact mean
+  temperature) or, above 400 pixels, 128 bins of equal apparent-temperature
+  width, whose mean is within 0.01 K of the exact one. Samples outside the
+  camera's calibrated range are shown grey (extrapolated), saturated ones red.
+- **TC Compare:** paste logger data; each ROI can be mapped to a thermocouple
+  column. It gives IR − TC and the emissivity that would make them agree. A
+  value above 1 means no emissivity can: the camera sees flames, hot gas or a
+  hotter area than the thermocouple.
+- **Summary, Charts, ROI Map, Validation, Source:** peaks, times to
+  thresholds and TC statistics; charts grouped by ROI name across recordings;
+  where the ROIs are; formulas against the File SDK; calibration provenance.
+
+The conversion is FLIR's measurement formula,
+`T = B / ln(R / (K1·counts − K2 + O) + F)`, where R, B, F, O come from the
+recording's own calibration record. For SEQ/CSQ, that record and a fit to the
+File SDK's temperatures must agree and reproduce the SDK under changed
+parameters before live formulas are written (typically to 5 × 10⁻⁵ K).
+Recordings without a factory calibration, such as ResearchIR user
+calibrations, are exported as counts only. *Export → Save ROI set…* stores the
+ROIs and the ignition frame next to the recording (`<file>.rois.json`) for
+reuse and for multi-camera workbooks.
+
+Known SDK issue (fixed by FileSDK 2026.1): with FileSDK 5.0.1, switching
+units on recordings that carry a ResearchIR user calibration
+(Radiance/Temperature User) can crash the process inside the SDK.
 
 ## License
 

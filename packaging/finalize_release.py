@@ -16,7 +16,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_DIR = PROJECT_ROOT / "release"
@@ -112,7 +112,7 @@ def main() -> int:
     (RELEASE_DIR / "README.txt").write_text(
         README_TEMPLATE.format(
             version=VERSION, underline="=" * len(title), build_date=build_date,
-            verification=(f"Verified on {build_date}: bundled smoke test exited 0 and playback advanced."
+            verification=(f"Verified on {build_date}: bundled smoke test exited 0, playback advanced and an Excel workbook was exported."
                           if args.smoke_tested else "This build has not been smoke-test verified.")
         ),
         encoding="utf-8",

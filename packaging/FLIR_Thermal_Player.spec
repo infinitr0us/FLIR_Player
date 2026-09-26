@@ -69,6 +69,48 @@ a.binaries = [
     if Path(entry[0]).name.lower() not in legacy_conda_icu
 ]
 
+
+# The Conda environment's Visual C++ runtime (14.27) is too old for FLIR File
+# SDK 2026.1: its fnvreduce.dll fails to initialize (error 1114, then the
+# process dies with 0xC06D007E) against msvcp140 < 14.40, Microsoft's 2024
+# std::mutex change. Bundle the newest redistributable copies found instead
+# (Windows' own, or PySide6's); newer runtimes stay compatible with older code.
+def _file_version(path):
+    import ctypes
+    from ctypes import wintypes
+
+    version_dll = ctypes.windll.version
+    size = version_dll.GetFileVersionInfoSizeW(str(path), None)
+    if not size:
+        return (0, 0, 0, 0)
+    data = ctypes.create_string_buffer(size)
+    if not version_dll.GetFileVersionInfoW(str(path), 0, size, data):
+        return (0, 0, 0, 0)
+    info, length = ctypes.c_void_p(), wintypes.UINT()
+    if not version_dll.VerQueryValueW(data, "\\", ctypes.byref(info), ctypes.byref(length)):
+        return (0, 0, 0, 0)
+    fixed = ctypes.cast(info, ctypes.POINTER(ctypes.c_uint32 * 13)).contents
+    return (fixed[2] >> 16, fixed[2] & 0xFFFF, fixed[3] >> 16, fixed[3] & 0xFFFF)
+
+
+import PySide6  # noqa: E402
+
+vc_runtime = {"msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "vcruntime140.dll",
+              "vcruntime140_1.dll", "concrt140.dll"}
+vc_sources = [Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32", Path(PySide6.__file__).parent]
+vc_report = []
+binaries = []
+for dest, src, kind in a.binaries:
+    name = Path(dest).name.lower()
+    if name in vc_runtime and Path(dest).parent == Path("."):
+        candidates = [Path(src)] + [folder / Path(dest).name for folder in vc_sources]
+        best = max((c for c in candidates if c.is_file()), key=_file_version)
+        vc_report.append(f"{Path(dest).name} {'.'.join(map(str, _file_version(best)))} from {best.parent}")
+        src = str(best)
+    binaries.append((dest, src, kind))
+a.binaries = binaries
+print("Bundled Visual C++ runtime:\n  " + "\n  ".join(vc_report))
+
 pyz = PYZ(a.pure)
 common = dict(
     name="FLIR_Thermal_Player",

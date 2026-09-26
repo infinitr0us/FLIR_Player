@@ -24,7 +24,7 @@ tests you must obtain the SDK from FLIR and install it yourself. See the
 
 ```powershell
 # 1. Install the FLIR File SDK you obtained from FLIR, e.g.:
-pip install FileSDK-5.0.1-cp311-cp311-win_amd64.whl
+pip install FileSDK-2026.1.2-cp311-cp311-win_amd64.whl
 
 # 2. Install the project in editable mode with dev extras:
 pip install -e ".[dev]"
