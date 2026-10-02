@@ -403,7 +403,7 @@ def test_n09_bitmasks_can_be_replaced_after_confirmation(player, qapp, tmp_path,
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
     monkeypatch.setattr(MessageDialog, "question", staticmethod(lambda *a, **k: True))
     results = []
-    player.decoder.export_finished.connect(lambda ok, message: results.append((ok, message)))
+    player.decoder.bitmasks_finished.connect(lambda ok, message: results.append((ok, message)))
     for expected in (1, 2):
         player._export_bitmasks()
         assert wait_until(qapp, lambda: len(results) == expected)

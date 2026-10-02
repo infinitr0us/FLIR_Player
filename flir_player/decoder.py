@@ -176,6 +176,9 @@ class DecoderThread(QThread):
     extract_finished = Signal(bool, str)
     export_progress = Signal(int, int)
     export_finished = Signal(bool, str)
+    # Bitmask exports have no progress dialog, so they report separately: a
+    # queued one must never close the dialog of an export started after it.
+    bitmasks_finished = Signal(bool, str)
     busy_changed = Signal(bool, str)
     failed = Signal(str)
     open_failed = Signal(int, str)  # open generation, message
@@ -419,7 +422,7 @@ class DecoderThread(QThread):
                         self.busy_changed.emit(True, "Exporting ROI bitmasks…")
                         written = source.export_roi_bitmasks(
                             payload["folder"], overwrite=payload.get("replace", ()))
-                        self.export_finished.emit(
+                        self.bitmasks_finished.emit(
                             True, f"Wrote {len(written)} bitmask file(s)"
                         )
                         self.busy_changed.emit(False, "")
@@ -438,8 +441,10 @@ class DecoderThread(QThread):
                     message = f"{type(exc).__name__}: {exc}"
                     if command == "extract":
                         self.extract_finished.emit(False, message)
-                    elif command in {"export_sequence", "batch_extract", "export_bitmasks", "export_excel"}:
+                    elif command in {"export_sequence", "batch_extract", "export_excel"}:
                         self.export_finished.emit(False, message)
+                    elif command == "export_bitmasks":
+                        self.bitmasks_finished.emit(False, message)
                     elif command == "open":
                         self.open_failed.emit(payload[1], message)
                     elif command in self._STATE_COMMANDS:

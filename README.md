@@ -32,8 +32,9 @@ all decoding work off the GUI thread.
   plot, per-frame header metadata (with entry picker), and static source
   information (camera, lens, calibration ranges).
 - Scale-from-ROI range mode alongside dynamic and fixed scaling.
-- Overlay toggles: clipping indicators for out-of-calibration pixels and
-  min/max location markers for the image and each ROI.
+- Overlay toggles: clipping indicators for pixels the SDK clamped at the ends
+  of the calibrated range (saturated ones included) and min/max location
+  markers for the image and each ROI.
 - NUC / bad-pixel apply toggles when the recording carries embedded corrections.
 - Extract: trim a recording to a frame range (with optional decimation) into a
   new ATS file, with progress and cancel. Note: the File SDK only extracts
@@ -121,8 +122,8 @@ Notes on FileSDK 2026.1:
   executable bundles the newest copy found on the build machine; see
   *Standalone Windows release*.
 - ATS/SFMOV clocks carry no year, and the SDK dates them in 1976. The player
-  takes the year from the file's modification time and says so in the Source
-  panel.
+  takes the year from the file's modification time (a recording that runs
+  over New Year continues into the next year) and says so in the Source panel.
 - Set `FLIR_SDK_DEBUG=<log file>` to record what the DLL preload did.
 
 ## Run it

@@ -301,7 +301,7 @@ def test_roi_bitmask_export(qapp, tmp_path) -> None:
         window._add_roi("rect", ((10.0, 10.0), (60.0, 50.0)))
         assert wait_until(qapp, lambda: len(window.current_packet.roi_stats) == 1)
         finished: list[tuple[bool, str]] = []
-        window.decoder.export_finished.connect(lambda ok, msg: finished.append((ok, msg)))
+        window.decoder.bitmasks_finished.connect(lambda ok, msg: finished.append((ok, msg)))
         window.decoder.request_export_bitmasks(str(tmp_path))
         assert wait_until(qapp, lambda: len(finished) == 1, timeout=15.0)
         assert finished[0][0]

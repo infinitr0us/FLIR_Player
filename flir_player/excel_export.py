@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace as dataclass_replace  # run_export has a replace= argument
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -88,22 +88,36 @@ def save_roi_set(path: str | Path, roi_set: RoiSet) -> None:
 
 
 def load_roi_set(path: str | Path) -> RoiSet:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("format") != ROI_SET_FORMAT:
-        raise ValueError(f"{Path(path).name} is not a FLIR Thermal Player ROI set")
+    """Read a ROI set; anything malformed raises ValueError (or OSError)."""
+    name = Path(path).name
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))  # JSONDecodeError is a ValueError
+    if not isinstance(payload, dict) or payload.get("format") != ROI_SET_FORMAT:
+        raise ValueError(f"{name} is not a FLIR Thermal Player ROI set")
+    items = payload.get("rois", [])
+    if not isinstance(items, list):
+        raise ValueError(f"{name}: the ROI list is not valid")
     rois = []
-    for number, item in enumerate(payload.get("rois", ()), start=1):
-        kind = str(item["kind"])
-        points = tuple((float(x), float(y)) for x, y in item["points"])
-        if kind not in ROI_KINDS or len(points) != (1 if kind == "cursor" else 2):
-            raise ValueError(f"ROI {number} in {Path(path).name} is not valid")
-        rois.append(RoiShape(id=number, kind=kind, points=points,
-                             name=str(item.get("name") or f"ROI {number}")))
-    ignition = payload.get("ignition_frame")
-    size = payload.get("size")
-    return RoiSet(rois=tuple(rois), ignition_frame=None if ignition is None else int(ignition),
-                  recording=str(payload.get("recording", "")),
-                  size=tuple(int(v) for v in size) if size else None)
+    for number, item in enumerate(items, start=1):
+        try:
+            kind = str(item["kind"])
+            points = tuple((float(x), float(y)) for x, y in item["points"])
+            label = str(item.get("name") or f"ROI {number}")
+        except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
+            raise ValueError(f"ROI {number} in {name} is not valid") from exc
+        if (kind not in ROI_KINDS or len(points) != (1 if kind == "cursor" else 2)
+                or not all(math.isfinite(v) for point in points for v in point)):
+            raise ValueError(f"ROI {number} in {name} is not valid")
+        # names are shown on one line (readout badge, workbook headers)
+        label = " ".join(part.strip() for part in label.splitlines() if part.strip()) or f"ROI {number}"
+        rois.append(RoiShape(id=number, kind=kind, points=points, name=label))
+    try:
+        ignition = payload.get("ignition_frame")
+        size = payload.get("size")
+        return RoiSet(rois=tuple(rois), ignition_frame=None if ignition is None else int(ignition),
+                      recording=str(payload.get("recording", "")),
+                      size=tuple(int(v) for v in size) if size else None)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name}: the ignition frame or image size is not valid") from exc
 
 
 # --- request ------------------------------------------------------------------------
@@ -125,7 +139,10 @@ class ExportOptions:
     start_s: float | None = None  # seconds from ignition; None = earliest data
     end_s: float | None = None  # None = latest data
     step_s: float = 1.0
-    every_frame: bool = False  # one row per frame of the first recording
+    # one row per frame interval of the first recording (its mean rate): exactly
+    # one row per frame with the "frames" time base; with "clock" each row takes
+    # the frame nearest its time, so frames repeat or drop where the clock has gaps
+    every_frame: bool = False
     time_base: str = "frames"  # "frames": index / frame rate; "clock": camera timestamps
     extra_stats: tuple[str, ...] = ()
     pixel_limit: int = 400
@@ -244,17 +261,22 @@ def fit_pixel_limit(pixel_counts: list[int], options: ExportOptions) -> int:
 
 
 class _ClockSearch:
-    """Nearest-timestamp frame search on (non-decreasing) camera timestamps."""
+    """Nearest-timestamp frame search on (non-decreasing) camera timestamps.
 
-    def __init__(self, im: Any, n: int, origin: datetime):
+    ``repair`` maps raw SDK stamps to calendar time (``sdktime.TimestampRepair``);
+    ``origin`` must already be repaired.
+    """
+
+    def __init__(self, im: Any, n: int, origin: datetime, repair: Callable[[Any], Any] | None = None):
         self.im, self.n, self.origin = im, n, origin
+        self.repair = repair or (lambda stamp: stamp)
         self._seconds: dict[int, float] = {}
 
     def time(self, index: int) -> float:
         """Seconds of frame ``index`` from ``origin`` (the ignition frame's stamp)."""
         if index not in self._seconds:
             self.im.get_frame(int(index))
-            stamp = self.im.frame_info.time
+            stamp = self.repair(self.im.frame_info.time)
             self._seconds[index] = ((stamp - self.origin).total_seconds()
                                     if isinstance(stamp, datetime) else math.nan)
         return self._seconds[index]
@@ -371,9 +393,9 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         search = None
         if options.time_base == "clock":
             im.get_frame(max(0, min(n - 1, spec.ignition_frame)))
-            origin = im.frame_info.time
+            origin = repair(im.frame_info.time)
             if isinstance(origin, datetime):
-                search = _ClockSearch(im, n, origin)
+                search = _ClockSearch(im, n, origin, repair)
                 tolerance = 0.5 / fps
         rows = times.size
         data = []
@@ -575,12 +597,13 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
             reports.append(derive_calibration(im, spec.path, abort=abort))
         spans, rates, pixel_counts = [], [], []
         for spec, im in zip(specs, opened):
+            repair = TimestampRepair(spec.path)  # an ATS clock can roll over at New Year
             with preserved_state(im):
                 set_unit_safely(im, fnv.Unit.COUNTS)
                 n = int(im.num_frames)
-                first = _stamp(im, 0)
-                last = _stamp(im, n - 1)
-                ignition = _stamp(im, spec.ignition_frame)
+                first = _stamp(im, 0, repair)
+                last = _stamp(im, n - 1, repair)
+                ignition = _stamp(im, spec.ignition_frame, repair)
             span = (last - first).total_seconds() if first and last else 0.0
             fps = (n - 1) / span if n > 1 and span > 0 else 30.0
             rates.append(fps)
@@ -593,7 +616,7 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                              if shape.kind != "cursor"]
         pixel_limit = fit_pixel_limit([count for count in pixel_counts if count], options)
         if pixel_limit != options.pixel_limit:
-            options = replace(options, pixel_limit=pixel_limit)
+            options = dataclass_replace(options, pixel_limit=pixel_limit)
         times = timeline(spans, options, rates[0])
         total = times.size * len(specs) + 1
         done = 0
@@ -633,7 +656,7 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 pass
 
 
-def _stamp(im, index: int) -> datetime | None:
+def _stamp(im, index: int, repair: Callable[[Any], Any]) -> datetime | None:
     im.get_frame(int(index))
-    stamp = im.frame_info.time
+    stamp = repair(im.frame_info.time)
     return stamp if isinstance(stamp, datetime) else None

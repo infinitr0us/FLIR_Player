@@ -2248,7 +2248,8 @@ class InspectorPanel(QWidget):
         overlay_row.setSpacing(12)
         self.clipping_check = QCheckBox("Clipping")
         self.clipping_check.setChecked(True)
-        self.clipping_check.setToolTip("Highlight pixels outside the calibration range")
+        self.clipping_check.setToolTip("Highlight pixels the SDK clamped at the low or high limit "
+                                       "of the calibrated range (including saturated pixels)")
         self.markers_check = QCheckBox("Min/Max")
         self.markers_check.setToolTip("Mark min/max pixel locations of the image and ROIs")
         overlay_row.addWidget(self.clipping_check)

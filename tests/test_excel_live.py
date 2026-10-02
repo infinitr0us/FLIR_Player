@@ -26,6 +26,8 @@ from flir_player.workbook import write_workbook  # noqa: E402
 from test_excel_workbook import _source  # noqa: E402
 from test_radiometry import T650  # noqa: E402
 
+XL_NA = -2146826246  # #N/A as COM returns it (CVErr(xlErrNA))
+
 
 def _com(fn, *args):
     import pywintypes
@@ -72,8 +74,9 @@ def test_invalid_parameters_give_na_not_nonsense(excel, tmp_path) -> None:
         settings.Range("B10").Value = 100.0  # reflected temperature (°C)
         _com(excel.Calculate)
         values = [data.Cells(r, c).Value for r in range(6, 18) for c in (3, 5, 6, 7)]
-        numbers = [v for v in values if isinstance(v, float)]
-        assert all(v > -273.15 for v in numbers)
+        # every cell is a physical temperature or #N/A (COM returns errors as codes)
+        assert all((isinstance(v, float) and v > -273.15) or v == XL_NA for v in values), values
+        assert XL_NA in values  # ε 0.01 with a 100 °C surround leaves the curve's domain
         # clamping works on counts, so spots and pixel means agree on the clip range
         settings.Range("B5").Value = "Clamp like FLIR software"
         settings.Range("B9").Value = 0.1
@@ -128,11 +131,12 @@ def test_summary_window_uses_samples_inside_it(excel, tmp_path) -> None:
         book.Close(SaveChanges=False)
 
 
-def test_recalculation_keeps_every_recordings_own_parameters(excel, tmp_path) -> None:
+@pytest.mark.parametrize("transmission", [0.8, None])  # None: from distance, humidity, atmosphere
+def test_recalculation_keeps_every_recordings_own_parameters(excel, tmp_path, transmission) -> None:
     rng = np.random.default_rng(4)
     first, second = _source("Camera A", 14, rng), _source("Camera B", 14, rng)
     second.initial = second.initial.with_(atmosphere_k=333.15, humidity=0.8, emissivity=0.85,
-                                          transmission=0.8, reflected_k=313.15)
+                                          transmission=transmission, reflected_k=313.15)
     path, _ = _book(tmp_path, [first, second])
     cached = openpyxl.load_workbook(path, data_only=True)["Data"]
     before = [[cached.cell(r, c).value for c in range(3, 20)] for r in range(6, 18)]

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.2 — 2026-10-01
+
+A bug-fix release, mostly for the Excel workbook export, from a review of
+0.5.0 and 0.5.1. Measurements and file formats are unchanged.
+
+### Excel workbook
+
+- Exports with many area ROIs no longer fail with "TypeError: 'tuple' object
+  is not callable". When their pixels do not fit in Excel's 16,384 columns,
+  the larger areas are stored as bins, as intended.
+- The ROI charts show the thermocouple trace again. It is converted to the
+  display unit in a hidden helper column, which Excel left out of the chart.
+- A Validation sample outside the calibration curve no longer stops Excel
+  from opening the workbook without a repair. Such rows show #NUM!, and the
+  check reads CHECK unless the SDK clamped that sample.
+- A cancelled or failed export no longer leaves temporary files behind in the
+  Windows temp folder.
+- The TC Compare sheet's column limit only applies when that sheet is
+  included.
+- "Every frame" with camera timestamps is explained in the dialog and on the
+  Source sheet: rows follow the first recording's mean frame interval and
+  take the nearest frame, so a frame can repeat or be skipped where the
+  camera clock has gaps. With the frame-number time base there is exactly one
+  row per frame, as before.
+
+### Recordings and ROI sets
+
+- ATS/SFMOV recordings that run over New Year keep counting forward instead
+  of jumping back a year, in the player and in the workbook (the camera
+  clock's day counter restarts at 1).
+- Loading a file that is not a valid ROI set (another JSON file, wrong
+  types, non-finite coordinates) shows an error instead of doing nothing.
+  ROI names with line breaks are read as one line.
+
+### Player
+
+- A finished bitmask export can no longer close the progress dialog of an
+  export started after it.
+- No error message pops up while the player is closing.
+- The Clipping tooltip says what the overlay shows: pixels the SDK clamped at
+  the low or high end of the calibrated range, saturated ones included.
+
+### Under the hood
+
+- Bitmask exports report on their own `bitmasks_finished` signal.
+- `write_workbook` gives XlsxWriter a private temporary folder and removes it
+  however writing ends.
+- 34 new regression tests; the real-Excel tests also cover automatic
+  atmospheric transmission per recording.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.5.1...v0.5.2)
+
 ## 0.5.1 — 2026-09-26
 
 This release polishes the interface: the cursor readout works in every ROI

@@ -229,6 +229,7 @@ class MainWindow(QMainWindow):
         self.decoder.extract_finished.connect(self._on_extract_finished)
         self.decoder.export_progress.connect(self._on_export_progress)
         self.decoder.export_finished.connect(self._on_export_finished)
+        self.decoder.bitmasks_finished.connect(self._on_bitmasks_finished)
         self.decoder.busy_changed.connect(self._set_busy)
         self.decoder.failed.connect(self._on_decode_failed)
         self.decoder.open_failed.connect(self._on_open_failed)
@@ -1186,6 +1187,12 @@ class MainWindow(QMainWindow):
         elif message and message != "Export cancelled":
             self._show_error("Export failed", message)
 
+    def _on_bitmasks_finished(self, ok: bool, message: str) -> None:
+        if ok:
+            self._notify(message)
+        else:
+            self._show_error("Export failed", message)
+
     def _save_statistics(self) -> None:
         snapshot = self.bottom_panel.statistics.snapshot
         if snapshot is None:
@@ -1917,6 +1924,8 @@ class MainWindow(QMainWindow):
         # Owned by the player window: centred over it, and never by a job's
         # progress dialog, which the job's completion deletes (taking an
         # unread message with it).
+        if getattr(self, "_closing", False):
+            return  # quitting: a job failing on its way out needs no modal dialog
         MessageDialog.critical(self, title, message)
 
     def _notify(self, text: str) -> None:

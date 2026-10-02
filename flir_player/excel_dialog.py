@@ -147,6 +147,10 @@ class ExcelExportDialog(FramelessDialog):
         self.sampling_combo = ChevronComboBox()
         self.sampling_combo.addItem("Every … seconds", "seconds")
         self.sampling_combo.addItem("Every frame", "frame")
+        self.sampling_combo.setToolTip(
+            "Every frame: one row per frame of the first recording with the frame-number time base. "
+            "With camera timestamps the rows follow its mean frame interval and each takes the nearest "
+            "frame, so a frame can repeat or be skipped where the clock has gaps.")
         self.step_spin = QDoubleSpinBox()
         self.step_spin.setRange(0.001, 3600.0)
         self.step_spin.setDecimals(3)
