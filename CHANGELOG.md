@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.3 — 2026-10-05
+## 0.5.3 — 2026-10-04
 
 Fixes for FLIR A700 recordings saved by ResearchIR, found in the data of a
 battery fire test where an A700, a T650sc and thermocouples filmed the same
