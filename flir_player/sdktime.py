@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import FrameRate
 
@@ -89,29 +89,77 @@ def preset_frame_rate(im: Any) -> float:
 CAMERA_RATES = (60.0, 50.0, 30.0, 25.0, 20.0, 15.0, 10.0, 9.0, 7.5, 6.0, 5.0, 3.75, 3.0,
                 2.5, 2.0, 1.0)
 # Stored frames exceeding the clock span by this fraction: the stamps run slow.
-# Dropped frames only ever push the clock rate below the camera rate, and
 # 0.5 % stays clear of clock corrections (FLIR2229: 1 s jumps, 0.01 % overall).
 SLOW_CLOCK = (0.005, 0.03)
+# The typical frame interval must give the same rate to this fraction: slow
+# stamps lengthen every interval, while dropped frames leave most intervals at
+# the camera's own (higher) rate and only a few long ones.
+EVEN_INTERVALS = 0.05
 
 
-def frame_rate(stored_frames: int, span_seconds: float, preset_fps: float = 0.0) -> FrameRate:
+def frame_rate(stored_frames: int, span_seconds: float, preset_fps: float = 0.0,
+               typical_fps: float = 0.0) -> FrameRate:
     """The rate for frame-number time, from the stored frames and their clock span.
 
     Normally the clock's own average rate. ResearchIR's A700 recordings stamp
     their 30 Hz frames 32.8 ms apart, so their clock implies 30.48 fps and runs
     1.6 % slow against the camera (and against a TC logger and a second
-    camera). When no trusted preset rate exists and the clock rate sits
-    0.5–3 % above a camera rate, that camera rate is used instead.
+    camera). The camera rate is used instead when no trusted preset rate
+    exists, the clock rate sits 0.5-3 % above a camera rate, and the typical
+    frame interval (``typical_fps``, see ``typical_frame_rate``) agrees with the
+    average: a 60 Hz recording with a long dropout can also average 30.5 fps,
+    but its frames are still 1/60 s apart.
     """
     if stored_frames < 2 or not span_seconds > 0:
         return FrameRate(30.0)
     clock = (stored_frames - 1) / span_seconds
-    if preset_fps <= 0:
+    if preset_fps <= 0 and typical_fps > 0 and abs(typical_fps / clock - 1) <= EVEN_INTERVALS:
         low, high = SLOW_CLOCK
         for rate in CAMERA_RATES:
             if 1 + low < clock / rate <= 1 + high:
                 return FrameRate(rate, clock, rate)
     return FrameRate(clock, clock)
+
+
+def typical_frame_rate(stamp_at: Callable[[int], datetime | None], stored_frames: int,
+                       samples: int = 24) -> float:
+    """1 / median interval between consecutive frames at ``samples`` places (0 if unknown)."""
+    if stored_frames < 2:
+        return 0.0
+    intervals = []
+    for index in sorted({int(round(v)) for v in _spread(stored_frames - 2, samples)}):
+        a, b = stamp_at(index), stamp_at(index + 1)
+        if a is not None and b is not None:
+            seconds = (b - a).total_seconds()
+            if seconds > 0:
+                intervals.append(seconds)
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    middle = len(intervals) // 2
+    median = intervals[middle] if len(intervals) % 2 else 0.5 * (intervals[middle - 1] + intervals[middle])
+    return 1.0 / median
+
+
+def _spread(last: int, count: int) -> list[float]:
+    if count <= 1 or last <= 0:
+        return [0.0]
+    return [last * k / (count - 1) for k in range(count)]
+
+
+def recording_rate(im: Any, repair: Callable[[Any], Any] | None = None) -> FrameRate:
+    """``frame_rate`` of an open ImagerFile (moves its current frame)."""
+    repair = repair or (lambda stamp: stamp)
+    n = int(im.num_frames)
+
+    def stamp_at(index: int) -> datetime | None:
+        im.get_frame(int(index))
+        value = repair(im.frame_info.time)
+        return value if isinstance(value, datetime) else None
+
+    first, last = stamp_at(0), stamp_at(n - 1)
+    span = (last - first).total_seconds() if first is not None and last is not None else 0.0
+    return frame_rate(n, span, preset_frame_rate(im), typical_frame_rate(stamp_at, n))
 
 
 def _place(stamp: datetime, year: int) -> datetime:

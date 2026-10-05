@@ -21,7 +21,7 @@ import pytest
 from conftest import wait_until
 from flir_player.fff import describe_parameters, saved_object_parameters
 from flir_player.models import FrameRate
-from flir_player.sdktime import frame_rate
+from flir_player.sdktime import frame_rate, typical_frame_rate
 
 SAMPLES = Path(__file__).resolve().parents[1] / "local" / "data"
 CLIP = "a700_clip.seq"
@@ -34,7 +34,7 @@ CAMERA = {"emissivity": 0.95, "reflected_temp": 293.15, "atmosphere_temp": 293.1
 
 
 def test_slow_a700_clock_snaps_to_the_camera_rate() -> None:
-    rate = frame_rate(105_965, 3476.414)  # the whole 0922 A700 recording
+    rate = frame_rate(105_965, 3476.414, 0.0, 30.5)  # the whole 0922 A700 recording
     assert rate.corrected and rate.fps == 30.0
     assert rate.clock_fps == pytest.approx(30.4808, abs=1e-3)
     assert rate.clock_error == pytest.approx(0.016, abs=5e-4)
@@ -47,14 +47,37 @@ def test_slow_a700_clock_snaps_to_the_camera_rate() -> None:
     (3_048, 100.0, 30.0, 30.47),  # a trusted preset rate: cadence logic owns the case
 ])
 def test_other_clocks_are_kept(frames, span, preset, expected) -> None:
-    rate = frame_rate(frames, span, preset)
+    rate = frame_rate(frames, span, preset, (frames - 1) / span)
     assert not rate.corrected and rate.fps == pytest.approx(expected, abs=1e-3)
 
 
 @pytest.mark.parametrize("clock, camera", [(60.9, 60.0), (9.1, 9.0), (15.3, 15.0), (25.5, 25.0)])
 def test_slow_clocks_snap_to_the_nearest_camera_rate(clock, camera) -> None:
     frames = int(round(clock * 200)) + 1
-    assert frame_rate(frames, 200.0) == FrameRate(camera, pytest.approx(clock, abs=1e-6), camera)
+    assert frame_rate(frames, 200.0, 0.0, clock) == FrameRate(camera, pytest.approx(clock, abs=1e-6), camera)
+
+
+def test_dropped_frames_are_not_mistaken_for_a_slow_clock() -> None:
+    # 60 Hz with a 29.5 s outage averages 30.5 fps, but its frames are 1/60 s apart
+    assert not frame_rate(3051, 100.0, 0.0, 60.0).corrected
+    assert not frame_rate(3051, 100.0).corrected  # interval unknown: keep the clock
+    assert frame_rate(3051, 100.0, 0.0, 30.4).corrected
+
+
+def _stamps(intervals):
+    from datetime import datetime, timedelta
+    times = [datetime(2026, 9, 22, 11)]
+    for seconds in intervals:
+        times.append(times[-1] + timedelta(seconds=seconds))
+    return lambda index: times[index]
+
+
+def test_typical_frame_rate_is_the_median_interval() -> None:
+    jitter = [0.0328 + 0.003 * ((k % 7) - 3) / 3 for k in range(3000)]  # A700-like 29-36 ms
+    assert typical_frame_rate(_stamps(jitter), 3001) == pytest.approx(30.49, abs=0.5)
+    outage = [1 / 60] * 1525 + [29.5] + [1 / 60] * 1524
+    assert typical_frame_rate(_stamps(outage), 3051) == pytest.approx(60.0, rel=1e-4)
+    assert typical_frame_rate(lambda index: None, 100) == 0.0
 
 
 def test_degenerate_spans_fall_back_to_30_fps() -> None:
@@ -97,6 +120,24 @@ def test_non_overrides_are_ignored(tmp_path, attributes) -> None:
     assert saved_object_parameters(_with_tail(tmp_path, _workspace(attributes))) is None
 
 
+@pytest.mark.parametrize("xml", [
+    _workspace("override='true' emissivity='1' distance='3'"),  # single quotes
+    _workspace('override="true" emissivity="1" distance="3"').replace(
+        "<palette", '<!-- <objectParameters override="false" /> --><palette'),  # a comment first
+    _workspace('override="true" emissivity="1" distance="3"').replace(
+        '<palette name="Iron" />', "<palette>" + '<color value="#000000" />' * 12000 + "</palette>"),  # 300 KB
+], ids=["single-quotes", "comment-first", "300-KB-workspace"])
+def test_overrides_in_any_valid_xml_form_are_read(tmp_path, xml) -> None:
+    saved = saved_object_parameters(_with_tail(tmp_path, xml))
+    assert saved == {"emissivity": 1.0, "distance": 3.0}
+
+
+def test_entities_are_never_expanded(tmp_path) -> None:
+    xml = _workspace('override="true" emissivity="&e;"').replace(
+        "<workspaceFileSettings>", '<!DOCTYPE w [<!ENTITY e "1">]><workspaceFileSettings>')
+    assert saved_object_parameters(_with_tail(tmp_path, xml)) is None
+
+
 def test_files_without_a_workspace_are_ignored(tmp_path) -> None:
     assert saved_object_parameters(_with_tail(tmp_path, "")) is None
     assert saved_object_parameters(tmp_path / "missing.seq") is None
@@ -118,6 +159,7 @@ def test_a700_opens_with_camera_values_and_frame_time() -> None:
         assert source.read_object_parameters()["emissivity"] == pytest.approx(0.95)
         assert metadata.saved_parameters["emissivity"] == 1.0
         assert metadata.saved_parameters["distance"] == 3.0
+        assert metadata.saved_by == "ResearchIR"
         details = dict(metadata.source_details)
         assert details["Frame rate"] == "30.00 fps (camera rate)"
         assert "slow" in details["Timestamps"]
@@ -160,7 +202,7 @@ def test_a700_workbook_uses_the_camera_rate(tmp_path) -> None:
     assert frames == [1, 31, 61, 91, 121]  # 1-based, one row per 30 frames
     source = {book["Source"].cell(r, 1).value: book["Source"].cell(r, 2).value for r in range(1, 80)}
     assert source["Frame rate"] == "30.0000 fps (camera rate)"
-    assert source["Saved ResearchIR override (not used)"].startswith("ε 1.000 · 3 m · τ 1.000")
+    assert source["Saved ResearchIR override"].startswith("ε 1.000 · 3 m · τ 1.000")
     assert str(book["Validation"]["E4"].value).startswith("PASS")
 
 
@@ -174,6 +216,7 @@ def test_player_offers_the_saved_values(qapp) -> None:
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
         panel = window.inspector.params_panel
         assert panel.saved_button.isVisibleTo(panel)
+        assert panel.saved_button.text() == "Use Saved ResearchIR Values"
         assert "ResearchIR" in window.canvas.notice
         assert window.transport is not None and window.metadata.frame_timed
 
@@ -195,3 +238,41 @@ def test_player_offers_the_saved_values(qapp) -> None:
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_a700_clock_time_base_keeps_the_timestamps_rate(tmp_path) -> None:
+    openpyxl = pytest.importorskip("openpyxl")
+    from flir_player.excel_export import ExportOptions, SourceSpec, run_export
+    from flir_player.models import RoiShape
+
+    spot = (RoiShape(1, "cursor", ((320.5, 240.5),), "Spot"),)
+    for ignition in (0, 20):
+        dest = tmp_path / f"clock_{ignition}.xlsx"
+        run_export(dest, [SourceSpec(SAMPLES / CLIP, spot, ignition_frame=ignition)],
+                   ExportOptions(every_frame=True, time_base="clock", sheets=frozenset()))
+        book = openpyxl.load_workbook(dest, data_only=True)
+        counts = book["Counts"]
+        frames = [counts.cell(r, 2).value for r in range(6, 6 + 200)]
+        frames = [f for f in frames if isinstance(f, (int, float))]
+        # rows every mean clock interval (30.6 fps here), not every 1/30 s (147 rows); the
+        # nearest-stamp pick on jittery stamps may skip one frame and repeat another
+        assert len(frames) >= (150 if ignition == 0 else 149)  # the grid is anchored at ignition
+        assert len(set(frames)) >= 140
+        source = {book["Source"].cell(r, 1).value: book["Source"].cell(r, 2).value for r in range(1, 80)}
+        assert "This workbook follows them" in source["Note"]
+
+
+def test_workbook_says_which_parameters_it_starts_from(tmp_path) -> None:
+    openpyxl = pytest.importorskip("openpyxl")
+    from flir_player.excel_export import ExportOptions, SourceSpec, run_export
+    from flir_player.models import RoiShape
+
+    spot = (RoiShape(1, "cursor", ((320.5, 240.5),), "Spot"),)
+    saved = saved_object_parameters(SAMPLES / CLIP)
+    for parameters, expected in ((None, "camera's recorded values"), (saved, "starts from these values")):
+        dest = tmp_path / f"start_{expected[:6]}.xlsx"
+        run_export(dest, [SourceSpec(SAMPLES / CLIP, spot, parameters=parameters)],
+                   ExportOptions(step_s=1.0, sheets=frozenset()))
+        sheet = openpyxl.load_workbook(dest, data_only=True)["Source"]
+        rows = {sheet.cell(r, 1).value: sheet.cell(r, 2).value for r in range(1, 80)}
+        assert expected in rows["Saved ResearchIR override"]

@@ -338,6 +338,9 @@ class ExcelExportDialog(FramelessDialog):
         self.step_spin.setEnabled(self.sampling_combo.currentData() == "seconds")
         options = self.options()
         fps = self.metadata.nominal_fps or 30.0
+        rate = self.metadata.rate
+        if options.time_base == "clock" and rate is not None and rate.clock_fps > 0:
+            fps = rate.clock_fps  # rows follow the timestamps' own mean rate
         ignition = self.ignition_spin.value() - 1
         start = options.start_s if options.start_s is not None else -ignition / fps
         end = options.end_s if options.end_s is not None else (self.metadata.num_frames - 1 - ignition) / fps

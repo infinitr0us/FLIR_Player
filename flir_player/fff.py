@@ -21,10 +21,10 @@ applies an ``objectParameters override="true"`` from there on open.
 from __future__ import annotations
 
 import math
-import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 from .radiometry import AtmosphereConstants, Calibration, PlanckConstants, RangeLimits
 
@@ -159,7 +159,8 @@ def read_camera_info(path: str | Path, scan_bytes: int = _SCAN_BYTES) -> CameraI
     return None
 
 
-_TAIL_BYTES = 1 << 18
+_TAIL_BYTES = 8 << 20  # a workspace (palette, ROIs, settings) is ~12 KB; generous bound
+_END_TAG = b"</workspaceFileSettings>"
 # ResearchIR attribute → File SDK object-parameter field
 _SAVED_FIELDS = {
     "emissivity": "emissivity",
@@ -171,6 +172,33 @@ _SAVED_FIELDS = {
     "extOpticsTemp": "ext_optics_temp",
     "extOpticsTransmission": "ext_optics_transmission",
 }
+
+
+def _workspace(tail: bytes):
+    """The last ``workspaceFileSettings`` document in ``tail``, parsed, or None."""
+    end = tail.rfind(_END_TAG)
+    if end < 0:
+        return None
+    end += len(_END_TAG)
+    starts = []
+    for marker in (b"<?xml", b"<workspaceFileSettings"):
+        position = end
+        for _ in range(4):
+            position = tail.rfind(marker, 0, position)
+            if position < 0:
+                break
+            starts.append(position)
+    for start in sorted(set(starts), reverse=True):
+        document = tail[start:end]
+        if b"<!DOCTYPE" in document or b"<!ENTITY" in document:
+            return None  # no entity expansion from a recording's bytes
+        try:
+            root = ElementTree.fromstring(document)
+        except ElementTree.ParseError:
+            continue
+        if root.tag == "workspaceFileSettings":
+            return root
+    return None
 
 
 def saved_object_parameters(path: str | Path, tail_bytes: int = _TAIL_BYTES) -> dict[str, float] | None:
@@ -187,21 +215,15 @@ def saved_object_parameters(path: str | Path, tail_bytes: int = _TAIL_BYTES) -> 
             tail = handle.read()
     except OSError:
         return None
-    start = tail.rfind(b"<workspaceFileSettings")
-    if start < 0:
-        return None
-    match = re.search(rb"<objectParameters\b([^>]*)/?>", tail[start:])
-    if match is None:
-        return None
-    attributes = {key.decode("latin-1"): value.decode("latin-1")
-                  for key, value in re.findall(rb'(\w+)\s*=\s*"([^"]*)"', match.group(1))}
-    if attributes.get("override", "").strip().lower() != "true":
+    root = _workspace(tail)
+    element = root.find("objectParameters") if root is not None else None
+    if element is None or element.get("override", "").strip().lower() != "true":
         return None
     values: dict[str, float] = {}
     for name, field in _SAVED_FIELDS.items():
         try:
-            value = float(attributes[name])
-        except (KeyError, ValueError):
+            value = float(element.get(name, ""))
+        except ValueError:
             continue
         if math.isfinite(value):
             values[field] = value

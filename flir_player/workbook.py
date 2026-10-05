@@ -26,7 +26,7 @@ import numpy as np
 import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name, xl_rowcol_to_cell
 
-from .excel_export import AREA_STATS, EXCEL_COLUMNS, ExportData, RoiData, SourceData
+from .excel_export import AREA_STATS, EXCEL_COLUMNS, ExportData, RoiData, SourceData, same_parameters
 from .fff import describe_parameters
 from .jobs import JobCancelled
 from .radiometry import (
@@ -1253,15 +1253,24 @@ class _Writer:
             if info.get("saturation_threshold"):
                 fields.append(("Camera saturation threshold (counts)", info["saturation_threshold"]))
             if info.get("rate_corrected"):
-                fields.append(("Note", f"The camera timestamps imply {info['clock_fps']:.4f} fps: they run "
-                                       f"{(info['clock_fps'] / info['fps'] - 1) * 100:.1f} % slow, so times "
-                                       "come from the frame number at the camera rate. The clock columns "
-                                       "show the file's own (slow) timestamps."))
+                slow = (info["clock_fps"] / info["fps"] - 1) * 100
+                if self.data.options.time_base == "clock":
+                    note = (f"The camera timestamps imply {info['clock_fps']:.4f} fps, {slow:.1f} % slower than "
+                            "the camera rate. This workbook follows them (time base: camera timestamps); the "
+                            "frame-number time base would use the camera rate instead.")
+                else:
+                    note = (f"The camera timestamps imply {info['clock_fps']:.4f} fps: they run {slow:.1f} % "
+                            "slow, so times come from the frame number at the camera rate. The clock "
+                            "columns show the file's own (slow) timestamps.")
+                fields.append(("Note", note))
             if info.get("saved_parameters"):
-                fields.append(("Saved ResearchIR override (not used)",
+                start = ("the workbook starts from these values" if info.get("saved_parameters_used")
+                         else "the workbook starts from the camera's recorded values"
+                         if same_parameters(source.initial, source.file_parameters)
+                         else "the workbook starts from the values set in the player")
+                fields.append(("Saved ResearchIR override",
                                describe_parameters(info["saved_parameters"], source.report.file_parameters)
-                               + ". The workbook starts from the camera's values; ResearchIR shows the "
-                                 "recording with the saved ones."))
+                               + f". ResearchIR shows the recording with these; {start}."))
             if info.get("date_inferred"):
                 fields.append(("Note", "The ATS clock has no year: the date comes from the file's "
                                        "modification time; times of day are exact."))

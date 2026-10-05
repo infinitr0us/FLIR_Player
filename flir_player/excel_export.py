@@ -45,10 +45,10 @@ from .calibration import (
 )
 from .geometry import roi_coordinates
 from .jobs import JobCancelled, OutputTransaction
-from .models import RoiShape
+from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, count_status
 from .fff import saved_object_parameters
-from .sdktime import TimestampRepair, frame_rate, preset_frame_rate
+from .sdktime import TimestampRepair, recording_rate
 
 ROI_SET_FORMAT = "flir-player-roi-set"
 EXCEL_COLUMNS = 16_384
@@ -373,8 +373,11 @@ def _saturation_threshold(im: Any) -> float | None:
 
 def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: ExportOptions,
                    report: CalibrationReport, *, progress: Callable[[int], None] | None = None,
-                   abort: Callable[[], bool] | None = None) -> SourceData:
-    """Sample one recording on ``times``; the handle's state is restored after."""
+                   abort: Callable[[], bool] | None = None, rate: FrameRate | None = None) -> SourceData:
+    """Sample one recording on ``times``; the handle's state is restored after.
+
+    ``rate`` (``sdktime.recording_rate``) is measured here when not given.
+    """
     n = int(im.num_frames)
     height, width = int(im.height), int(im.width)
     rois = [shape for shape in spec.rois if roi_coordinates(shape, height, width)[0].size]
@@ -388,9 +391,10 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         for index in (0, n - 1):
             im.get_frame(index)
             stamps.append(repair(im.frame_info.time))
-        span = (stamps[1] - stamps[0]).total_seconds() if all(stamps) else 0.0
-        rate = frame_rate(n, span, preset_frame_rate(im))
+        if rate is None:
+            rate = recording_rate(im, repair)
         fps = rate.fps
+        clock_fps = rate.clock_fps or fps  # camera timestamps: their own mean rate
         frames = frames_for(times, spec.ignition_frame, fps, n)
         search = None
         if options.time_base == "clock":
@@ -398,7 +402,7 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
             origin = repair(im.frame_info.time)
             if isinstance(origin, datetime):
                 search = _ClockSearch(im, n, origin, repair)
-                tolerance = 0.5 / fps
+                tolerance = 0.5 / clock_fps
         rows = times.size
         data = []
         for shape, (ys, _xs) in zip(rois, coordinates):
@@ -420,7 +424,7 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
                 raise JobCancelled("Export cancelled")
             frame = int(frames[row])
             if search is not None:
-                guess = spec.ignition_frame + int(round(times[row] * fps))
+                guess = spec.ignition_frame + int(round(times[row] * clock_fps))
                 frame = search.nearest(float(times[row]), guess, tolerance)
                 frames[row] = frame
             if frame < 0:
@@ -463,10 +467,25 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
                                                   rel_tol=1e-5, abs_tol=1e-5)
                                  for key, value in saved.items()):
         info["saved_parameters"] = saved
+        info["saved_parameters_used"] = same_parameters(MeasurementParameters.from_sdk(saved), initial)
     return SourceData(spec=spec, label=spec.label or info["camera_short"], info=info, fps=fps,
                       num_frames=n, frames=frames, clock=clock, rois=data, report=report,
                       initial=initial, file_parameters=file_parameters,
                       validation_rows=validation_rows, map_png=map_png)
+
+
+def same_parameters(a: MeasurementParameters, b: MeasurementParameters) -> bool:
+    """True when two parameter sets give the same temperatures (to float tolerance)."""
+    def close(x, y) -> bool:
+        if x is None or y is None:
+            return x is y
+        return math.isclose(float(x), float(y), rel_tol=1e-5, abs_tol=1e-5)
+    fields = ("emissivity", "reflected_k", "atmosphere_k", "transmission", "window_transmission", "window_k")
+    if not all(close(getattr(a, name), getattr(b, name)) for name in fields):
+        return False
+    if a.transmission is None:  # automatic transmission also depends on distance and humidity
+        return close(a.distance_m, b.distance_m) and close(a.humidity, b.humidity)
+    return True
 
 
 def _validation_rows(frames: np.ndarray, count: int) -> np.ndarray:
@@ -604,7 +623,7 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
             if abort():
                 raise JobCancelled("Export cancelled")
             reports.append(derive_calibration(im, spec.path, abort=abort))
-        spans, rates, pixel_counts = [], [], []
+        spans, rates, pixel_counts, measured = [], [], [], []
         for spec, im in zip(specs, opened):
             repair = TimestampRepair(spec.path)  # an ATS clock can roll over at New Year
             with preserved_state(im):
@@ -613,9 +632,11 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 first = _stamp(im, 0, repair)
                 last = _stamp(im, n - 1, repair)
                 ignition = _stamp(im, spec.ignition_frame, repair)
-            span = (last - first).total_seconds() if first and last else 0.0
-            fps = frame_rate(n, span, preset_frame_rate(im)).fps
-            rates.append(fps)
+                rate = recording_rate(im, repair)
+            measured.append(rate)
+            fps = rate.fps
+            # rows every frame interval: the frame rate, or the clock's mean rate
+            rates.append(rate.clock_fps if options.time_base == "clock" and rate.clock_fps > 0 else fps)
             if options.time_base == "clock" and first and last and ignition:
                 spans.append(((first - ignition).total_seconds(), (last - ignition).total_seconds()))
             else:
@@ -631,14 +652,14 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
         done = 0
         sources = []
         labels_seen: dict[str, int] = {}
-        for spec, im, report in zip(specs, opened, reports):
+        for spec, im, report, rate in zip(specs, opened, reports, measured):
             offset = done
 
             def tick(value, offset=offset):
                 if progress is not None:
                     progress(offset + value, total)
 
-            source = collect_source(im, spec, times, options, report, progress=tick, abort=abort)
+            source = collect_source(im, spec, times, options, report, progress=tick, abort=abort, rate=rate)
             count = labels_seen.get(source.label, 0) + 1
             labels_seen[source.label] = count
             if count > 1:

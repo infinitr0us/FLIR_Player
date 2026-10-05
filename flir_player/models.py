@@ -114,9 +114,11 @@ class VideoMetadata:
     source_details: tuple[tuple[str, str], ...] = ()
     cadence: CadenceInfo | None = None
     rate: FrameRate | None = None
-    # Object parameters saved in the file by FLIR software (a ResearchIR
-    # workspace override) that differ from the camera's; not applied at open.
+    # Object parameters the SDK applied on open from settings saved in the file
+    # (a ResearchIR workspace override) where they differ from the camera's
+    # recorded values; the player opens with the camera's values instead.
     saved_parameters: dict[str, float] | None = None
+    saved_by: str = ""  # "ResearchIR" when its workspace XML holds the override
 
     @property
     def filename(self) -> str:

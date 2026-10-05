@@ -1871,6 +1871,10 @@ class ColorScaleWidget(QWidget):
         super().mouseReleaseEvent(event)
 
 
+def saved_button_text(saved_by: str) -> str:
+    return "Use Saved ResearchIR Values" if saved_by == "ResearchIR" else "Use Saved Software Values"
+
+
 class ObjectParametersPanel(QFrame):
     """Editable measurement (object) parameters, ResearchIR §4.8.1 style."""
 
@@ -1988,14 +1992,16 @@ class ObjectParametersPanel(QFrame):
             spin.blockSignals(False)
             self._displayed[key] = spin.value()
 
-    def set_saved_parameters(self, values: dict | None) -> None:
-        """Offer the object parameters a ResearchIR workspace saved in the file."""
+    def set_saved_parameters(self, values: dict | None, saved_by: str = "ResearchIR") -> None:
+        """Offer the object parameters saved in the file (e.g. a ResearchIR workspace)."""
         self._saved = dict(values) if values else None
         self.saved_button.setVisible(self._saved is not None)
         if self._saved is not None:
+            self.saved_button.setText(saved_button_text(saved_by))
+            who = "ResearchIR" if saved_by == "ResearchIR" else "FLIR software"
             self.saved_button.setToolTip(
-                "Apply the object parameters ResearchIR saved in this file ("
-                f"{describe_parameters(self._saved)}). ResearchIR shows the recording with them; "
+                f"Apply the object parameters {who} saved in this file ("
+                f"{describe_parameters(self._saved)}). {who} shows the recording with them; "
                 "the player opens with the camera's values.")
 
     def _apply_saved(self) -> None:
@@ -2712,8 +2718,8 @@ class InspectorPanel(QWidget):
     def set_object_parameters(self, snapshot: dict) -> None:
         self.params_panel.set_parameters(snapshot)
 
-    def set_saved_parameters(self, values: dict | None) -> None:
-        self.params_panel.set_saved_parameters(values)
+    def set_saved_parameters(self, values: dict | None, saved_by: str = "ResearchIR") -> None:
+        self.params_panel.set_saved_parameters(values, saved_by)
 
     def set_corrections(self, state: dict) -> None:
         """Show correction toggles only when the file carries them (§4.7)."""

@@ -22,7 +22,7 @@ import numpy as np
 
 from .calibration import set_unit_safely
 from .fff import describe_parameters, saved_object_parameters
-from .sdktime import TimestampRepair, frame_rate, preset_frame_rate
+from .sdktime import TimestampRepair, preset_frame_rate, recording_rate
 from .models import (
     CadenceInfo,
     FramePacket,
@@ -346,7 +346,7 @@ class FlirVideoSource:
             self._im = fnv.file.ImagerFile(str(resolved))
             if self._im.num_frames <= 0:
                 raise ValueError("The recording contains no frames")
-            saved_parameters = self._undo_saved_override(resolved)
+            saved_parameters, saved_by = self._undo_saved_override(resolved)
 
             supported_sdk_units = set(self._im.supported_units)
             self._available_units = tuple(
@@ -369,14 +369,14 @@ class FlirVideoSource:
             last_time = self._timestamp_for_frame(last_index) if last_index else first_time
             self._first_packet = first_packet
             duration = self._duration(first_time, last_time)
-            rate = frame_rate(int(self._im.num_frames), duration, preset_frame_rate(self._im))
+            rate = recording_rate(self._im, self._clock)
             nominal_fps = rate.fps
 
             cadence = _cadence_info(self._im, duration, int(self._im.num_frames))
             source_info = self._im.source_info
             saved_rows = ()
             if saved_parameters is not None:
-                saved_rows = (("Saved settings", "ResearchIR override, not applied: "
+                saved_rows = (("Saved settings", f"{saved_by} override, not applied: "
                                + describe_parameters(saved_parameters, self.read_object_parameters())),)
             self._metadata = VideoMetadata(
                 path=resolved,
@@ -398,6 +398,7 @@ class FlirVideoSource:
                 cadence=cadence,
                 rate=rate,
                 saved_parameters=saved_parameters,
+                saved_by=saved_by,
             )
             return self._metadata
         except Exception:
@@ -1002,24 +1003,23 @@ class FlirVideoSource:
         snapshot["can_change"] = bool(self._im.can_change_object_parameters)
         return snapshot
 
-    def _undo_saved_override(self, path: Path) -> dict[str, float] | None:
+    def _undo_saved_override(self, path: Path) -> tuple[dict[str, float] | None, str]:
         """Open with the camera's object parameters, not a saved software override.
 
         A ResearchIR workspace saved in the file can override the object
         parameters every frame records (the 0922 A700 test: ε 1, 3 m, τ 1
         over the camera's ε 0.95, 1 m), and the SDK applies it on open. The
         player starts from the camera's values instead, as "Reset" and the
-        Excel export do, and returns the override when it differs so it can
-        be offered.
+        Excel export do. Whatever the SDK applied is returned when it differs,
+        so it can be offered, with its origin for the labels.
         """
-        saved = saved_object_parameters(path)
-        if saved is None:
-            return None
+        opened = self.read_object_parameters()
         self._im.reset_object_parameters()
         camera = self.read_object_parameters()
-        differs = any(not math.isclose(value, camera[key], rel_tol=1e-5, abs_tol=1e-5)
-                      for key, value in saved.items() if key in camera)
-        return saved if differs else None
+        saved = {key: opened[key] for key in OBJECT_PARAMETER_FIELDS}
+        if all(math.isclose(value, camera[key], rel_tol=1e-5, abs_tol=1e-5) for key, value in saved.items()):
+            return None, ""
+        return saved, "ResearchIR" if saved_object_parameters(path) is not None else "FLIR software"
 
     def apply_object_parameters(self, values: dict[str, float] | None) -> dict[str, Any]:
         """Apply edited object parameters (None resets to file defaults).

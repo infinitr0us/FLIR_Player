@@ -82,6 +82,7 @@ from .widgets import (
     ThermalCanvas,
     TitleBar,
     TransportBar,
+    saved_button_text,
 )
 
 
@@ -1608,10 +1609,11 @@ class MainWindow(QMainWindow):
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)
-        self.inspector.set_saved_parameters(metadata.saved_parameters)
+        self.inspector.set_saved_parameters(metadata.saved_parameters, metadata.saved_by)
         if metadata.saved_parameters is not None:
-            self._notify("Opened with the camera's object parameters. The file's saved ResearchIR "
-                         "override is not applied: Measurement → Use Saved ResearchIR Values.")
+            who = "ResearchIR" if metadata.saved_by == "ResearchIR" else "software"
+            self._notify(f"Opened with the camera's object parameters. The file's saved {who} "
+                         f"override is not applied: Measurement → {saved_button_text(metadata.saved_by)}.")
         self.transport.set_cadence(metadata.cadence)
         self.transport.set_video(metadata.num_frames, metadata.duration_seconds)
         self.inspector.set_median_size_cap(
