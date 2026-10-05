@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
 )
 
 from .settings import app_settings
+from .fff import describe_parameters
 from .geometry import area_extent, pixel_index
 from .models import ROI_COLORS, ROI_KIND_LABELS, CadenceInfo, UnitOption, VideoMetadata
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
@@ -1931,11 +1932,19 @@ class ObjectParametersPanel(QFrame):
             "Estimated atmospheric transmission (0 = compute automatically)"
         )
 
-        self.reset_button = QPushButton("Reset to File Values")
+        self.reset_button = QPushButton("Reset to Camera Values")
         self.reset_button.setProperty("variant", "ghost")
-        self.reset_button.setToolTip("Restore the object parameters stored in the recording")
+        self.reset_button.setToolTip("Restore the object parameters the camera recorded in the file")
         self.reset_button.clicked.connect(self.reset_requested)
         layout.addWidget(self.reset_button)
+
+        # Only for files that also carry a saved ResearchIR override.
+        self._saved: dict | None = None
+        self.saved_button = QPushButton("Use Saved ResearchIR Values")
+        self.saved_button.setProperty("variant", "ghost")
+        self.saved_button.clicked.connect(self._apply_saved)
+        self.saved_button.setVisible(False)
+        layout.addWidget(self.saved_button)
 
     def _field_row(
         self,
@@ -1978,6 +1987,20 @@ class ObjectParametersPanel(QFrame):
             spin.setValue(float(snapshot[key]) / self._scales[key])
             spin.blockSignals(False)
             self._displayed[key] = spin.value()
+
+    def set_saved_parameters(self, values: dict | None) -> None:
+        """Offer the object parameters a ResearchIR workspace saved in the file."""
+        self._saved = dict(values) if values else None
+        self.saved_button.setVisible(self._saved is not None)
+        if self._saved is not None:
+            self.saved_button.setToolTip(
+                "Apply the object parameters ResearchIR saved in this file ("
+                f"{describe_parameters(self._saved)}). ResearchIR shows the recording with them; "
+                "the player opens with the camera's values.")
+
+    def _apply_saved(self) -> None:
+        if self._saved is not None and self._snapshot.get("can_change", True):
+            self.applied.emit(dict(self._saved))
 
     def _emit_applied(self, key: str | None = None) -> None:
         if not self._snapshot.get("can_change", True):
@@ -2688,6 +2711,9 @@ class InspectorPanel(QWidget):
 
     def set_object_parameters(self, snapshot: dict) -> None:
         self.params_panel.set_parameters(snapshot)
+
+    def set_saved_parameters(self, values: dict | None) -> None:
+        self.params_panel.set_saved_parameters(values)
 
     def set_corrections(self, state: dict) -> None:
         """Show correction toggles only when the file carries them (§4.7)."""

@@ -1608,6 +1608,10 @@ class MainWindow(QMainWindow):
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)
+        self.inspector.set_saved_parameters(metadata.saved_parameters)
+        if metadata.saved_parameters is not None:
+            self._notify("Opened with the camera's object parameters. The file's saved ResearchIR "
+                         "override is not applied: Measurement → Use Saved ResearchIR Values.")
         self.transport.set_cadence(metadata.cadence)
         self.transport.set_video(metadata.num_frames, metadata.duration_seconds)
         self.inspector.set_median_size_cap(
@@ -1743,7 +1747,8 @@ class MainWindow(QMainWindow):
         self._update_statistics()
 
     def _frame_interval(self, current: FramePacket, following: FramePacket) -> float:
-        if current.timestamp is not None and following.timestamp is not None:
+        frame_timed = self.metadata is not None and self.metadata.frame_timed
+        if current.timestamp is not None and following.timestamp is not None and not frame_timed:
             try:
                 delta = (following.timestamp - current.timestamp).total_seconds()
                 if 0.001 <= delta <= 1.0:
@@ -1757,6 +1762,7 @@ class MainWindow(QMainWindow):
     def _playback_target_seconds(self, packet: FramePacket) -> float:
         if (
             not self.constant_rate
+            and not (self.metadata is not None and self.metadata.frame_timed)
             and self._playback_anchor_timestamp is not None
             and packet.timestamp is not None
         ):

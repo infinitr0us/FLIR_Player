@@ -74,6 +74,30 @@ class CadenceInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameRate:
+    """The rate that turns frame numbers into seconds (``sdktime.frame_rate``).
+
+    ``clock_fps`` is the rate the first and last timestamps imply (0 when
+    unknown). ``camera_fps`` is set when those timestamps run slow: more frames
+    were stored than their span allows at any camera rate, so ``fps`` is the
+    nominal camera rate instead and frame times come from the frame number.
+    """
+
+    fps: float
+    clock_fps: float = 0.0
+    camera_fps: float = 0.0
+
+    @property
+    def corrected(self) -> bool:
+        return self.camera_fps > 0
+
+    @property
+    def clock_error(self) -> float:
+        """How far the timestamps run slow, as a fraction (0.016 = 1.6 %)."""
+        return self.clock_fps / self.camera_fps - 1.0 if self.corrected else 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class VideoMetadata:
     """Metadata needed by the player without retaining the SDK object."""
 
@@ -89,10 +113,19 @@ class VideoMetadata:
     camera_serial: str = ""
     source_details: tuple[tuple[str, str], ...] = ()
     cadence: CadenceInfo | None = None
+    rate: FrameRate | None = None
+    # Object parameters saved in the file by FLIR software (a ResearchIR
+    # workspace override) that differ from the camera's; not applied at open.
+    saved_parameters: dict[str, float] | None = None
 
     @property
     def filename(self) -> str:
         return self.path.name
+
+    @property
+    def frame_timed(self) -> bool:
+        """True when seconds come from frame numbers, not the (slow) timestamps."""
+        return self.rate is not None and self.rate.corrected
 
     def fallback_seconds_for_frame(self, index: int) -> float:
         if self.nominal_fps <= 0:

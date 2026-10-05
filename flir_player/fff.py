@@ -12,9 +12,16 @@ CSQ files: a 64-byte header ("FFF\\0", creator, version at 0x14 deciding the
 header byte order, directory offset and entry count), 32-byte directory
 entries (type 0x20 = CameraInfo), and a CameraInfo record whose first 16-bit
 word is 2 in its own byte order. Only the start of the file is read.
+
+``saved_object_parameters`` reads the other end of the file: ResearchIR keeps
+its workspace settings (palette, ROIs, object parameters) as XML in a record
+of the last frame (type 0xF06; also at the end of ATS files). The File SDK
+applies an ``objectParameters override="true"`` from there on open.
 """
 from __future__ import annotations
 
+import math
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,3 +157,83 @@ def read_camera_info(path: str | Path, scan_bytes: int = _SCAN_BYTES) -> CameraI
             pass
         position = magic_at + 4
     return None
+
+
+_TAIL_BYTES = 1 << 18
+# ResearchIR attribute → File SDK object-parameter field
+_SAVED_FIELDS = {
+    "emissivity": "emissivity",
+    "reflectedTemp": "reflected_temp",
+    "atmosphereTemp": "atmosphere_temp",
+    "estAtmosphericTransmission": "est_atmospheric_transmission",
+    "distance": "distance",
+    "relativeHumidity": "relative_humidity",
+    "extOpticsTemp": "ext_optics_temp",
+    "extOpticsTransmission": "ext_optics_transmission",
+}
+
+
+def saved_object_parameters(path: str | Path, tail_bytes: int = _TAIL_BYTES) -> dict[str, float] | None:
+    """Object parameters a ResearchIR workspace saved as an override, or None.
+
+    Only an ``override="true"`` block counts (the SDK ignores the others);
+    values use the SDK's field names and units. Never raises.
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - tail_bytes))
+            tail = handle.read()
+    except OSError:
+        return None
+    start = tail.rfind(b"<workspaceFileSettings")
+    if start < 0:
+        return None
+    match = re.search(rb"<objectParameters\b([^>]*)/?>", tail[start:])
+    if match is None:
+        return None
+    attributes = {key.decode("latin-1"): value.decode("latin-1")
+                  for key, value in re.findall(rb'(\w+)\s*=\s*"([^"]*)"', match.group(1))}
+    if attributes.get("override", "").strip().lower() != "true":
+        return None
+    values: dict[str, float] = {}
+    for name, field in _SAVED_FIELDS.items():
+        try:
+            value = float(attributes[name])
+        except (KeyError, ValueError):
+            continue
+        if math.isfinite(value):
+            values[field] = value
+    if not values or not 0 < values.get("emissivity", 1.0) <= 1:
+        return None
+    return values
+
+
+def describe_parameters(values: dict[str, float], reference: dict[str, float] | None = None) -> str:
+    """Short text for object parameters, e.g. "ε 1.000 · 3.0 m · τ 1.000".
+
+    With ``reference`` only the values that differ from it are listed.
+    """
+    def kelvin(value: float) -> str:
+        return f"{value - 273.15:.1f} °C"
+
+    formats = (
+        ("emissivity", lambda v: f"ε {v:.3f}"),
+        ("distance", lambda v: f"{v:g} m"),
+        ("est_atmospheric_transmission", lambda v: "τ auto" if v <= 0 else f"τ {v:.3f}"),
+        ("reflected_temp", lambda v: f"reflected {kelvin(v)}"),
+        ("atmosphere_temp", lambda v: f"atmosphere {kelvin(v)}"),
+        ("relative_humidity", lambda v: f"RH {v * 100:.0f} %"),
+        ("ext_optics_temp", lambda v: f"window {kelvin(v)}"),
+        ("ext_optics_transmission", lambda v: f"window τ {v:.3f}"),
+    )
+    parts = []
+    for key, text in formats:
+        if key not in values:
+            continue
+        if reference is not None and key in reference and math.isclose(
+                values[key], reference[key], rel_tol=1e-5, abs_tol=1e-5):
+            continue
+        parts.append(text(values[key]))
+    return " · ".join(parts)

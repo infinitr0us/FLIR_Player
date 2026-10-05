@@ -47,7 +47,8 @@ from .geometry import roi_coordinates
 from .jobs import JobCancelled, OutputTransaction
 from .models import RoiShape
 from .radiometry import MeasurementParameters, count_status
-from .sdktime import TimestampRepair
+from .fff import saved_object_parameters
+from .sdktime import TimestampRepair, frame_rate, preset_frame_rate
 
 ROI_SET_FORMAT = "flir-player-roi-set"
 EXCEL_COLUMNS = 16_384
@@ -388,7 +389,8 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
             im.get_frame(index)
             stamps.append(repair(im.frame_info.time))
         span = (stamps[1] - stamps[0]).total_seconds() if all(stamps) else 0.0
-        fps = (n - 1) / span if n > 1 and span > 0 else 30.0
+        rate = frame_rate(n, span, preset_frame_rate(im))
+        fps = rate.fps
         frames = frames_for(times, spec.ignition_frame, fps, n)
         search = None
         if options.time_base == "clock":
@@ -454,6 +456,13 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
     initial = MeasurementParameters.from_sdk(spec.parameters) if spec.parameters else file_parameters
     info = _source_info(im, spec, fps, stamps, report, saturation)
     info["date_inferred"] = repair.repaired
+    info["clock_fps"] = rate.clock_fps
+    info["rate_corrected"] = rate.corrected
+    saved = saved_object_parameters(spec.path)
+    if saved is not None and any(not math.isclose(value, report.file_parameters.get(key, value),
+                                                  rel_tol=1e-5, abs_tol=1e-5)
+                                 for key, value in saved.items()):
+        info["saved_parameters"] = saved
     return SourceData(spec=spec, label=spec.label or info["camera_short"], info=info, fps=fps,
                       num_frames=n, frames=frames, clock=clock, rois=data, report=report,
                       initial=initial, file_parameters=file_parameters,
@@ -605,7 +614,7 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 last = _stamp(im, n - 1, repair)
                 ignition = _stamp(im, spec.ignition_frame, repair)
             span = (last - first).total_seconds() if first and last else 0.0
-            fps = (n - 1) / span if n > 1 and span > 0 else 30.0
+            fps = frame_rate(n, span, preset_frame_rate(im)).fps
             rates.append(fps)
             if options.time_base == "clock" and first and last and ignition:
                 spans.append(((first - ignition).total_seconds(), (last - ignition).total_seconds()))

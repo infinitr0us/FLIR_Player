@@ -430,7 +430,9 @@ def format_time(seconds: float) -> str:
 
 
 def frame_seconds(packet_timestamp, metadata, frame_index: int) -> float:
-    if packet_timestamp is not None and metadata.start_time is not None:
+    """Seconds from the first frame: from the timestamps unless they run slow."""
+    if (packet_timestamp is not None and metadata.start_time is not None
+            and not getattr(metadata, "frame_timed", False)):
         try:
             value = (packet_timestamp - metadata.start_time).total_seconds()
             if value >= 0:

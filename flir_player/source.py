@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -20,10 +21,12 @@ except ModuleNotFoundError:  # Let this module import without the SDK present.
 import numpy as np
 
 from .calibration import set_unit_safely
-from .sdktime import TimestampRepair
+from .fff import describe_parameters, saved_object_parameters
+from .sdktime import TimestampRepair, frame_rate, preset_frame_rate
 from .models import (
     CadenceInfo,
     FramePacket,
+    FrameRate,
     RoiShape,
     RoiStats,
     UnitOption,
@@ -124,23 +127,7 @@ def _pretty_value(value: Any) -> str:
     return str(value)
 
 
-def _base_frame_rate(im: Any) -> float:
-    """Camera rate of the recording's active preset, or 0.0 when unknown.
-
-    Only presets that are both available and flag ``frame_rate_valid`` are
-    trusted: the SDK leaves a placeholder 1.0/30.0 in ``frame_rate`` otherwise,
-    and a made-up base rate would produce a made-up dropped-frame count.
-    """
-    info = getattr(im, "source_info", None)
-    for preset in getattr(info, "preset_info", ()) or ():
-        if getattr(preset, "available", False) and getattr(preset, "frame_rate_valid", False):
-            try:
-                rate = float(preset.frame_rate)
-            except (TypeError, ValueError):
-                continue
-            if rate > 0:
-                return rate
-    return 0.0
+_base_frame_rate = preset_frame_rate  # kept for callers of the old name
 
 
 def _cadence_info(im: Any, span_seconds: float, stored_frames: int) -> CadenceInfo | None:
@@ -150,7 +137,7 @@ def _cadence_info(im: Any, span_seconds: float, stored_frames: int) -> CadenceIn
     decodes — scanning every frame's timestamp would mean a full decode pass
     (~100 s for the 19302-frame CSQ sample).
     """
-    base_fps = _base_frame_rate(im)
+    base_fps = preset_frame_rate(im)
     if base_fps <= 0 or span_seconds <= 0 or stored_frames < 2:
         return None
     expected = int(round(span_seconds * base_fps)) + 1
@@ -163,10 +150,15 @@ def _cadence_info(im: Any, span_seconds: float, stored_frames: int) -> CadenceIn
     )
 
 
-def _cadence_rows(cadence: CadenceInfo | None, average_fps: float) -> tuple[tuple[str, str], ...]:
+def _cadence_rows(cadence: CadenceInfo | None, average_fps: float,
+                  rate: FrameRate | None = None) -> tuple[tuple[str, str], ...]:
     """Source-panel rows describing the recording's frame rate and evenness."""
     rows: list[tuple[str, str]] = []
-    if average_fps > 0:
+    if rate is not None and rate.corrected:
+        rows.append(("Frame rate", f"{rate.fps:.2f} fps (camera rate)"))
+        rows.append(("Timestamps", f"Run {rate.clock_error * 100:.1f} % slow ({rate.clock_fps:.2f} fps "
+                                   f"implied); times use the frame number"))
+    elif average_fps > 0:
         if cadence is not None and not cadence.is_even:
             rows.append(
                 (
@@ -354,6 +346,7 @@ class FlirVideoSource:
             self._im = fnv.file.ImagerFile(str(resolved))
             if self._im.num_frames <= 0:
                 raise ValueError("The recording contains no frames")
+            saved_parameters = self._undo_saved_override(resolved)
 
             supported_sdk_units = set(self._im.supported_units)
             self._available_units = tuple(
@@ -376,10 +369,15 @@ class FlirVideoSource:
             last_time = self._timestamp_for_frame(last_index) if last_index else first_time
             self._first_packet = first_packet
             duration = self._duration(first_time, last_time)
-            nominal_fps = (last_index / duration) if last_index > 0 and duration > 0 else 30.0
+            rate = frame_rate(int(self._im.num_frames), duration, preset_frame_rate(self._im))
+            nominal_fps = rate.fps
 
             cadence = _cadence_info(self._im, duration, int(self._im.num_frames))
             source_info = self._im.source_info
+            saved_rows = ()
+            if saved_parameters is not None:
+                saved_rows = (("Saved settings", "ResearchIR override, not applied: "
+                               + describe_parameters(saved_parameters, self.read_object_parameters())),)
             self._metadata = VideoMetadata(
                 path=resolved,
                 width=int(self._im.width),
@@ -387,15 +385,19 @@ class FlirVideoSource:
                 num_frames=int(self._im.num_frames),
                 start_time=first_time,
                 end_time=last_time,
-                duration_seconds=duration if duration > 0 else last_index / nominal_fps,
+                duration_seconds=(last_index / nominal_fps if rate.corrected or duration <= 0
+                                  else duration),
                 nominal_fps=float(nominal_fps),
                 camera_model=str(getattr(source_info, "camera_model", "") or ""),
                 camera_serial=str(getattr(source_info, "camera_serial", "") or ""),
-                source_details=_cadence_rows(cadence, float(nominal_fps))
+                source_details=_cadence_rows(cadence, float(nominal_fps), rate)
                 + ((("Recording date", "From the file's modification time (the ATS clock has no year)"),)
                    if self._clock.repaired else ())
+                + saved_rows
                 + _source_details(self._im),
                 cadence=cadence,
+                rate=rate,
+                saved_parameters=saved_parameters,
             )
             return self._metadata
         except Exception:
@@ -999,6 +1001,25 @@ class FlirVideoSource:
         snapshot["atmospheric_transmission"] = float(params.atmospheric_transmission)
         snapshot["can_change"] = bool(self._im.can_change_object_parameters)
         return snapshot
+
+    def _undo_saved_override(self, path: Path) -> dict[str, float] | None:
+        """Open with the camera's object parameters, not a saved software override.
+
+        A ResearchIR workspace saved in the file can override the object
+        parameters every frame records (the 0922 A700 test: ε 1, 3 m, τ 1
+        over the camera's ε 0.95, 1 m), and the SDK applies it on open. The
+        player starts from the camera's values instead, as "Reset" and the
+        Excel export do, and returns the override when it differs so it can
+        be offered.
+        """
+        saved = saved_object_parameters(path)
+        if saved is None:
+            return None
+        self._im.reset_object_parameters()
+        camera = self.read_object_parameters()
+        differs = any(not math.isclose(value, camera[key], rel_tol=1e-5, abs_tol=1e-5)
+                      for key, value in saved.items() if key in camera)
+        return saved if differs else None
 
     def apply_object_parameters(self, values: dict[str, float] | None) -> dict[str, Any]:
         """Apply edited object parameters (None resets to file defaults).

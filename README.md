@@ -17,6 +17,13 @@ all decoding work off the GUI thread.
 - Capture-cadence reporting: the Source tab states the average frame rate and,
   where the camera's preset rate is known, how many frames of the capture grid
   the file actually stored.
+- Slow camera clocks are detected: when a file stores more frames than its
+  timestamps allow at any camera rate (ResearchIR's A700 SEQ files stamp 30 Hz
+  frames 32.8 ms apart), times come from the frame number at the camera rate,
+  in the player and in workbooks.
+- Object parameters start from the camera's recorded values even when a
+  ResearchIR workspace saved in the file overrides them; the saved values are
+  listed on the Source tab and one click applies them.
 - Play, pause, single-frame stepping, timeline scrubbing, and 0.25×–4× speed.
 - Counts, object signal, factory/user temperature (°C, °F, K, °R), and radiance
   modes, driven by the units the file actually supports.
@@ -219,7 +226,9 @@ unevenly as it was recorded — that wobble is in the file, not the player.
 Constant-rate mode (`R`) re-anchors the same clock to frame index × the
 recording's average rate instead, which paces frames evenly and preserves the
 total duration; the elapsed-time readout keeps showing recorded time, so it
-steps across the gaps. Decoding runs ahead of presentation through a small bounded
+steps across the gaps. A recording whose timestamps run slow (see
+`sdktime.frame_rate`) is paced and timed by frame number at the camera rate
+instead. Decoding runs ahead of presentation through a small bounded
 queue, so decode, processing, and rendering overlap the presentation wait
 instead of serializing. If the player falls behind, it drops or skips forward
 to stay on the media clock, which keeps the 0.25×–4× speed multipliers

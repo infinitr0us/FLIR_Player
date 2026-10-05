@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.3 — 2026-10-05
+
+Fixes for FLIR A700 recordings saved by ResearchIR, found in the data of a
+battery fire test where an A700, a T650sc and thermocouples filmed the same
+cells. Other recordings play and export as before.
+
+### Time base
+
+- Recordings whose timestamps run slow are timed by frame number at the
+  camera rate. The A700 SEQ files stamp their 30 Hz frames 32.8 ms apart, so
+  their clock implied 30.48 fps and drifted 1.6 % (about 56 s per hour)
+  against the thermocouple logger and the T650sc. This applies when no preset
+  rate is known and the clock rate lies 0.5 to 3 % above a camera rate:
+  dropped frames can only make a clock look slower, never faster.
+- It covers the elapsed-time readout, playback pacing, the timeline length,
+  and the workbook's frame-number time base and multi-recording alignment.
+  The Source tab and the workbook's Source sheet show the camera rate, the
+  rate the timestamps imply and how far they run slow. Clock-time columns
+  still show the file's own timestamps.
+
+### Object parameters
+
+- A ResearchIR workspace saved in a recording can override the object
+  parameters every frame records, and the File SDK applies that override on
+  open: the A700 file opened with emissivity 1.0, 3 m and transmission 1.0
+  instead of the camera's 0.95 and 1 m. The player now opens such files with
+  the camera's values, as *Reset* and the Excel export already did. The
+  Source tab lists the saved values, a notice says they are not applied, and
+  *Use Saved ResearchIR Values* in the Measurement section applies them.
+- The reset button is now called *Reset to Camera Values*.
+- The workbook's Source sheet lists a saved override that differs from the
+  camera's values.
+
+### Under the hood
+
+- `sdktime.frame_rate` decides the rate for frame-number time in one place;
+  `VideoMetadata` carries it (`rate`, `frame_timed`) and the saved values.
+- `fff.saved_object_parameters` reads ResearchIR's workspace XML, kept in a
+  record of the last frame (type 0xF06) or at the end of an ATS file.
+- 19 new tests, on a 150-frame clip of the A700 recording that keeps its saved
+  workspace.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.5.2...v0.5.3)
+
 ## 0.5.2 — 2026-10-01
 
 A bug-fix release, mostly for the Excel workbook export, from a review of

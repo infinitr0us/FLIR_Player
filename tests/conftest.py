@@ -37,6 +37,7 @@ _SDK_AVAILABLE = importlib.util.find_spec("fnv") is not None
 _SEQ_AVAILABLE = (_SAMPLES / "2.seq").exists()
 _ATS_AVAILABLE = (_SAMPLES / "1.ats").exists()
 _CSQ_AVAILABLE = (_SAMPLES / "3.csq").exists()
+_A700_AVAILABLE = (_SAMPLES / "a700_clip.seq").exists()
 
 
 def _relevant_sources(item: pytest.Item) -> str:
@@ -88,7 +89,10 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401
         needs_seq = "2.seq" in source
         needs_ats = "1.ats" in source
         needs_csq = "3.csq" in source
-        if not (needs_seq or needs_ats or needs_csq):
+        # a700_clip.seq: first 150 frames of the 0922 A700 SEQ with its ResearchIR
+        # workspace (local/notes/2026-10-04-0922-fire-test/make_a700_clip.py)
+        needs_a700 = "CLIP" in source and "a700_clip.seq" in inspect.getsource(item.module)
+        if not (needs_seq or needs_ats or needs_csq or needs_a700):
             continue
         if not _SDK_AVAILABLE:
             item.add_marker(
@@ -105,6 +109,10 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401
         elif needs_csq and not _CSQ_AVAILABLE:
             item.add_marker(
                 pytest.mark.skip(reason="sample recording '3.csq' is not present in local/data/")
+            )
+        elif needs_a700 and not _A700_AVAILABLE:
+            item.add_marker(
+                pytest.mark.skip(reason="sample recording 'a700_clip.seq' is not present in local/data/")
             )
 
 

@@ -27,6 +27,7 @@ import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name, xl_rowcol_to_cell
 
 from .excel_export import AREA_STATS, EXCEL_COLUMNS, ExportData, RoiData, SourceData
+from .fff import describe_parameters
 from .jobs import JobCancelled
 from .radiometry import (
     KELVIN,
@@ -1230,7 +1231,8 @@ class _Writer:
                 ("File", info["file"]), ("Size (bytes)", info["file_size"]), ("Camera", info["camera"]),
                 ("Camera serial", info["camera_serial"]), ("Lens", info["lens"]),
                 ("Image size", f"{info['width']} × {info['height']}"), ("Frames", info["frames"]),
-                ("Frame rate (average)", f"{info['fps']:.4f} fps"),
+                ("Frame rate", f"{info['fps']:.4f} fps (camera rate)" if info.get("rate_corrected")
+                 else f"{info['fps']:.4f} fps (average)"),
                 ("First frame clock", info["start"].isoformat(sep=" ") if info["start"] else ""),
                 ("Last frame clock", info["end"].isoformat(sep=" ") if info["end"] else ""),
                 ("Ignition frame (t = 0)", info["ignition_frame"] + 1),
@@ -1250,6 +1252,16 @@ class _Writer:
                 fields.append((f"Check: {label}", f"{error:.2e} K over {pixels} pixels"))
             if info.get("saturation_threshold"):
                 fields.append(("Camera saturation threshold (counts)", info["saturation_threshold"]))
+            if info.get("rate_corrected"):
+                fields.append(("Note", f"The camera timestamps imply {info['clock_fps']:.4f} fps: they run "
+                                       f"{(info['clock_fps'] / info['fps'] - 1) * 100:.1f} % slow, so times "
+                                       "come from the frame number at the camera rate. The clock columns "
+                                       "show the file's own (slow) timestamps."))
+            if info.get("saved_parameters"):
+                fields.append(("Saved ResearchIR override (not used)",
+                               describe_parameters(info["saved_parameters"], source.report.file_parameters)
+                               + ". The workbook starts from the camera's values; ResearchIR shows the "
+                                 "recording with the saved ones."))
             if info.get("date_inferred"):
                 fields.append(("Note", "The ATS clock has no year: the date comes from the file's "
                                        "modification time; times of day are exact."))
