@@ -1263,6 +1263,11 @@ class _Writer:
                             "slow, so times come from the frame number at the camera rate. The clock "
                             "columns show the file's own (slow) timestamps.")
                 fields.append(("Note", note))
+            elif info.get("suggested_fps"):
+                fields.append(("Note", f"The camera timestamps imply {info['clock_fps']:.4f} fps, "
+                                       f"{(info['clock_fps'] / info['suggested_fps'] - 1) * 100:.1f} % above "
+                                       f"{info['suggested_fps']:g} Hz. If the camera ran at {info['suggested_fps']:g} Hz, "
+                                       "its clock runs slow; the times here follow the timestamps."))
             if info.get("saved_parameters"):
                 start = ("the workbook starts from these values" if info.get("saved_parameters_used")
                          else "the workbook starts from the camera's recorded values"

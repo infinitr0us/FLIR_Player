@@ -17,10 +17,10 @@ all decoding work off the GUI thread.
 - Capture-cadence reporting: the Source tab states the average frame rate and,
   where the camera's preset rate is known, how many frames of the capture grid
   the file actually stored.
-- Slow camera clocks are detected: when a file stores more frames than its
-  timestamps allow at any camera rate (ResearchIR's A700 SEQ files stamp 30 Hz
-  frames 32.8 ms apart), times come from the frame number at the camera rate,
-  in the player and in workbooks.
+- Slow camera clocks are handled: ResearchIR's A700 SEQ files stamp 30 Hz
+  frames 32.8 ms apart, so their times come from the frame number at the
+  camera rate, in the player and in workbooks. Other recordings that store
+  more frames than their timestamps allow get a note on the Source tab.
 - Object parameters start from the camera's recorded values even when a
   ResearchIR workspace saved in the file overrides them; the saved values are
   listed on the Source tab and one click applies them.

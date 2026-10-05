@@ -81,11 +81,14 @@ class FrameRate:
     unknown). ``camera_fps`` is set when those timestamps run slow: more frames
     were stored than their span allows at any camera rate, so ``fps`` is the
     nominal camera rate instead and frame times come from the frame number.
+    ``suggested_fps`` is such a camera rate when the camera is not known to be
+    affected: noted, but times keep following the timestamps.
     """
 
     fps: float
     clock_fps: float = 0.0
     camera_fps: float = 0.0
+    suggested_fps: float = 0.0
 
     @property
     def corrected(self) -> bool:

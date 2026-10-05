@@ -8,15 +8,18 @@ cells. Other recordings play and export as before.
 
 ### Time base
 
-- Recordings whose timestamps run slow are timed by frame number at the
+- A700 recordings whose timestamps run slow are timed by frame number at the
   camera rate. The A700 SEQ files stamp their 30 Hz frames 32.8 ms apart, so
   their clock implied 30.48 fps and drifted 1.6 % (about 56 s per hour)
   against the thermocouple logger and the T650sc. This applies when no preset
   rate is known, the clock rate lies 0.5 to 3 % above a camera rate, and the
-  typical interval between frames agrees with that average. Slow stamps
-  lengthen every interval; dropped frames leave most intervals at the
-  camera's own rate, so a 60 Hz file with a long gap is not mistaken for a
-  slow 30 Hz clock.
+  typical interval between frames agrees with that average (slow stamps
+  lengthen every interval; dropped frames leave most intervals short).
+- Other cameras whose timestamps fit that pattern keep their timestamps, and
+  the Source tab and sheet note the camera rate they may be running slow
+  against: from a few sampled stamps a slow clock cannot be told apart from
+  some irregular frame drops. The A700 records at 30 Hz at most, so no finer
+  frame grid can mimic its slow clock.
 - It covers the elapsed-time readout, playback pacing, the timeline length,
   and the workbook's frame-number time base and multi-recording alignment.
   The Source tab and the workbook's Source sheet show the camera rate, the
@@ -46,10 +49,14 @@ cells. Other recordings play and export as before.
   it (`rate`, `frame_timed`) and the saved values.
 - `fff.saved_object_parameters` parses ResearchIR's workspace XML, kept in a
   record of the last frame (type 0xF06) or at the end of an ATS file.
-- 27 new tests, on a 150-frame clip of the A700 recording that keeps its saved
-  workspace. A Codex review of the first version found four issues (dropout
-  false positive, the camera-timestamps time base, overrides the parser
-  missed, the workbook's wording), all fixed.
+- `fff.saved_object_parameters` takes the workspace whose length prefix runs
+  to the end of the file and never raises; a partial override is compared
+  field by field.
+- 31 new tests, on a 150-frame clip of the A700 recording that keeps its saved
+  workspace. Two review passes found eight issues (frame drops mistaken for a
+  slow clock, the camera-timestamps time base, overrides the parser missed or
+  mislabelled, encodings that could stop a file from opening, a partial
+  override that stopped the export, the workbook's wording); all are fixed.
 
 [Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.5.2...v0.5.3)
 

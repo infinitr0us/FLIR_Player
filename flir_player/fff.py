@@ -160,7 +160,6 @@ def read_camera_info(path: str | Path, scan_bytes: int = _SCAN_BYTES) -> CameraI
 
 
 _TAIL_BYTES = 8 << 20  # a workspace (palette, ROIs, settings) is ~12 KB; generous bound
-_END_TAG = b"</workspaceFileSettings>"
 # ResearchIR attribute → File SDK object-parameter field
 _SAVED_FIELDS = {
     "emissivity": "emissivity",
@@ -175,30 +174,31 @@ _SAVED_FIELDS = {
 
 
 def _workspace(tail: bytes):
-    """The last ``workspaceFileSettings`` document in ``tail``, parsed, or None."""
-    end = tail.rfind(_END_TAG)
-    if end < 0:
+    """The workspace document that ends the file, parsed, or None.
+
+    ResearchIR appends it as ``[uint32 length][XML]`` running to the end of the
+    file (SEQ/CSQ: record 0xF06 of the last frame; ATS likewise), so the start
+    whose length prefix reaches exactly the end is the real one, not text that
+    a comment or CDATA section happens to contain.
+    """
+    tag = b"<workspaceFileSettings"
+    position = len(tail)
+    for _ in range(64):
+        position = tail.rfind(tag, 4, position)
+        if position < 0:
+            return None
+        if struct.unpack_from("<I", tail, position - 4)[0] == len(tail) - position:
+            break
+    else:
         return None
-    end += len(_END_TAG)
-    starts = []
-    for marker in (b"<?xml", b"<workspaceFileSettings"):
-        position = end
-        for _ in range(4):
-            position = tail.rfind(marker, 0, position)
-            if position < 0:
-                break
-            starts.append(position)
-    for start in sorted(set(starts), reverse=True):
-        document = tail[start:end]
-        if b"<!DOCTYPE" in document or b"<!ENTITY" in document:
-            return None  # no entity expansion from a recording's bytes
-        try:
-            root = ElementTree.fromstring(document)
-        except ElementTree.ParseError:
-            continue
-        if root.tag == "workspaceFileSettings":
-            return root
-    return None
+    document = tail[position:]
+    if b"<!DOCTYPE" in document or b"<!ENTITY" in document:
+        return None  # no entity expansion from a recording's bytes
+    try:
+        root = ElementTree.fromstring(document)
+    except (ElementTree.ParseError, ValueError, LookupError):  # malformed, odd or unknown encoding
+        return None
+    return root if root.tag == "workspaceFileSettings" else None
 
 
 def saved_object_parameters(path: str | Path, tail_bytes: int = _TAIL_BYTES) -> dict[str, float] | None:
@@ -215,7 +215,10 @@ def saved_object_parameters(path: str | Path, tail_bytes: int = _TAIL_BYTES) -> 
             tail = handle.read()
     except OSError:
         return None
-    root = _workspace(tail)
+    try:
+        root = _workspace(tail)
+    except Exception:  # advisory only: never stop a recording from opening
+        return None
     element = root.find("objectParameters") if root is not None else None
     if element is None or element.get("override", "").strip().lower() != "true":
         return None

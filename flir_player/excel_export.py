@@ -38,6 +38,7 @@ from .calibration import (
     derive_calibration,
     preserved_state,
     read_array,
+    sdk_values,
     sdk_version,
     user_calibration_risk,
     set_unit_safely,
@@ -462,12 +463,16 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
     info["date_inferred"] = repair.repaired
     info["clock_fps"] = rate.clock_fps
     info["rate_corrected"] = rate.corrected
+    info["suggested_fps"] = rate.suggested_fps
     saved = saved_object_parameters(spec.path)
     if saved is not None and any(not math.isclose(value, report.file_parameters.get(key, value),
                                                   rel_tol=1e-5, abs_tol=1e-5)
                                  for key, value in saved.items()):
         info["saved_parameters"] = saved
-        info["saved_parameters_used"] = same_parameters(MeasurementParameters.from_sdk(saved), initial)
+        # the override may list only some fields: compare those
+        start = sdk_values(initial)
+        info["saved_parameters_used"] = all(math.isclose(value, start[key], rel_tol=1e-5, abs_tol=1e-5)
+                                            for key, value in saved.items() if key in start)
     return SourceData(spec=spec, label=spec.label or info["camera_short"], info=info, fps=fps,
                       num_frames=n, frames=frames, clock=clock, rois=data, report=report,
                       initial=initial, file_parameters=file_parameters,

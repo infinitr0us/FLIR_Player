@@ -95,20 +95,31 @@ SLOW_CLOCK = (0.005, 0.03)
 # stamps lengthen every interval, while dropped frames leave most intervals at
 # the camera's own (higher) rate and only a few long ones.
 EVEN_INTERVALS = 0.05
+# Cameras whose recordings are known to carry slow timestamps: ResearchIR's
+# A700 SEQ files (0922 battery test, checked against a TC logger and a
+# T650sc). An A700 records at 30 Hz at most, so no finer frame grid can mimic
+# its slow clock. Other cameras that fit the pattern only get a note: from a
+# few sampled stamps, a slow clock cannot be told from some irregular drops.
+SLOW_CLOCK_CAMERAS = frozenset({"A700"})
+
+
+def slow_clock_camera(model: str) -> bool:
+    return str(model or "").upper().replace("FLIR", "").strip() in SLOW_CLOCK_CAMERAS
 
 
 def frame_rate(stored_frames: int, span_seconds: float, preset_fps: float = 0.0,
-               typical_fps: float = 0.0) -> FrameRate:
+               typical_fps: float = 0.0, camera_model: str = "") -> FrameRate:
     """The rate for frame-number time, from the stored frames and their clock span.
 
     Normally the clock's own average rate. ResearchIR's A700 recordings stamp
     their 30 Hz frames 32.8 ms apart, so their clock implies 30.48 fps and runs
     1.6 % slow against the camera (and against a TC logger and a second
-    camera). The camera rate is used instead when no trusted preset rate
-    exists, the clock rate sits 0.5-3 % above a camera rate, and the typical
-    frame interval (``typical_fps``, see ``typical_frame_rate``) agrees with the
-    average: a 60 Hz recording with a long dropout can also average 30.5 fps,
-    but its frames are still 1/60 s apart.
+    camera). The pattern: no trusted preset rate, a clock rate 0.5-3 % above a
+    camera rate, and a typical frame interval (``typical_fps``, see
+    ``typical_frame_rate``) that agrees with the average (a 60 Hz recording
+    with a long dropout can also average 30.5 fps, but its frames are still
+    1/60 s apart). For a camera in ``SLOW_CLOCK_CAMERAS`` the camera rate is
+    then used; for others it is only suggested (``FrameRate.suggested_fps``).
     """
     if stored_frames < 2 or not span_seconds > 0:
         return FrameRate(30.0)
@@ -117,7 +128,9 @@ def frame_rate(stored_frames: int, span_seconds: float, preset_fps: float = 0.0,
         low, high = SLOW_CLOCK
         for rate in CAMERA_RATES:
             if 1 + low < clock / rate <= 1 + high:
-                return FrameRate(rate, clock, rate)
+                if slow_clock_camera(camera_model):
+                    return FrameRate(rate, clock, rate)
+                return FrameRate(clock, clock, suggested_fps=rate)
     return FrameRate(clock, clock)
 
 
@@ -159,7 +172,8 @@ def recording_rate(im: Any, repair: Callable[[Any], Any] | None = None) -> Frame
 
     first, last = stamp_at(0), stamp_at(n - 1)
     span = (last - first).total_seconds() if first is not None and last is not None else 0.0
-    return frame_rate(n, span, preset_frame_rate(im), typical_frame_rate(stamp_at, n))
+    model = str(getattr(getattr(im, "source_info", None), "camera_model", "") or "")
+    return frame_rate(n, span, preset_frame_rate(im), typical_frame_rate(stamp_at, n), model)
 
 
 def _place(stamp: datetime, year: int) -> datetime:

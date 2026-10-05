@@ -34,7 +34,7 @@ CAMERA = {"emissivity": 0.95, "reflected_temp": 293.15, "atmosphere_temp": 293.1
 
 
 def test_slow_a700_clock_snaps_to_the_camera_rate() -> None:
-    rate = frame_rate(105_965, 3476.414, 0.0, 30.5)  # the whole 0922 A700 recording
+    rate = frame_rate(105_965, 3476.414, 0.0, 30.5, "FLIR A700")  # the whole 0922 A700 recording
     assert rate.corrected and rate.fps == 30.0
     assert rate.clock_fps == pytest.approx(30.4808, abs=1e-3)
     assert rate.clock_error == pytest.approx(0.016, abs=5e-4)
@@ -47,21 +47,31 @@ def test_slow_a700_clock_snaps_to_the_camera_rate() -> None:
     (3_048, 100.0, 30.0, 30.47),  # a trusted preset rate: cadence logic owns the case
 ])
 def test_other_clocks_are_kept(frames, span, preset, expected) -> None:
-    rate = frame_rate(frames, span, preset, (frames - 1) / span)
+    rate = frame_rate(frames, span, preset, (frames - 1) / span, "FLIR A700")
     assert not rate.corrected and rate.fps == pytest.approx(expected, abs=1e-3)
 
 
 @pytest.mark.parametrize("clock, camera", [(60.9, 60.0), (9.1, 9.0), (15.3, 15.0), (25.5, 25.0)])
 def test_slow_clocks_snap_to_the_nearest_camera_rate(clock, camera) -> None:
     frames = int(round(clock * 200)) + 1
-    assert frame_rate(frames, 200.0, 0.0, clock) == FrameRate(camera, pytest.approx(clock, abs=1e-6), camera)
+    assert frame_rate(frames, 200.0, 0.0, clock, "FLIR A700") == FrameRate(
+        camera, pytest.approx(clock, abs=1e-6), camera)
+
+
+def test_other_cameras_only_get_a_suggestion() -> None:
+    # same numbers as the A700, but the camera is not known to stamp slowly: from a few
+    # sampled stamps this cannot be told from a 60 Hz file that kept every even frame
+    # plus every 120th odd one (3051 frames over 100 s, mostly 1/30 s apart)
+    rate = frame_rate(3051, 100.0, 0.0, 30.0003, "FLIR T650sc")
+    assert not rate.corrected and rate.fps == pytest.approx(30.5) and rate.suggested_fps == 30.0
+    assert frame_rate(3051, 100.0, 0.0, 30.0003, "").suggested_fps == 30.0
 
 
 def test_dropped_frames_are_not_mistaken_for_a_slow_clock() -> None:
     # 60 Hz with a 29.5 s outage averages 30.5 fps, but its frames are 1/60 s apart
-    assert not frame_rate(3051, 100.0, 0.0, 60.0).corrected
-    assert not frame_rate(3051, 100.0).corrected  # interval unknown: keep the clock
-    assert frame_rate(3051, 100.0, 0.0, 30.4).corrected
+    assert not frame_rate(3051, 100.0, 0.0, 60.0, "FLIR A700").corrected
+    assert not frame_rate(3051, 100.0, 0.0, 0.0, "FLIR A700").corrected  # interval unknown
+    assert frame_rate(3051, 100.0, 0.0, 30.4, "FLIR A700").corrected
 
 
 def _stamps(intervals):
@@ -88,14 +98,17 @@ def test_degenerate_spans_fall_back_to_30_fps() -> None:
 # --- saved ResearchIR settings (pure) ------------------------------------------------------
 
 
-def _with_tail(tmp_path: Path, xml: str) -> Path:
+def _with_tail(tmp_path: Path, xml: str | bytes, prefix: bool = True) -> Path:
+    """A file ending like ResearchIR's: [uint32 length][workspace XML] up to the end."""
+    import struct
+    body = xml if isinstance(xml, bytes) else xml.encode("utf-8")
     path = tmp_path / "recording.seq"
-    path.write_bytes(b"FFF\0" + bytes(5000) + xml.encode("utf-8"))
+    path.write_bytes(b"FFF\0" + bytes(5000) + (struct.pack("<I", len(body)) if prefix else b"") + body)
     return path
 
 
 def _workspace(attributes: str) -> str:
-    return ("<?xml version=\"1.0\"?>\r\n<workspaceFileSettings>\r\n<palette name=\"Iron\" />\r\n"
+    return ("<workspaceFileSettings>\r\n<palette name=\"Iron\" />\r\n"
             f"<objectParameters {attributes} />\r\n</workspaceFileSettings>\r\n")
 
 
@@ -130,6 +143,23 @@ def test_non_overrides_are_ignored(tmp_path, attributes) -> None:
 def test_overrides_in_any_valid_xml_form_are_read(tmp_path, xml) -> None:
     saved = saved_object_parameters(_with_tail(tmp_path, xml))
     assert saved == {"emissivity": 1.0, "distance": 3.0}
+
+
+def test_a_workspace_inside_a_trailing_comment_is_not_taken(tmp_path) -> None:
+    real = _workspace('override="true" emissivity="1" distance="3"')
+    fake = _workspace('override="true" emissivity="0.8" distance="9"')
+    assert saved_object_parameters(_with_tail(tmp_path, real + "<!-- " + fake + " -->")) == {
+        "emissivity": 1.0, "distance": 3.0}
+
+
+def test_unreadable_workspaces_never_raise(tmp_path) -> None:
+    shift_jis = ('<?xml version="1.0" encoding="Shift_JIS"?><workspaceFileSettings><!-- \u65e5 -->'
+                 '<objectParameters override="true" emissivity="1" /></workspaceFileSettings>').encode("shift_jis")
+    assert saved_object_parameters(_with_tail(tmp_path, shift_jis)) is None
+    unknown = b'<?xml version="1.0" encoding="x-nonsense"?><workspaceFileSettings />'
+    assert saved_object_parameters(_with_tail(tmp_path, unknown)) is None
+    no_prefix = _workspace('override="true" emissivity="1"')
+    assert saved_object_parameters(_with_tail(tmp_path, no_prefix, prefix=False)) is None
 
 
 def test_entities_are_never_expanded(tmp_path) -> None:
@@ -276,3 +306,20 @@ def test_workbook_says_which_parameters_it_starts_from(tmp_path) -> None:
         sheet = openpyxl.load_workbook(dest, data_only=True)["Source"]
         rows = {sheet.cell(r, 1).value: sheet.cell(r, 2).value for r in range(1, 80)}
         assert expected in rows["Saved ResearchIR override"]
+
+
+def test_a_partial_override_does_not_stop_the_export(tmp_path, monkeypatch) -> None:
+    openpyxl = pytest.importorskip("openpyxl")
+    import flir_player.excel_export as excel_export
+    from flir_player.excel_export import ExportOptions, SourceSpec, run_export
+    from flir_player.models import RoiShape
+
+    # an override that lists only some fields (no reflected temperature)
+    monkeypatch.setattr(excel_export, "saved_object_parameters", lambda path: {"emissivity": 1.0, "distance": 3.0})
+    dest = tmp_path / "partial.xlsx"
+    run_export(dest, [SourceSpec(SAMPLES / CLIP, (RoiShape(1, "cursor", ((320.5, 240.5),), "Spot"),))],
+               ExportOptions(step_s=1.0, sheets=frozenset()))
+    sheet = openpyxl.load_workbook(dest, data_only=True)["Source"]
+    rows = {sheet.cell(r, 1).value: sheet.cell(r, 2).value for r in range(1, 80)}
+    assert rows["Saved ResearchIR override"].startswith("ε 1.000 · 3 m.")
+    assert "camera's recorded values" in rows["Saved ResearchIR override"]

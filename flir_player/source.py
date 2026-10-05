@@ -158,7 +158,8 @@ def _cadence_rows(cadence: CadenceInfo | None, average_fps: float,
         rows.append(("Frame rate", f"{rate.fps:.2f} fps (camera rate)"))
         rows.append(("Timestamps", f"Run {rate.clock_error * 100:.1f} % slow ({rate.clock_fps:.2f} fps "
                                    f"implied); times use the frame number"))
-    elif average_fps > 0:
+        return tuple(rows)
+    if average_fps > 0:
         if cadence is not None and not cadence.is_even:
             rows.append(
                 (
@@ -168,6 +169,11 @@ def _cadence_rows(cadence: CadenceInfo | None, average_fps: float,
             )
         else:
             rows.append(("Frame rate", f"{average_fps:.2f} fps"))
+    if rate is not None and rate.suggested_fps > 0:
+        rows.append(("Timestamps", f"Imply {rate.clock_fps:.2f} fps, "
+                                   f"{(rate.clock_fps / rate.suggested_fps - 1) * 100:.1f} % above "
+                                   f"{rate.suggested_fps:g} Hz: if the camera ran at {rate.suggested_fps:g} Hz, "
+                                   "its clock runs slow (times follow the timestamps)"))
     if cadence is None:
         return tuple(rows)
     if cadence.is_even:
