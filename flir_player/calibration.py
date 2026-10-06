@@ -166,8 +166,15 @@ def _sample_frames(count: int, n: int) -> list[int]:
     return sorted({int(round(v)) for v in np.linspace(0, n - 1, count)})
 
 
-def derive_calibration(im: Any, path: str | Path, *, frames: int = 8, abort=None) -> CalibrationReport:
-    """Identify and verify the calibration of the open recording ``im``."""
+def derive_calibration(im: Any, path: str | Path, *, frames: int = 8, abort=None,
+                       indices: list[int] | None = None, limits: RangeLimits | None = None) -> CalibrationReport:
+    """Identify and verify the calibration of the open recording ``im``.
+
+    ``indices`` picks the frames to compare (default: ``frames`` spread over
+    the recording). A superframing recording alternates presets with
+    different calibrations, so it needs the frames of one preset, and that
+    preset's range as ``limits`` (the default takes the first calibrated one).
+    """
     path = Path(path)
     fff = read_camera_info(path)
     with preserved_state(im):
@@ -185,7 +192,12 @@ def derive_calibration(im: Any, path: str | Path, *, frames: int = 8, abort=None
                 "The recording has no temperature calibration (counts only).",
                 kind="none", fff=fff, file_parameters=file_parameters)
         n = int(im.num_frames)
-        indices = _sample_frames(max(2, frames), n)
+        if indices is None:
+            indices = _sample_frames(max(2, frames), n)
+        else:
+            indices = sorted({int(i) for i in indices if 0 <= int(i) < n})
+            if not indices:
+                raise ValueError("No frames to verify the calibration on")
         write_parameters(im, sdk_values(NEUTRAL))
         set_unit_safely(im, fnv.Unit.COUNTS)
         counts = np.stack([read_array(im, i).astype(np.float64) for i in indices])
@@ -199,7 +211,8 @@ def derive_calibration(im: Any, path: str | Path, *, frames: int = 8, abort=None
             return CalibrationReport(None, "unavailable",
                                      "Too few unclamped pixels to verify the calibration.",
                                      fff=fff, file_parameters=file_parameters)
-        limits = _sdk_limits(im, fff)
+        override = limits
+        limits = override if override is not None else _sdk_limits(im, fff)
         candidates: list[tuple[str, Calibration, float]] = []
         fff_error = fit_error = None
         if fff is not None:
@@ -242,9 +255,11 @@ def derive_calibration(im: Any, path: str | Path, *, frames: int = 8, abort=None
                 fff=fff, fff_error_k=fff_error, fit_error_k=fit_error, checks=tuple(checks),
                 file_parameters=file_parameters)
         source = f"{label}; verified against the File SDK (max error {max(worst, _error):.1e} K)"
-        calibration = Calibration(calibration.planck, calibration.atmosphere,
-                                  limits if calibration.limits == RangeLimits() else calibration.limits,
-                                  source)
+        if override is not None:
+            final_limits = override
+        else:
+            final_limits = limits if calibration.limits == RangeLimits() else calibration.limits
+        calibration = Calibration(calibration.planck, calibration.atmosphere, final_limits, source)
         return CalibrationReport(calibration, "verified", source, fff=fff, fff_error_k=fff_error,
                                  fit_error_k=fit_error, checks=tuple(checks),
                                  file_parameters=file_parameters)

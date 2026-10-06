@@ -147,6 +147,11 @@ class _Writer:
         self._formats()
         self.sheets = {}
         self.layouts: list[_RoiLayout] = []
+        prefill = data.options.tc_prefill
+        if prefill is not None:
+            prefill.check(TC_CAPACITY, TC_COLUMNS)
+        self._tc_names: list[str] = list(prefill.names) if prefill is not None else []
+        self._roi_tc: dict[str, str] = dict(prefill.roi_tc) if prefill is not None else {}
 
     def _add_sheets(self) -> None:
         """Create the worksheets (each opens a constant-memory row file)."""
@@ -466,7 +471,8 @@ class _Writer:
             put(r, 4, roi.pixels, self.f_int)
             put(r, 5, None, self.f_input_num)
             put(r, 6, None, self.f_input_num)
-            put(r, 7, None, self.f_input)
+            mapped = self._roi_tc.get(roi.shape.name) if "TC Compare" in self.sheets else None
+            put(r, 7, mapped, self.f_input)
             if "TC Compare" in self.sheets:
                 ws.data_validation(r, 7, r, 7, {"validate": "list", "source": tc_list,
                                                  "ignore_blank": True})
@@ -501,7 +507,8 @@ class _Writer:
             put(r, col["TCCOL"], None, self.f_calc,
                 formula=(f"=IF(H{R}=\"\",\"\",IFERROR(MATCH(H{R},'TC Compare'!$B${TC_FIRST + 1}:"
                          f"${xl_col_to_name(TC_COLUMNS)}${TC_FIRST + 1},0),\"\"))"
-                         if "TC Compare" in self.sheets else '=""'), cached="")
+                         if "TC Compare" in self.sheets else '=""'),
+                cached=self._tc_names.index(mapped) + 1 if mapped else "")
             for label, c in (("EPS", 8), ("TREFL", 9), ("TC", 7)):
                 self._name(f"{name}_{label}", S, r, c)
             for label, c in col.items():
@@ -796,7 +803,8 @@ class _Writer:
                        "temperature; the two differ when the area spans large temperature differences.",
                  self.f_note)
         ws.write(5, 0, "Logger time offset (s)", self.f_bold)
-        ws.write_number(5, 1, 0.0, self.f_input_num)
+        prefill = self.data.options.tc_prefill
+        ws.write_number(5, 1, prefill.offset_s if prefill else 0.0, self.f_input_num)
         self._name("TC_OFFSET", T, 5, 1)
         # comparison block (to the right), one row per Data row
         c0 = TC_COLUMNS + 2
@@ -813,7 +821,9 @@ class _Writer:
             ws.merge_range(TC_FIRST - 1, col, TC_FIRST - 1, col + 3, layout.title, self.f_group)
         ws.write(TC_FIRST, 0, "Time (s)", self.f_input)
         for k in range(TC_COLUMNS):
-            ws.write(TC_FIRST, 1 + k, f"TC {k + 1}", self.f_input)
+            ws.write(TC_FIRST, 1 + k, self._tc_names[k] if k < len(self._tc_names) else f"TC {k + 1}",
+                     self.f_input)
+
         ws.write(TC_FIRST, c0, "Time (s)", self.f_head)
         ws.write(TC_FIRST, c0 + 1, "Logger row", self.f_head)
         ws.write(TC_FIRST, c0 + 2, "Weight", self.f_head)
@@ -824,8 +834,17 @@ class _Writer:
                                        "TC (display unit)", "ΔT (stats)", "x·y", "x²")):
                 ws.write(TC_FIRST, col + k, label, self.f_head)
         first_row = TC_FIRST + 1
+
+        def logger_row(i: int) -> None:  # constant_memory: write with the rest of row i
+            if prefill is not None and i < len(prefill.times):
+                ws.write_number(first_row + i, 0, float(prefill.times[i]))
+                for k, column in enumerate(prefill.columns):
+                    if math.isfinite(column[i]):
+                        ws.write_number(first_row + i, 1 + k, float(column[i]))
+
         for i in range(self.rows):
             self._check(i)
+            logger_row(i)
             r = first_row + i
             R = r + 1
             data_r = HEADER_ROWS + i
@@ -870,6 +889,9 @@ class _Writer:
                 ws.write_formula(r, cols["dts"], f'=IFERROR({ir}-{tc},"")', None, "")
                 ws.write_formula(r, cols["xy"], f'=IF({both},IFERROR({x}*{y},""),"")', None, "")
                 ws.write_formula(r, cols["x2"], f'=IF({both},IFERROR({x}^2,""),"")', None, "")
+        for i in range(self.rows, len(prefill.times) if prefill is not None else 0):
+            self._check(i)
+            logger_row(i)
         for layout in self.layouts:
             cols = self.tc_cols[layout.number]
             last = first_row + self.rows - 1
@@ -893,6 +915,8 @@ class _Writer:
         t0, t1 = float(self.times[0]), float(self.times[-1])
         base = (t0, 0.0) if t0 < 0 else (t0, min(t1, t0 + 60.0))
         thresholds = [_c_to(v, self.unit) for v in (100.0, 300.0, 500.0)]
+        prefill = self.data.options.tc_prefill
+        tc_window = prefill.window if prefill is not None and prefill.window is not None else (t0, t1)
         ws.write(0, 0, "Summary (live — follows Settings)", self.f_title)
         ws.write(1, 0, "Per ROI: spots use their value, areas their mean. Windows and thresholds are editable.",
                  self.f_note)
@@ -901,8 +925,8 @@ class _Writer:
                   ("THR_1", "Threshold 1 (display unit)", thresholds[0]),
                   ("THR_2", "Threshold 2 (display unit)", thresholds[1]),
                   ("THR_3", "Threshold 3 (display unit)", thresholds[2]),
-                  ("TCW_START", "TC comparison window start (s)", t0),
-                  ("TCW_END", "TC comparison window end (s)", t1))
+                  ("TCW_START", "TC comparison window start (s)", tc_window[0]),
+                  ("TCW_END", "TC comparison window end (s)", tc_window[1]))
         for k, (name, label, value) in enumerate(inputs):
             ws.write(3 + k, 0, label)
             ws.write_number(3 + k, 1, value, self.f_input_num)
@@ -912,7 +936,7 @@ class _Writer:
         windows = {}
         for (start_name, end_name, a_name, b_name, row, label, (w0, w1)) in (
                 ("BASE_START", "BASE_END", "BASE_A", "BASE_B", 3, "Baseline rows", base),
-                ("TCW_START", "TCW_END", "TCW_A", "TCW_B", 8, "TC window rows", (t0, t1))):
+                ("TCW_START", "TCW_END", "TCW_A", "TCW_B", 8, "TC window rows", tc_window)):
             first = int(np.searchsorted(self.times, w0 - 1e-9))
             last = int(np.searchsorted(self.times, w1 + 1e-9, side="right")) - 1
             windows[a_name] = (first, last)

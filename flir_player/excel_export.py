@@ -137,6 +137,35 @@ class SourceSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class TcPrefill:
+    """Logger data for the TC Compare sheet, instead of pasting it by hand.
+
+    ``times`` are on the workbook's axis (seconds from ignition) after
+    ``offset_s``, the sheet's logger time offset; ``columns`` hold one TC each
+    (°C, NaN = blank). ``roi_tc`` pre-selects a TC column for ROIs by name and
+    ``window`` sets the Summary's TC comparison window.
+    """
+
+    times: tuple[float, ...]
+    columns: tuple[tuple[float, ...], ...]
+    names: tuple[str, ...]
+    roi_tc: tuple[tuple[str, str], ...] = ()
+    window: tuple[float, float] | None = None
+    offset_s: float = 0.0
+
+    def check(self, capacity: int, width: int) -> None:
+        if len(self.names) != len(self.columns) or not 0 < len(self.names) <= width:
+            raise ValueError(f"The TC sheet takes 1 to {width} thermocouples")
+        if any(len(column) != len(self.times) for column in self.columns):
+            raise ValueError("Every TC column needs one value per logger time")
+        if len(self.times) > capacity:
+            raise ValueError(f"{len(self.times):,} logger rows exceed the TC sheet's {capacity:,}")
+        unknown = {tc for _roi, tc in self.roi_tc} - set(self.names)
+        if unknown:
+            raise ValueError(f"No TC column named {', '.join(sorted(unknown))}")
+
+
+@dataclass(frozen=True, slots=True)
 class ExportOptions:
     start_s: float | None = None  # seconds from ignition; None = earliest data
     end_s: float | None = None  # None = latest data
@@ -152,6 +181,7 @@ class ExportOptions:
     validation_rows: int = 24
     sheets: frozenset[str] = frozenset({"charts", "tc", "summary", "roimap", "validation"})
     unit: str = "°C"
+    tc_prefill: TcPrefill | None = None
 
 
 # --- collected data -------------------------------------------------------------------
