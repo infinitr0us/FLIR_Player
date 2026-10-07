@@ -8,7 +8,8 @@ The method of the 0922 battery test, made reusable:
    the frames of one preset) and keeps, per time bin and pixel of a region,
    the mean count and the detrended spread of the counts within the bin. Bins
    sit on the recording's frame-number time base, so A700 recordings get the
-   slow-clock correction of ``sdktime``.
+   slow-clock correction of ``sdktime``; superframing frames are timed by the
+   camera clock (``preset_frames``), which dropped frames do not shift.
 2. ``locate`` correlates every pixel's counts with the blackbody signal of
    every TC temperature, over all time offsets. Counts are linear in the
    radiance the camera receives, and that radiance is linear in the blackbody
@@ -35,10 +36,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 import warnings
+import zipfile
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -104,6 +108,10 @@ class MatchOptions:
     coarse_pixels: int = 12_000  # pixels of the binned image used to find the offset
     tc_min_c: float = 50.0  # fit only where the TC reads at least this
     flicker_max: float = 0.02  # flame filter: within-bin spread / (T − ambient)
+    jump_k: float = 30.0  # a TC rising more than this within ``jump_window_s`` has a flame on it ...
+    jump_window_s: float = 5.0
+    jump_hold_s: float = 30.0  # ... and is not fitted from the jump until this long after it (0 = off)
+    below_range: bool = False  # also fit IR below the calibrated range (extrapolated)
     bound_margin_k: float = 20.0  # IR at ε = 1 above the TC by more than this: no ε can match
     min_event_s: float = 30.0
     gap_s: float = 5.0  # shorter interruptions do not split an event
@@ -131,6 +139,7 @@ class Samples:
     report: CalibrationReport
     params: MeasurementParameters  # the recording's own object parameters
     info: dict[str, Any] = field(default_factory=dict)
+    frame_seconds: np.ndarray | None = None  # recording seconds of every frame by its clock (superframing)
 
     @property
     def calibration(self) -> Calibration | None:
@@ -146,47 +155,85 @@ class Samples:
         """Temperature (°C) at emissivity 1 for counts of this recording."""
         return object_temperature(self.calibration, self.params.with_(emissivity=1.0), counts) - KELVIN
 
+    def frame_at(self, seconds: float) -> int:
+        """Frame index at recording time ``seconds`` (beyond the ends: extrapolated at the frame rate)."""
+        t = self.frame_seconds
+        if t is None or t.size == 0:
+            return int(round(seconds * self.fps))
+        if seconds <= t[0]:
+            return int(round((seconds - t[0]) * self.fps))
+        if seconds >= t[-1]:
+            return int(t.size - 1 + round((seconds - t[-1]) * self.fps))
+        return int(np.argmin(np.abs(t - seconds)))
 
-def preset_frames(im: Any) -> tuple[dict[int, tuple[int, int]], dict[int, tuple[float, float]]]:
-    """Superframing layout: {preset: (first frame, cycle)} and {preset: calibrated range in K}.
 
-    Empty dicts when the recording has one preset. The cycle is read from the
-    per-frame ``Preset`` field of the first frames and checked on frames spread
-    over the recording; an irregular pattern raises ValueError.
+@dataclass(frozen=True)
+class PresetLayout:
+    """Frames of each preset of a superframing recording, and when each frame was taken (empty: one preset)."""
+
+    frames: Mapping[int, np.ndarray] = field(default_factory=dict)  # preset → its frame indices, ascending
+    ranges: Mapping[int, tuple[float, float]] = field(default_factory=dict)  # preset → calibrated range (K)
+    seconds: np.ndarray | None = None  # clock time of every frame from the first
+    breaks: int = 0  # places where the preset cycle breaks (dropped frames)
+
+    def __bool__(self) -> bool:
+        return bool(self.frames)
+
+
+def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progress: Progress | None = None,
+                  abort: Abort | None = None) -> PresetLayout:
+    """Which frames belong to which preset of a superframing recording, and their clock times.
+
+    Every frame header is read once: its ``Preset`` field and its clock stamp
+    (``repair`` fixes the stamps). Checking a sample of frames is not enough:
+    two dropped frames can cancel out between the checks, and dropping a whole
+    preset cycle keeps the order while frame number / frame rate drifts. So the
+    frames of a superframing recording are always timed by their clock.
     """
     info = getattr(im, "source_info", None)
     presets = [p for p in (getattr(info, "preset_info", ()) or ())
                if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
     if len(presets) < 2:
-        return {}, {}
+        return PresetLayout()
     n = int(im.num_frames)
-
-    def preset_of(index: int) -> int:
-        im.get_frame(int(index))
-        for entry in im.frame_info:
-            if str(entry["name"]) == "Preset":
-                return int(str(entry["value"]))
-        raise ValueError("The recording has several presets but its frames do not say which")
-
-    head = [preset_of(i) for i in range(min(n, 4 * len(presets)))]
-    cycle = len(set(head))
-    pattern = head[:cycle]
-    for index in np.unique(np.linspace(0, n - 1, 64).astype(int)):
-        if preset_of(int(index)) != pattern[int(index) % cycle]:
-            raise ValueError("The presets of this superframing recording do not alternate regularly")
-    layout = {p: (k, cycle) for k, p in enumerate(pattern)}
+    repair = repair or (lambda stamp: stamp)
+    labels = np.zeros(n, dtype=np.int64)
+    seconds = np.full(n, np.nan)
+    origin = None
+    for i in range(n):
+        if i % 256 == 0:
+            _check(abort)
+            if progress is not None:
+                progress(i, n)
+        im.get_frame(i)
+        label = next((str(e["value"]) for e in im.frame_info if str(e["name"]) == "Preset"), None)
+        if label is None:
+            raise ValueError("The recording has several presets but its frames do not say which")
+        labels[i] = int(label)
+        stamp = repair(im.frame_info.time)
+        if isinstance(stamp, datetime):
+            origin = stamp if origin is None else origin
+            seconds[i] = (stamp - origin).total_seconds()
+    if progress is not None:
+        progress(n, n)
+    if not np.all(np.isfinite(seconds)) or np.any(np.diff(seconds) < 0):
+        raise ValueError("The clock of this superframing recording cannot time its frames "
+                         "(missing or backward time stamps)")
+    frames = {int(p): np.flatnonzero(labels == p) for p in np.unique(labels)}
+    pattern = list(dict.fromkeys(int(v) for v in labels[:4 * len(frames)]))  # the cycle, in order
+    follows = {p: pattern[(k + 1) % len(pattern)] for k, p in enumerate(pattern)}
+    breaks = int(sum(follows.get(int(a)) != int(b) for a, b in zip(labels[:-1], labels[1:])))
     ranges = {}
     all_presets = list(getattr(info, "preset_info", ()) or ())
-    for p in layout:
+    for p in frames:
         # the per-frame preset numbers count from 1 on superframing files, matching preset_info's index
         entry = all_presets[p] if 0 <= p < len(all_presets) else None
         if entry is not None and getattr(entry, "calibrated", False):
             ranges[p] = (float(entry.min_temp), float(entry.max_temp))
-    return layout, ranges
+    return PresetLayout(frames=frames, ranges=ranges, seconds=seconds, breaks=breaks)
 
 
-def choose_preset(layout: Mapping[int, tuple[int, int]], ranges: Mapping[int, tuple[float, float]],
-                  requested: int | None = None) -> tuple[int | None, RangeLimits | None]:
+def choose_preset(layout: PresetLayout, requested: int | None = None) -> tuple[int | None, RangeLimits | None]:
     """(preset, its calibrated range as limits) of a superframing recording; (None, None) otherwise.
 
     Without a request, the preset with the lowest range: closest to TC temperatures.
@@ -195,18 +242,45 @@ def choose_preset(layout: Mapping[int, tuple[int, int]], ranges: Mapping[int, tu
         return None, None
     preset = requested
     if preset is None:
-        preset = min(layout, key=lambda p: ranges.get(p, (math.inf, math.inf))[0])
-    if preset not in layout:
+        preset = min(layout.frames, key=lambda p: layout.ranges.get(p, (math.inf, math.inf))[0])
+    if preset not in layout.frames:
         raise ValueError(f"Preset {preset} is not in this recording (presets: "
-                         f"{', '.join(str(p) for p in sorted(layout))})")
-    return preset, (RangeLimits(calibrated=tuple(ranges[preset])) if preset in ranges else None)
+                         f"{', '.join(str(p) for p in sorted(layout.frames))})")
+    return preset, (RangeLimits(calibrated=tuple(layout.ranges[preset])) if preset in layout.ranges else None)
 
 
-def _cache_key(path: Path, options: MatchOptions, step: float) -> str:
+def _file_key(path: Path, *extra) -> str:
     stat = path.stat()
-    text = json.dumps([str(path.resolve()), stat.st_size, int(stat.st_mtime), options.roi, options.preset,
-                       round(step, 9), 2])
+    text = json.dumps([str(path.resolve()), stat.st_size, int(stat.st_mtime), *extra])
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = False) -> str:
+    # clock-timed bins (superframing) differ from frame-number bins
+    return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []))
+
+
+def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress, abort) -> PresetLayout:
+    """``preset_frames``, kept in ``cache_dir`` (the scan reads every frame header)."""
+    store = Path(cache_dir) / f"{_file_key(path, 'presets', 1)}_presets.npz" if cache_dir is not None else None
+    if store is not None and store.exists():
+        try:
+            with np.load(store) as data:
+                presets = [int(p) for p in data["presets"]]
+                return PresetLayout(frames={p: data[f"frames_{p}"] for p in presets},
+                                    ranges={p: tuple(data[f"range_{p}"]) for p in presets if f"range_{p}" in data},
+                                    seconds=data["seconds"], breaks=int(data["breaks"]))
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            pass  # unreadable (e.g. a run stopped while writing it): scan again
+    layout = preset_frames(im, repair=repair, progress=progress, abort=abort)
+    if store is not None and layout:
+        arrays = {f"frames_{p}": f for p, f in layout.frames.items()}
+        arrays.update({f"range_{p}": np.asarray(r) for p, r in layout.ranges.items()})
+        partial = store.with_name(store.stem + ".partial.npz")
+        np.savez(partial, presets=np.array(sorted(layout.frames)), seconds=layout.seconds, breaks=layout.breaks,
+                 **arrays)
+        os.replace(partial, store)  # complete files only
+    return layout
 
 
 def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float = 1.0, im: Any = None,
@@ -235,32 +309,35 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             repair = TimestampRepair(path)
             rate = recording_rate(im, repair)
             fps = rate.fps
-            layout, ranges = preset_frames(im)
-            info: dict[str, Any] = {
-                "camera": str(getattr(im.source_info, "camera_model", "") or "").strip(),
-                "frames": n, "fps": fps, "clock_fps": rate.clock_fps, "rate_corrected": rate.corrected,
-                "region": [x0, y0, x1, y1], "presets": {str(k): v for k, v in ranges.items()},
-            }
-            preset, limits = choose_preset(layout, ranges, options.preset)
-            if preset is not None:
-                first, cycle = layout[preset]
-                info["preset"] = preset
-            else:
-                first, cycle = 0, 1
-            frames = np.arange(first, n, cycle)
-            step = max(float(step_s), cycle / fps)
-            info["step"] = step
-            key = None
             if cache_dir is not None:
                 cache_dir = Path(cache_dir)
                 cache_dir.mkdir(parents=True, exist_ok=True)
-                key = _cache_key(path, options, step)
+            layout = _cached_layout(im, path, cache_dir, repair, progress, abort)
+            info: dict[str, Any] = {
+                "camera": str(getattr(im.source_info, "camera_model", "") or "").strip(),
+                "frames": n, "fps": fps, "clock_fps": rate.clock_fps, "rate_corrected": rate.corrected,
+                "region": [x0, y0, x1, y1], "presets": {str(k): v for k, v in layout.ranges.items()},
+            }
+            preset, limits = choose_preset(layout, options.preset)
+            if preset is not None:
+                frames = np.asarray(layout.frames[preset], dtype=np.int64)
+                info["preset"] = preset
+                if layout.breaks:
+                    info["preset_breaks"] = layout.breaks
+            else:
+                frames = np.arange(n)
+            # recording seconds of each frame: frame number / rate, or the clock on superframing files
+            frame_times = layout.seconds[frames] if layout.seconds is not None else frames / fps
+            interval = float(np.median(np.diff(frame_times))) if frames.size > 1 else 1.0 / fps
+            step = float(step_s) if interval <= 1.01 * float(step_s) else interval
+            info["step"] = step
+            key = _cache_key(path, options, step, clock=layout.seconds is not None) if cache_dir is not None else None
             cached = _load_cache(cache_dir, key) if key else None
             if cached is not None:
                 times, mean, spread, counts, first_frame = cached
             else:
                 times, mean, spread, counts, first_frame = _accumulate(
-                    im, frames, fps, step, (x0, y0, x1, y1), progress, abort, cache_dir, key)
+                    im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key)
             if abort():
                 raise JobCancelled("Cancelled")
             indices = None
@@ -275,7 +352,7 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
         info["calibration"] = report.message
         return Samples(path=path, times=times, mean=mean, spread=spread, counts=counts, first_frame=first_frame,
                        origin=(x0, y0), size=(width, height), fps=fps, step=step, report=report, params=params,
-                       info=info)
+                       info=info, frame_seconds=layout.seconds)
     finally:
         if owned:
             try:
@@ -284,10 +361,12 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
                 pass
 
 
-def _accumulate(im, frames, fps, step, region, progress, abort, cache_dir, key):
+def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_dir, key):
+    """Per-bin statistics of ``frames`` (recording seconds ``frame_times``, ascending) in ``region``."""
     x0, y0, x1, y1 = region
     h, w = y1 - y0, x1 - x0
-    bins_of = np.floor(frames / fps / step + 0.5).astype(np.int64)
+    frame_times = np.asarray(frame_times, dtype=np.float64)
+    bins_of = np.floor(frame_times / step + 0.5).astype(np.int64)
     nbins = int(bins_of[-1]) + 1 if frames.size else 0
     shape = (nbins, h, w)
     nbytes = 2 * 4 * nbins * h * w
@@ -330,7 +409,7 @@ def _accumulate(im, frames, fps, step, region, progress, abort, cache_dir, key):
             spread[k] = np.sqrt(np.maximum(resid, 0.0) / m)
 
     total = int(frames.size)
-    for done, (frame, k) in enumerate(zip(frames, bins_of)):
+    for done, (frame, at, k) in enumerate(zip(frames, frame_times, bins_of)):
         if done % 256 == 0:
             if abort():
                 raise JobCancelled("Cancelled")
@@ -344,7 +423,7 @@ def _accumulate(im, frames, fps, step, region, progress, abort, cache_dir, key):
             stx.fill(0)
             first_frame[k] = int(frame)
         x = read_array(im, int(frame))[y0:y1, x0:x1].astype(np.float64)
-        tau = frame / fps - k * step
+        tau = at - k * step
         s1 += x
         s2 += x * x
         stx += tau * x
@@ -395,6 +474,7 @@ class TcChannel:
     locate_usable: np.ndarray  # bool per logger bin: use for the time and pixel search
     flags: ChannelFlags
     windows: tuple[tuple[float, float], ...]
+    calm: np.ndarray | None = None  # bool per logger bin: no flame on the TC (``flame_free``); None = all
 
     @property
     def searchable(self) -> bool:
@@ -429,10 +509,47 @@ def prepare_channels(table: TcTable, options: MatchOptions, step: float) -> tupl
         if options.scope is not None:
             base &= window_mask(grid, [options.scope])
         usable = base & window_mask(grid, windows)
+        # jumps are found on the logger's own rows, and only among readings declared valid
+        rows = rows_ok & window_mask(table.times, windows)
+        if options.scope is not None:
+            rows &= window_mask(table.times, [options.scope])
+        calm = flame_free(table.times, np.where(rows, table.values[:, index], np.nan), grid, options.jump_k,
+                          options.jump_window_s, options.jump_hold_s)
         channels.append(TcChannel(name=name, index=index, values=values, usable=usable,
                                   locate_usable=base if options.search_outside_windows else usable,
-                                  flags=flags, windows=windows))
+                                  flags=flags, windows=windows, calm=calm))
     return grid, channels
+
+
+def flame_free(times: np.ndarray, values: np.ndarray, grid: np.ndarray, jump_k: float, window_s: float,
+               hold_s: float) -> np.ndarray:
+    """Per ``grid`` time: False from ``window_s`` before a TC jump until ``hold_s`` after it (TC data only).
+
+    A flame or hot gas jet on the junction makes a taped TC jump faster than
+    the surface under it can heat (0903: +500 K in seconds), and the TC then
+    reads neither the gas nor the surface while both cool; such stretches are
+    not fitted. A jump is a reading more than ``jump_k`` above any earlier
+    reading within ``window_s`` on the logger's own rows (``times``; missing
+    readings are skipped, so a spike that rises and falls inside the window,
+    or one whose peak was dropped, counts). A logger slower than the window
+    cannot show a jump, so none is found then.
+    Runaway heating of the cell itself is slower (0922: a few K/s), so it stays.
+    A hit whose effect outlasts ``hold_s`` (0903's 700-980 °C jets decay over
+    about 100 s) leaves its tail in the fit; the median over a TC's events
+    keeps such an event from setting the TC's value.
+    """
+    grid = np.asarray(grid, dtype=np.float64)
+    calm = np.ones(grid.size, dtype=bool)
+    values = np.asarray(values, dtype=np.float64)
+    ok = np.isfinite(values) & np.isfinite(np.asarray(times, dtype=np.float64))
+    t, x = np.asarray(times, dtype=np.float64)[ok], values[ok]
+    if hold_s <= 0 or t.size < 2:
+        return calm
+    first = np.searchsorted(t, t - window_s - 1e-9, side="left")  # earliest row within the window
+    for i in range(1, t.size):
+        if first[i] < i and x[i] - x[first[i]:i].min() > jump_k:
+            calm &= ~((grid >= t[i] - window_s - 1e-9) & (grid <= t[i] + hold_s + 1e-9))
+    return calm
 
 
 def _windows_for(valid: Mapping[str, Sequence[tuple[float, float]]], table: TcTable, index: int):
@@ -794,8 +911,9 @@ def spot_series(samples: Samples, pixel: tuple[int, int], size: int, lag_bins: i
     high = np.full(n, np.nan)
     flick_k = np.full(n, np.nan)
     sel = ir[inside]
-    block = np.asarray(samples.mean[sel, r0:r1, c0:c1], dtype=np.float64).reshape(sel.size, -1)
-    sd = np.asarray(samples.spread[sel, r0:r1, c0:c1], dtype=np.float64).reshape(sel.size, -1)
+    cells = (r1 - r0) * (c1 - c0)  # explicit: no recording bin may overlap the logger (a forced offset)
+    block = np.asarray(samples.mean[sel, r0:r1, c0:c1], dtype=np.float64).reshape(sel.size, cells)
+    sd = np.asarray(samples.spread[sel, r0:r1, c0:c1], dtype=np.float64).reshape(sel.size, cells)
     with np.errstate(invalid="ignore"):
         counts[inside] = block.mean(axis=1)
         low[inside] = block.min(axis=1)
@@ -846,9 +964,13 @@ def event_rules(channel: TcChannel, spot: SpotSeries, options: MatchOptions, fli
         rules = {
             "tc usable": channel.usable,
             f"tc ≥ {options.tc_min_c:g} °C": channel.values >= options.tc_min_c,
+            "no flame on the tc": channel.calm if channel.calm is not None else np.ones(channel.values.size, bool),
             "ir present": spot.status >= 0,
-            "ir in calibrated range": spot.status == 0,
         }
+        if options.below_range:
+            rules["ir in calibrated range or below"] = (spot.status == 0) | (spot.status == 1)
+        else:
+            rules["ir in calibrated range"] = spot.status == 0
         if flicker_known:
             rules["no flames (flicker)"] = spot.flicker < options.flicker_max
     return rules
@@ -971,6 +1093,8 @@ class ChannelResult:
     rules: dict[str, int]  # logger bins passing each event rule
     usable_bins: int
     trusted: bool = True  # False: most of its event seconds are not physical, so none of its events is used
+    eps: tuple[float, float, float] | None = None  # min, median, max of its used events' ε (the median is its value)
+    eps_events: int = 0
 
 
 @dataclass
@@ -994,6 +1118,10 @@ class MatchResult:
     spread: float | None  # max − min ε over the physical events
     consistent: bool | None  # span within ``consistent_eps``
     overlapping: bool | None  # the events' candidate-pixel ranges share a value
+    tc_spread: float | None  # max − min of the TCs' own values (TCs with a used event); None under two TCs
+    tcs_agree: bool | None  # tc_spread within ``consistent_eps``: one emissivity serves all TCs
+    common_eps: float | None  # median of the TCs' values when they agree (or the only TC's); else None
+    origin_s: float | None  # clock time of the workbook origin frame (superframing); None: frame / fps
     warnings: list[str]
     notes: list[str]
     reflected_c: float
@@ -1103,6 +1231,9 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
             if er.used:
                 all_events.append((er, counts_, values_, ch_))
         pending.clear()
+        own = [e.fit.eps for e in res.events if e.used and math.isfinite(e.fit.eps)]
+        if own:  # the median: one event spoiled by a flame or a contact change does not move it
+            res.eps, res.eps_events = _spread3(own), len(own)
         if match.found and not res.events:
             warnings.append(f"{ch.name}: no stretch passes the event rules ({_rule_note(res.rules, ch)}).")
     pooled = None
@@ -1152,7 +1283,24 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     found_now = [m for m in location.channels if m.found and not m.fixed]
     if len(found_now) == 1 and not location.lag_fixed:
         notes.append("Only one TC was found, so the time offset rests on that TC alone.")
-    ignition = int(round(location.lag_s * samples.fps))
+    medians = [res.eps[1] for res in results if res.eps is not None]
+    tc_spread = float(max(medians) - min(medians)) if len(medians) > 1 else None
+    tcs_agree = None if tc_spread is None else tc_spread <= options.consistent_eps
+    if samples.frame_seconds is not None:
+        breaks = samples.info.get("preset_breaks", 0)
+        notes.append("Superframing: the frames of the chosen preset were timed by the camera clock"
+                     + (f"; the preset cycle breaks {breaks} time(s) (dropped frames)." if breaks else "."))
+    if tcs_agree:
+        common = float(np.median(medians))
+    elif len(medians) == 1:
+        common = medians[0]
+    else:
+        common = None
+    ignition = samples.frame_at(location.lag_s)
+    n_frames = int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1))
+    origin_frame = min(max(ignition, 0), max(0, n_frames - 1))
+    clock = samples.frame_seconds
+    origin_s = float(clock[origin_frame]) if clock is not None and origin_frame < clock.size else None
     x0, y0 = samples.origin
     _nb, h, w = samples.mean.shape
     result = MatchResult(
@@ -1162,7 +1310,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         num_frames=int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1)),
         region=[x0, y0, x0 + w, y0 + h], preset=samples.info.get("preset"), channels=results,
         pooled=pooled, cross=cross, spread=spread, consistent=consistent, overlapping=overlapping,
-        warnings=warnings, notes=notes,
+        tc_spread=tc_spread, tcs_agree=tcs_agree, common_eps=common, origin_s=origin_s, warnings=warnings,
+        notes=notes,
         reflected_c=reflected_k - KELVIN, calibration=samples.report.message, spot=options.spot,
         options=_options_dict(options))
     _check(abort)
@@ -1237,10 +1386,28 @@ def summary_text(result: MatchResult) -> str:
                             if e.excluded_bound else ""))
     lines.append("")
     used = [e for ch in result.channels for e in ch.events if e.used]
-    if result.pooled is not None:
-        p = result.pooled
-        lines.append(f"Usable events together: emissivity {p.eps:.2f}, RMSE {p.rmse_k:.0f} K over {p.n} s.")
-    if result.spread is not None:
+    valued = [ch for ch in result.channels if ch.eps is not None]
+    if valued:
+        lines.append("Emissivity per TC (the median of its usable events; the range shows how far they spread):")
+        for ch in valued:
+            lo, med, hi = ch.eps
+            lines.append(f"  {ch.name}: {med:.2f}" + (f" ({ch.eps_events} events, {lo:.2f}-{hi:.2f})"
+                                                      if ch.eps_events > 1 else " (1 event)"))
+    if result.tcs_agree is False:
+        lines.append(f"The TCs differ (their values span {result.tc_spread:.2f}): each describes the surface at its "
+                     "own spot, so no common emissivity is given.")
+    else:
+        if result.tcs_agree:
+            lines.append(f"The TCs agree: emissivity {result.common_eps:.2f} (the median of their values).")
+        if result.pooled is not None:
+            p = result.pooled
+            text = f"All usable events fitted together: emissivity {p.eps:.2f}, RMSE {p.rmse_k:.0f} K over {p.n} s."
+            if result.common_eps is not None and abs(p.eps - result.common_eps) > result.options.get(
+                    "consistent_eps", 0.05):
+                text += (f" This is off the median ({result.common_eps:.2f}) because some events disagree; "
+                         "the median is the better value.")
+            lines.append(text)
+    if result.spread is not None and result.tcs_agree is not False:
         if result.consistent:
             verdict = "agree"
         elif result.overlapping:
@@ -1269,7 +1436,8 @@ def workbook_origin(result: MatchResult) -> tuple[int, float]:
     and the sheet's offset maps the logger onto it: logger time = workbook time − offset.
     """
     frame = min(max(int(result.ignition_frame), 0), max(0, int(result.num_frames) - 1))
-    return frame, float(result.lag_s - frame / result.fps)
+    at = result.origin_s if result.origin_s is not None else frame / result.fps  # the clock on superframing
+    return frame, float(result.lag_s - at)
 
 
 def tc_prefill(result: MatchResult, table: TcTable):
@@ -1373,7 +1541,8 @@ def save_figure(path: str | Path, result: MatchResult, location: Location, serie
         ax.plot(grid, tc.values, color="#eb6834", lw=1.5, label=ch.name)
         ax.plot(grid, spot.apparent, color="#2a78d6", lw=0.8, label="IR at ε 1")
         used_events = [e for e in ch.events if e.used] or ch.events
-        best = max(used_events, key=lambda e: e.fit.n).fit.eps if used_events else None
+        fitted = [e for e in used_events if e.fit.n > 0 and math.isfinite(e.fit.eps)]  # no-fit events have no ε
+        best = ch.eps[1] if ch.eps is not None else (max(fitted, key=lambda e: e.fit.n).fit.eps if fitted else None)
         if best is not None:
             temp = object_temperature(samples.calibration, params.with_(emissivity=best), spot.counts) - KELVIN
             ax.plot(grid, temp, color="#1baf7a", lw=0.8, label=f"IR at ε {best:.2f}")
@@ -1402,7 +1571,8 @@ def save_figure(path: str | Path, result: MatchResult, location: Location, serie
 
 
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
-        cache_dir: str | Path | None = None, sheet: str | None = None, figure: bool = True, workbook: bool = False,
+        cache_dir: str | Path | None = None, sheet: str | None = None, time_column: int | str | None = None,
+        figure: bool = True, workbook: bool = False,
         progress: Progress | None = None, abort: Abort | None = None,
         log: Callable[[str], None] | None = None) -> MatchResult:
     """Whole analysis; writes result.json, summary.txt, rois.json and overview.png into ``out_dir``.
@@ -1412,7 +1582,7 @@ def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, ou
     from .excel_export import RoiSet, save_roi_set
 
     say = log or (lambda text: None)
-    table = read_tc_table(tc_file, sheet=sheet)
+    table = read_tc_table(tc_file, sheet=sheet, time_column=time_column)
     step = options.step_s or table.interval
     say(f"TC file: {len(table.names)} channel(s), {table.times.size} rows every {table.interval:g} s")
     t0 = time.time()
@@ -1456,7 +1626,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("tc_file")
     parser.add_argument("--out", help="folder for result.json, summary.txt, rois.json, overview.png")
     parser.add_argument("--cache", help="folder that keeps the sampled statistics between runs")
-    parser.add_argument("--sheet")
+    parser.add_argument("--sheet", help="workbook sheet with the TC data (default: one named like TC data)")
+    parser.add_argument("--time-column", help="header of the TC file's time column (default: found)")
     parser.add_argument("--roi", help="x0,y0,x1,y1 in pixels (end exclusive)")
     parser.add_argument("--preset", type=int)
     parser.add_argument("--step", type=float, help="time bin in s (default: the logger interval)")
@@ -1470,6 +1641,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--spot", type=int, default=3)
     parser.add_argument("--tc-min", type=float, default=50.0)
     parser.add_argument("--reflected", type=float, help="reflected temperature, °C")
+    parser.add_argument("--jump", type=float, default=30.0,
+                        help="a TC rising more than this (K) within 5 s has a flame on it (default 30)")
+    parser.add_argument("--hold", type=float, default=30.0,
+                        help="seconds after such a jump that are not fitted (default 30; 0 = off)")
+    parser.add_argument("--below-range", action="store_true",
+                        help="also fit IR below the calibrated range (extrapolated)")
     parser.add_argument("--no-figure", action="store_true")
     parser.add_argument("--workbook", action="store_true", help="also write an Excel workbook with the TC data")
     args = parser.parse_args(argv)
@@ -1486,7 +1663,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         roi=_pair(args.roi, int) if args.roi else None, preset=args.preset, step_s=args.step,
         channels=tuple(c.strip() for c in args.channels.split(",")) if args.channels else (),
         valid=valid, scope=scope, lag_s=args.lag, lag_range=_pair(args.lag_range) if args.lag_range else None,
-        pixels=pixels, spot=args.spot, tc_min_c=args.tc_min, reflected_c=args.reflected)
+        pixels=pixels, spot=args.spot, tc_min_c=args.tc_min, reflected_c=args.reflected, jump_k=args.jump,
+        jump_hold_s=args.hold, below_range=args.below_range)
     last = [0.0]
 
     def progress(done: int, total: int) -> None:
@@ -1496,7 +1674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     out = args.out or str(Path(args.recording).with_suffix("")) + "_tcmatch"
     result = run(args.recording, args.tc_file, options, out_dir=out, cache_dir=args.cache, sheet=args.sheet,
-                 figure=not args.no_figure, workbook=args.workbook, progress=progress,
+                 time_column=args.time_column, figure=not args.no_figure, workbook=args.workbook, progress=progress,
                  log=lambda s: print(s, flush=True))
     print(summary_text(result))
     print(f"Results in {out}")

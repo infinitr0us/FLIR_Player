@@ -22,7 +22,7 @@ import csv
 import math
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -31,7 +31,30 @@ import numpy as np
 
 _UNIT_ONLY = re.compile(r"^[\[\(]?\s*(°\s*[CFK]|deg\.?\s*[CFK]|[CFK]|degrees?\s*[CFK]?|s|sec|secs|seconds|"
                         r"min|h|hh:mm:ss)\s*[\]\)]?$", re.IGNORECASE)
-_TIME_HINT = re.compile(r"time|sec|elapsed|date|clock", re.IGNORECASE)
+# whole words (after splitting "ElapsedTime" and "Time_s"): "Section" is no time, "Template" no temperature
+_TIME_HINT = re.compile(r"(?<![a-z])(time|times|timestamp|timestamps|sec|secs|second|seconds|elapsed|elapsedtime|"
+                        r"date|datetime|clock)(?![a-z])", re.IGNORECASE)  # compounds without case boundaries too
+_SHEET_HINT = re.compile(r"(?<![a-z])(tcs?|thermo\w*|temp|temps|temperatures?)(?![a-z])", re.IGNORECASE)
+_TEMPERATURE_UNIT = re.compile(r"°\s*[CFK]\b|\bdeg\.?\s*[CFK]\b|^[\[\(]\s*[CFK]\s*[\]\)]$|^[CFK]$", re.IGNORECASE)
+
+
+def _unit_patterns(words: str, spelled: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """(the cell is only the unit, the unit in brackets, the unit spelled out)."""
+    return (re.compile(rf"[\[\(]?\s*({words})\s*[\]\)]?", re.IGNORECASE),
+            re.compile(rf"[\[\(]\s*({words})\s*[\]\)]", re.IGNORECASE),
+            re.compile(rf"(?<![a-z]){spelled}(?![a-z])", re.IGNORECASE))
+
+
+_TIME_UNITS = ((1.0, _unit_patterns("s|sec|secs|second|seconds", "seconds")),
+               (60.0, _unit_patterns("min|mins|minute|minutes", "minutes")),
+               (3600.0, _unit_patterns("h|hr|hrs|hour|hours", "hours")))
+
+
+def _words(text: str) -> str:
+    """ "ElapsedTime" → "Elapsed Time", "TCData" → "TC Data", "Time_s" → "Time s" (for whole-word hints)."""
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+    return text.replace("_", " ")
+_TIME_RATIOS = (1.0, 60.0, 3600.0, 1 / 60.0, 1 / 3600.0)  # one time column against another in s, min or h
 
 
 @dataclass(frozen=True)
@@ -74,7 +97,11 @@ class TcTable:
 
 
 def read_tc_table(path: str | Path, *, sheet: str | None = None, time_column: int | str | None = None) -> TcTable:
-    """Read a logger export (.xlsx/.xlsm/.csv/.txt/.tsv); raises ValueError on no data."""
+    """Read a logger export (.xlsx/.xlsm/.csv/.txt/.tsv); raises ValueError on no data.
+
+    Without ``sheet``, a workbook's sheet named like TC data ("TC", "Thermocouples",
+    "Temperature") is preferred, else the one with the most rows; a note names the sheet used.
+    """
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix in (".xlsx", ".xlsm"):
@@ -87,19 +114,22 @@ def read_tc_table(path: str | Path, *, sheet: str | None = None, time_column: in
         if sheet not in sheets:
             raise ValueError(f"{path.name} has no sheet {sheet!r} (sheets: {', '.join(sheets)})")
         sheets = {sheet: sheets[sheet]}
-    best: TcTable | None = None
+    tables: list[tuple[str, TcTable]] = []
     errors = []
     for name, rows in sheets.items():
         try:
-            table = parse_rows(rows, time_column=time_column, source=f"{path.name}" +
-                               (f" [{name}]" if len(sheets) > 1 or sheet else ""))
+            tables.append((name, parse_rows(rows, time_column=time_column, source=f"{path.name}" +
+                                            (f" [{name}]" if len(sheets) > 1 or sheet else ""))))
         except ValueError as exc:
             errors.append(f"{name}: {exc}")
-            continue
-        if best is None or table.times.size > best.times.size:
-            best = table
-    if best is None:
+    if not tables:
         raise ValueError(f"{path.name}: no logger data found ({'; '.join(errors) or 'empty file'})")
+    hinted = [item for item in tables if _SHEET_HINT.search(_words(item[0]))]
+    name, best = max(hinted or tables, key=lambda item: item[1].times.size)
+    if len(tables) > 1:
+        why = "its name suggests TC data" if hinted else "it has the most rows"
+        others = ", ".join(repr(other) for other, _t in tables if other != name)
+        best = replace(best, notes=best.notes + (f"sheet {name!r} used ({why}); other sheets with data: {others}",))
     return best
 
 
@@ -209,7 +239,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
         raise ValueError("no block of at least three data rows")
     block = rows[first:last + 1]
     headers = rows[:first]
-    tcol = _time_column(block, headers, width, time_column)
+    tcol, scale = _time_column(block, headers, width, time_column)
     timed = [_time_like(row[tcol]) for row in block]  # rows at the edges without a time are not data
     lead = timed.index(True) if True in timed else 0
     trail = len(timed) - 1 - timed[::-1].index(True) if True in timed else len(timed) - 1
@@ -220,7 +250,11 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     channels = [c for c in range(width) if c != tcol
                 and sum(_number(row[c]) is not None for row in block) >= 0.5 * len(block)]
     counters = [c for c in channels if _counter([row[c] for row in block])]
-    channels = [c for c in channels if c not in counters]
+    raw_times = _seconds([row[tcol] for row in block])
+    # dropping a column needs a time word ("Time From Ignition"); a unit alone is too weak for that
+    copies = [c for c in channels if c not in counters and _time_words(headers, c)
+              and not _temperature_unit(headers, c) and _time_copy([row[c] for row in block], raw_times)]
+    channels = [c for c in channels if c not in counters and c not in copies]
     if not channels:
         raise ValueError("no numeric TC columns next to the time column")
     # rows without any reading at the edges of the block are not data (e.g. a lone number above it)
@@ -233,11 +267,13 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     first = first + lead
     if len(block) < 3:
         raise ValueError("no block of at least three data rows")
-    times = _seconds([row[tcol] for row in block])
+    times = _seconds([row[tcol] for row in block]) * scale
     values = np.array([[_number(row[c]) if _number(row[c]) is not None else np.nan for c in channels]
                        for row in block], dtype=np.float64)
     keep = np.isfinite(times)
     notes = []
+    if scale != 1.0:
+        notes.append(f"the time column is in {'minutes' if scale == 60.0 else 'hours'}; converted to seconds")
     if not keep.all():
         notes.append(f"{int((~keep).sum())} row(s) without a readable time were skipped")
     times, values = times[keep], values[keep]
@@ -251,7 +287,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
         times, values = times[~duplicate], values[~duplicate]
     # header rows name the channels; other text above the data is reported, not used
     titled = [row for row in headers if any(isinstance(row[c], str) and row[c].strip() for c in channels)]
-    names = _names(titled, channels)
+    names = _names([row for row in titled if not _uniform(row, channels)] or titled, channels)
     time_label = " ".join(reversed(_texts(titled, tcol))) or "Time"
     ignored = []
     for i, row in enumerate(headers):
@@ -264,6 +300,9 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     for c in counters:
         label = " ".join(reversed(_texts(titled, c))) or f"column {c + 1}"
         notes.append(f"column {label!r} counts rows (1, 2, 3, ...), so it is not used as a TC")
+    for c in copies:
+        label = " ".join(reversed(_texts(titled, c))) or f"column {c + 1}"
+        notes.append(f"column {label!r} is the time again in other units, so it is not used as a TC")
     if trailing > 0:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
@@ -276,6 +315,60 @@ def _counter(cells: list[Any]) -> bool:
     if len(values) < 3 or any(v is None for v in values) or values[0] not in (0.0, 1.0):
         return False
     return all(b - a == 1 for a, b in zip(values, values[1:]))
+
+
+def _time_copy(cells: list[Any], times: np.ndarray) -> bool:
+    """The time column again in other units (minutes beside seconds), not a measurement."""
+    values = np.array([np.nan if _number(v) is None else _number(v) for v in cells], dtype=np.float64)
+    ok = np.isfinite(values) & np.isfinite(times)
+    if ok.sum() < 3 or not np.ptp(times[ok]) > 0:
+        return False
+    x, y = times[ok], values[ok]
+    slope, intercept = np.polyfit(x, y, 1)
+    if not any(math.isclose(slope, ratio, rel_tol=1e-6) for ratio in _TIME_RATIOS):
+        return False
+    return float(np.max(np.abs(y - (slope * x + intercept)))) <= 1e-6 * max(float(np.ptp(y)), 1.0)
+
+
+def _uniform(row: tuple, channels: list[int]) -> bool:
+    """One text over all channels (e.g. FlexLogger's "Free_0"): it tells no channel apart."""
+    texts = [row[c].strip() for c in channels
+             if isinstance(row[c], str) and row[c].strip() and not _UNIT_ONLY.match(row[c].strip())]
+    return len(texts) >= 2 and len(set(texts)) == 1
+
+
+def _time_words(headers: list[tuple], column: int) -> bool:
+    return any(_TIME_HINT.search(_words(t)) for t in _texts(headers, column))
+
+
+def _temperature_unit(headers: list[tuple], column: int) -> bool:
+    return any(isinstance(row[column], str) and _TEMPERATURE_UNIT.search(row[column].strip()) for row in headers)
+
+
+def _time_evidence(headers: list[tuple], column: int) -> bool:
+    """The header says time (a time word, or a time unit such as "[min]") and gives no temperature unit."""
+    if _temperature_unit(headers, column):
+        return False
+    return _time_words(headers, column) or _time_scale(headers, column) is not None
+
+
+def _time_scale(headers: list[tuple], column: int) -> float | None:
+    """Seconds per unit of a time column from its header (1, 60 or 3600); None when no unit is given.
+
+    A unit counts when the cell is only the unit ("[min]", "s"), when it is spelled out ("minutes"),
+    or when it is in brackets beside a time word ("Time [s]"); a letter in brackets inside a name
+    ("TC (S)", south) does not.
+    """
+    for row in reversed(headers):  # nearest the data first
+        value = row[column]
+        if not (isinstance(value, str) and value.strip()):
+            continue
+        text = value.strip()
+        worded = bool(_TIME_HINT.search(_words(text)))
+        for factor, (alone, bracketed, spelled) in _TIME_UNITS:
+            if alone.fullmatch(text) or spelled.search(text) or (worded and bracketed.search(text)):
+                return factor
+    return None
 
 
 def _texts(headers: list[tuple], column: int) -> list[str]:
@@ -305,15 +398,25 @@ def _names(headers: list[tuple], channels: list[int]) -> tuple[str, ...]:
     return tuple(unique)
 
 
-def _time_column(block: list[tuple], headers: list[tuple], width: int, requested) -> int:
+def _time_column(block: list[tuple], headers: list[tuple], width: int, requested) -> tuple[int, float]:
+    """(column, seconds per unit) of the time column.
+
+    Preferred: a header that says time (a word such as time, elapsed, date, clock, or a time unit),
+    then a column in seconds or dates, then one without a unit, then minutes or hours (converted).
+    """
+    def scale_of(c: int) -> float:
+        if any(isinstance(row[c], (datetime, date, dtime, timedelta)) for row in block):
+            return 1.0
+        return _time_scale(headers, c) or 1.0
+
     if requested is not None:
         if isinstance(requested, int):
             if not 0 <= requested < width:
                 raise ValueError(f"time column {requested} is outside the table")
-            return requested
+            return requested, scale_of(requested)
         for c in range(width):
             if any(str(requested).casefold() == text.casefold() for text in _texts(headers, c)):
-                return c
+                return c, scale_of(c)
         raise ValueError(f"no column headed {requested!r}")
     candidates = []
     for c in range(width):
@@ -329,11 +432,15 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
             continue
         seconds = _seconds(cells)
         if np.all(np.isfinite(seconds)) and np.all(np.diff(seconds) >= 0) and seconds[-1] > seconds[0]:
-            hinted = any(_TIME_HINT.search(text) for text in _texts(headers, c))
-            candidates.append((not hinted, c))
+            hinted = _time_evidence(headers, c)
+            dated = any(isinstance(v, (datetime, date, dtime, timedelta)) for v in cells)
+            unit = 1.0 if dated else _time_scale(headers, c)
+            rank = 0 if unit == 1.0 else (1 if unit is None else 2)
+            candidates.append((not hinted, rank, c))
     if not candidates:
         raise ValueError("no increasing time column")
-    return min(candidates)[1]
+    c = min(candidates)[2]
+    return c, scale_of(c)
 
 
 def _seconds(cells: Iterable[Any]) -> np.ndarray:

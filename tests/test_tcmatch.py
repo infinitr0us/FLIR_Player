@@ -340,12 +340,17 @@ def test_fit_eps_bound_and_unconstrained() -> None:
 # --- sampling ---------------------------------------------------------------------------------
 
 
+class _Header(list):
+    time = None  # the frame's clock stamp, as fnv's frame_info has it
+
+
 class _FakeImager:
-    def __init__(self, frames: np.ndarray, presets=None):
+    def __init__(self, frames: np.ndarray, presets=None, clock=None):
         self.frames = frames
         self.num_frames, self.height, self.width = frames.shape
         self._i = 0
         self._presets = presets
+        self._clock = clock
 
     def get_frame(self, index):
         self._i = int(index)
@@ -356,7 +361,10 @@ class _FakeImager:
 
     @property
     def frame_info(self):
-        return [{"name": "Preset", "value": str(self._presets[self._i])}] if self._presets is not None else []
+        header = _Header([{"name": "Preset", "value": str(self._presets[self._i])}]
+                         if self._presets is not None else [])
+        header.time = self._clock[self._i] if self._clock is not None else None
+        return header
 
 
 def test_accumulate_mean_and_detrended_spread(tmp_path) -> None:
@@ -367,7 +375,7 @@ def test_accumulate_mean_and_detrended_spread(tmp_path) -> None:
     im = _FakeImager(frames)
     seen = []
     times, mean, spread, counts, first = tcmatch._accumulate(
-        im, np.arange(n), fps, 1.0, (1, 0, 4, 3), lambda d, t_: seen.append((d, t_)), lambda: False, None, None)
+        im, np.arange(n), t, 1.0, (1, 0, 4, 3), lambda d, t_: seen.append((d, t_)), lambda: False, None, None)
     bins = np.floor(t + 0.5).astype(int)
     assert times.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] and counts.tolist() == np.bincount(bins).tolist()
     assert first.tolist() == [int(np.flatnonzero(bins == k)[0]) for k in range(6)]
@@ -385,7 +393,7 @@ def test_accumulate_mean_and_detrended_spread(tmp_path) -> None:
                 assert spread[k, r, c] == pytest.approx(resid.std(), rel=1e-4, abs=1e-4)
     assert seen[-1] == (n, n)
     # the cache keeps the same statistics
-    cached = tcmatch._accumulate(im, np.arange(n), fps, 1.0, (1, 0, 4, 3), None, lambda: False, tmp_path, "k")
+    cached = tcmatch._accumulate(im, np.arange(n), t, 1.0, (1, 0, 4, 3), None, lambda: False, tmp_path, "k")
     loaded = tcmatch._load_cache(tmp_path, "k")
     for got, want in zip(loaded, cached):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -395,7 +403,8 @@ def test_accumulate_mean_and_detrended_spread(tmp_path) -> None:
 def test_accumulate_refuses_huge_statistics_without_a_cache() -> None:
     im = _FakeImager(np.zeros((2, 2, 2), np.float32))
     with pytest.raises(ValueError, match="smaller region"):
-        tcmatch._accumulate(im, np.array([0, 10 ** 8]), 1.0, 1.0, (0, 0, 2, 2), None, lambda: False, None, None)
+        tcmatch._accumulate(im, np.array([0, 10 ** 8]), np.array([0.0, 1e8]), 1.0, (0, 0, 2, 2), None,
+                            lambda: False, None, None)
 
 
 class _Preset:
@@ -409,19 +418,45 @@ class _Info:
         self.preset_info = presets
 
 
-def test_preset_frames_of_a_superframing_recording() -> None:
-    frames = np.zeros((200, 2, 2), np.float32)
-    im = _FakeImager(frames, presets=[1 + (i % 2) for i in range(200)])
-    im.source_info = _Info([_Preset(False, 0), _Preset(True, 100, 523.15, 873.15), _Preset(True, 100, 773.15, 1473.15)])
-    layout, ranges = tcmatch.preset_frames(im)
-    assert layout == {1: (0, 2), 2: (1, 2)}
-    assert ranges == {1: (523.15, 873.15), 2: (773.15, 1473.15)}
-    im._presets[100:] = [1] * 100  # a broken pattern
-    with pytest.raises(ValueError, match="alternate"):
-        tcmatch.preset_frames(im)
-    single = _FakeImager(frames)
+def test_preset_frames_of_a_superframing_recording(tmp_path) -> None:
+    info = _Info([_Preset(False, 0), _Preset(True, 100, 523.15, 873.15), _Preset(True, 100, 773.15, 1473.15)])
+    start = datetime(2026, 9, 3, 10, 51, 49)
+    im = _FakeImager(np.zeros((200, 2, 2), np.float32), presets=[1 + (i % 2) for i in range(200)],
+                     clock=[start + timedelta(seconds=0.5 * i) for i in range(200)])
+    im.source_info = info
+    layout = tcmatch.preset_frames(im)  # every header is read: presets and clock
+    assert sorted(layout.frames) == [1, 2] and layout.breaks == 0
+    np.testing.assert_allclose(layout.seconds, 0.5 * np.arange(200))
+    np.testing.assert_array_equal(layout.frames[1], np.arange(0, 200, 2))
+    np.testing.assert_array_equal(layout.frames[2], np.arange(1, 200, 2))
+    assert layout.ranges == {1: (523.15, 873.15), 2: (773.15, 1473.15)}
+    # a dropped frame breaks the cycle (0903 A8303: 14 breaks in 16,481 frames); the clock times the frames,
+    # which frame number / rate does not after the drop
+    kept = [i for i in range(201) if i != 101]
+    gappy = _FakeImager(np.arange(200, dtype=np.float32).reshape(200, 1, 1), presets=[1 + (i % 2) for i in kept],
+                        clock=[start + timedelta(seconds=0.5 * i) for i in kept])
+    gappy.source_info = info
+    seen = []
+    layout = tcmatch.preset_frames(gappy, progress=lambda d, t: seen.append((d, t)))
+    assert layout.breaks == 1 and seen[-1] == (200, 200)
+    np.testing.assert_array_equal(layout.frames[1], [k for k, i in enumerate(kept) if i % 2 == 0])
+    np.testing.assert_allclose(layout.seconds, 0.5 * np.array(kept))
+    ones = layout.frames[1]
+    _t, _m, _s, counts, _f = tcmatch._accumulate(gappy, ones, layout.seconds[ones], 1.0, (0, 0, 1, 1), None,
+                                                 lambda: False, None, None)
+    assert counts.tolist() == [1] * 101  # one preset-1 frame per second, also after the drop
+    # the scan is kept in a cache folder and read back
+    fake_path = tmp_path / "rec.ats"
+    fake_path.write_bytes(b"x")
+    first = tcmatch._cached_layout(gappy, fake_path, tmp_path, None, None, None)
+    gappy._presets = None  # a second scan would fail now
+    again = tcmatch._cached_layout(gappy, fake_path, tmp_path, None, None, None)
+    assert again.breaks == 1 and again.ranges == first.ranges
+    np.testing.assert_array_equal(again.frames[2], first.frames[2])
+    np.testing.assert_array_equal(again.seconds, first.seconds)
+    single = _FakeImager(np.zeros((200, 2, 2), np.float32))
     single.source_info = _Info([_Preset(True, 200, 273.15, 923.15)])
-    assert tcmatch.preset_frames(single) == ({}, {})
+    assert not tcmatch.preset_frames(single)
 
 
 def test_sample_recording_on_the_a700_clip() -> None:
@@ -618,14 +653,14 @@ def test_r02_a_tc_is_found_only_at_the_shared_offset_with_enough_overlap() -> No
 
 
 def test_r03_a_chosen_preset_brings_its_own_range() -> None:
-    layout = {1: (0, 2), 2: (1, 2)}
-    ranges = {1: (523.15, 873.15), 2: (773.15, 1473.15)}
-    preset, limits = tcmatch.choose_preset(layout, ranges, 2)
+    layout = tcmatch.PresetLayout(frames={1: np.arange(0, 10, 2), 2: np.arange(1, 10, 2)},
+                                  ranges={1: (523.15, 873.15), 2: (773.15, 1473.15)})
+    preset, limits = tcmatch.choose_preset(layout, 2)
     assert preset == 2 and limits.calibrated == (773.15, 1473.15)
-    assert tcmatch.choose_preset(layout, ranges)[0] == 1  # default: the lowest range
-    assert tcmatch.choose_preset({}, {}) == (None, None)
+    assert tcmatch.choose_preset(layout)[0] == 1  # default: the lowest range
+    assert tcmatch.choose_preset(tcmatch.PresetLayout()) == (None, None)
     with pytest.raises(ValueError, match="Preset 3"):
-        tcmatch.choose_preset(layout, ranges, 3)
+        tcmatch.choose_preset(layout, 3)
 
 
 def test_r04_a_tc_heating_from_the_start_is_not_failed() -> None:
@@ -756,7 +791,8 @@ def test_r11_a_cancelled_rebuild_leaves_no_complete_cache(tmp_path) -> None:
 
     n = 800
     im = _FakeImager(np.arange(n, dtype=np.float32).reshape(n, 1, 1) + 1000.0)
-    cached = tcmatch._accumulate(im, np.arange(n), 10.0, 1.0, (0, 0, 1, 1), None, lambda: False, tmp_path, "k")
+    cached = tcmatch._accumulate(im, np.arange(n), np.arange(n) / 10.0, 1.0, (0, 0, 1, 1), None, lambda: False,
+                                 tmp_path, "k")
     del cached
     gc.collect()
     (tmp_path / "k_spread.npy").write_bytes(b"damaged")
@@ -768,7 +804,7 @@ def test_r11_a_cancelled_rebuild_leaves_no_complete_cache(tmp_path) -> None:
         return calls[0] > 1
 
     with pytest.raises(tcmatch.JobCancelled):
-        tcmatch._accumulate(im, np.arange(n), 10.0, 1.0, (0, 0, 1, 1), None, abort, tmp_path, "k")
+        tcmatch._accumulate(im, np.arange(n), np.arange(n) / 10.0, 1.0, (0, 0, 1, 1), None, abort, tmp_path, "k")
     gc.collect()
     assert tcmatch._load_cache(tmp_path, "k") is None
 
@@ -860,3 +896,255 @@ def test_f5_the_bounded_fit_is_the_same_in_blocks(monkeypatch) -> None:
     blocked = tcmatch.fit_eps(A700, PARAMS, counts, tc)
     assert blocked.eps == whole.eps and blocked.rmse_k == pytest.approx(whole.rmse_k, rel=1e-12)
     assert whole.eps == pytest.approx(0.77, abs=0.01)
+
+
+# --- 0903 dataset (2026-10-07): lab-workbook layouts, flames on the TCs, values per TC -------------
+
+
+def test_g1_the_0903_tc_sheet_layout() -> None:
+    """FlexLogger export: minutes beside seconds, a "Free_0" header row over every channel."""
+    rows = [("Time", "ELAPSED TIME", "Free_0", "Free_0", "Free_0"),
+            ("From Ignition", "[sec]", "S1", "T1", "TC Tree (1.5 m)"),
+            (None, 420, None, None, None),
+            ("[mim]", "shft time", None, None, None)]
+    rows += [(k / 60.0, k, 21.6 + 0.3 * k, 21.9 + 0.2 * k + (k % 3), 23.0) for k in range(10)]
+    table = parse_rows(rows)
+    np.testing.assert_array_equal(table.times, np.arange(10.0))  # the seconds, not the minutes
+    assert table.names == ("S1", "T1", "TC Tree (1.5 m)")
+    assert any("time again in other units" in note for note in table.notes)
+    assert any("shft time" in note for note in table.notes)
+    minutes = parse_rows([("Time [min]", "TC")] + [(0.5 * k, 30.0 + k * k) for k in range(5)])
+    np.testing.assert_allclose(minutes.times, 30.0 * np.arange(5))  # converted
+    assert any("minutes" in note for note in minutes.notes)
+
+
+def test_g2_a_sheet_named_tc_wins_over_a_bigger_one(tmp_path) -> None:
+    import xlsxwriter
+    path = tmp_path / "lab.xlsx"
+    book = xlsxwriter.Workbook(str(path))
+    log = book.add_worksheet("Log")
+    log.write_row(0, 0, ["Time", "CO", "O2"])
+    for k in range(50):
+        log.write_row(1 + k, 0, [k, 0.39, 0.72])
+    sheet = book.add_worksheet("TC")
+    sheet.write_row(0, 0, ["Time", "S1"])
+    for k in range(20):
+        sheet.write_row(1 + k, 0, [k, 22.0 + k])
+    book.close()
+    table = read_tc_table(path)
+    assert table.names == ("S1",) and "[TC]" in table.source
+    assert any("'TC' used" in note and "'Log'" in note for note in table.notes)
+    assert read_tc_table(path, sheet="Log").names == ("CO", "O2")
+
+
+def test_g3_a_flame_on_the_tc_is_not_fitted_but_runaway_heating_is() -> None:
+    t = np.arange(400.0)
+    surface = 100.0 + np.clip(t - 50, 0, 100) * 4.0  # the cell heats at 4 K/s (runaway onset, as 0922)
+    tc = surface + np.where(t >= 250, 400.0 * np.exp(-(t - 250) / 5.0), 0.0)  # a jet on the TC at 250 s
+    calm = tcmatch.flame_free(t, tc, t, 30.0, 5.0, 30.0)
+    assert calm[:245].all() and not calm[245:285].any() and calm[285:].all()  # 5 s before to 30 s after the jumps
+    assert tcmatch.flame_free(t, tc, t, 30.0, 5.0, 0.0).all()  # hold 0 = off
+    samples, table = _one_pixel_scene(tc, counts_for(surface, 0.8))  # the camera sees the surface
+    options = MatchOptions(spot=1, lag_s=0.0, pixels={"TC A": (0, 0)})
+    result, _l, _s = tcmatch.analyse(samples, table, options)
+    ch = result.channels[0]
+    assert all(e.end_s < 250 or e.start_s > 284 for e in ch.events)  # no second of the jet is fitted
+    assert ch.eps[1] == pytest.approx(0.8, abs=0.002) and 355 <= ch.rules["no flame on the tc"] <= 365
+    off, _l, _s = tcmatch.analyse(samples, table, _replace(options, jump_hold_s=0.0))
+    assert abs(off.channels[0].eps[1] - 0.8) > 0.01  # the jet pulls the fit off
+
+
+def _two_spot_scene(eps_a: float, eps_b: float):
+    t = np.arange(300.0)
+    a = 120.0 - 50.0 * np.cos(t / 30.0) + 0.2 * t  # never below the start (a TC far below it counts as failed)
+    b = 150.0 - 40.0 * np.cos(t / 25.0)
+    mean = np.stack([counts_for(a, eps_a), counts_for(b, eps_b)], axis=1).astype(np.float32).reshape(300, 1, 2)
+    samples = Samples(path=Path("synthetic.seq"), times=t, mean=mean, spread=np.zeros_like(mean),
+                      counts=np.full(300, 30, dtype=np.int32), first_frame=np.arange(300, dtype=np.int64) * 30,
+                      origin=(0, 0), size=(2, 1), fps=30.0, step=1.0, report=REPORT, params=PARAMS,
+                      info={"camera": "synthetic", "frames": 9000})
+    table = TcTable(times=t, values=np.column_stack([a, b]), names=("S2", "S3"))
+    return samples, table, MatchOptions(spot=1, lag_s=0.0, pixels={"S2": (0, 0), "S3": (0, 1)})
+
+
+def test_g4_tcs_on_different_surfaces_keep_their_own_values() -> None:
+    samples, table, options = _two_spot_scene(0.9, 0.55)  # 0903: S2 about 0.9, S3 about 0.55
+    result, _l, _s = tcmatch.analyse(samples, table, options)
+    s2, s3 = result.channels
+    assert s2.eps[1] == pytest.approx(0.9, abs=0.002) and s3.eps[1] == pytest.approx(0.55, abs=0.002)
+    assert s2.eps_events == 1 and result.tcs_agree is False and result.tc_spread == pytest.approx(0.35, abs=0.005)
+    text = tcmatch.summary_text(result)
+    assert "The TCs differ" in text and "fitted together" not in text  # no common value
+    same, _l, _s = tcmatch.analyse(*_two_spot_scene(0.8, 0.8)[:2], options)
+    assert same.tcs_agree is True and same.common_eps == pytest.approx(0.8, abs=0.002)
+    assert "The TCs agree: emissivity 0.80" in tcmatch.summary_text(same)
+    json.dumps(result.to_dict())
+
+
+def test_g5_below_the_calibrated_range_only_when_asked() -> None:
+    tc = 60.0 + 30.0 * np.sin(np.arange(300.0) / 40.0) ** 2  # 60-90 °C: below a 100-650 °C range (T650)
+    samples, table = _one_pixel_scene(tc, counts_for(tc, 0.85))
+    t650 = Calibration(planck=A700.planck, limits=RangeLimits(calibrated=(373.15, 923.15), raw=A700.limits.raw),
+                       source="100-650 °C")
+    samples = _replace(samples, report=CalibrationReport(calibration=t650, status="verified", message="synthetic"))
+    options = MatchOptions(spot=1, lag_s=0.0, pixels={"TC A": (0, 0)})
+    strict, _l, _s = tcmatch.analyse(samples, table, options)
+    assert not strict.channels[0].events and strict.channels[0].rules["ir in calibrated range"] == 0
+    loose, _l, _s = tcmatch.analyse(samples, table, _replace(options, below_range=True))
+    assert loose.channels[0].eps[1] == pytest.approx(0.85, abs=0.002)
+    assert loose.channels[0].rules["ir in calibrated range or below"] == 300
+
+
+def test_g6_the_figure_draws_a_tc_whose_events_all_lack_a_fit(tmp_path) -> None:
+    tc = 100.0 + np.arange(200.0) * 0.2
+    samples, table = _one_pixel_scene(tc, counts_for(tc + 150.0, 1.0))  # IR far above any match throughout
+    options = MatchOptions(spot=1, lag_s=0.0, pixels={"TC A": (0, 0)})
+    result, location, series = tcmatch.analyse(samples, table, options)
+    assert result.channels[0].events and all(e.fit.n == 0 for e in result.channels[0].events)
+    grid, _channels = tcmatch.prepare_channels(table, options, 1.0)
+    tcmatch.save_figure(tmp_path / "overview.png", result, location, series, samples, grid)  # raised before
+    assert (tmp_path / "overview.png").stat().st_size > 0
+
+
+# --- Codex review of the 0903 changes (run 20261007-161831-review-tcmatch-0903) ------------------------
+
+
+def test_h1_a_short_spike_or_a_dropped_peak_still_counts_as_a_jump() -> None:
+    x = np.r_[np.full(10, 100.0), [200.0, 160.0, 125.0, 110.0, 100.0], np.full(60, 100.0)]  # up and down in 5 s
+    t = np.arange(x.size, dtype=float)
+    calm = tcmatch.flame_free(t, x, t, 30.0, 5.0, 30.0)
+    assert not calm[9:41].any() and calm[:5].all() and calm[42:].all()
+    gap = np.r_[np.full(10, 100.0), [np.nan, 180.0, 130.0], np.full(60, 100.0)]  # the peak spike-filtered away
+    assert not tcmatch.flame_free(t[:gap.size], gap, t[:gap.size], 30.0, 5.0, 30.0)[11]
+    slow = np.arange(0.0, 120.0, 3.0)  # a 3 s logger heating at 5.5 K/s: 27.5 K per 5 s, no jump
+    assert tcmatch.flame_free(slow, 100.0 + 5.5 * slow, slow, 30.0, 5.0, 30.0).all()
+    coarse = np.arange(0.0, 110.0, 10.0)  # a 10 s logger at 4 K/s: no two rows within 5 s, so no jump (R1)
+    assert tcmatch.flame_free(coarse, 100.0 + 4.0 * coarse, coarse, 30.0, 5.0, 30.0).all()
+    fine = np.arange(0.0, 100.0)  # a 1 s logger, analysed on a 10 s grid: the jump still holds its bins
+    jumpy = np.where(fine >= 50, 300.0, 100.0)
+    held = tcmatch.flame_free(fine, jumpy, coarse, 30.0, 5.0, 30.0)
+    assert held.tolist() == [True] * 5 + [False] * 4 + [True] * 2
+
+
+def test_h2_cancelling_dropped_frames_are_found_by_the_full_scan() -> None:
+    info = _Info([_Preset(False, 0), _Preset(True, 5000, 523.15, 873.15), _Preset(True, 5000, 773.15, 1473.15)])
+    start = datetime(2026, 9, 3, 10, 51, 49)
+    kept = [i for i in range(10_002) if i not in (101, 110)]  # two drops: the phase flips back between checks
+    im = _FakeImager(np.zeros((len(kept), 1, 1), np.float32), presets=[1 + (i % 2) for i in kept],
+                     clock=[start + timedelta(seconds=0.5 * i) for i in kept])
+    im.source_info = info
+    layout = tcmatch.preset_frames(im)
+    assert layout.breaks == 2
+    np.testing.assert_array_equal(layout.frames[1], [k for k, i in enumerate(kept) if i % 2 == 0])
+    np.testing.assert_allclose(layout.seconds, 0.5 * np.array(kept))
+
+
+def test_h3_the_ignition_frame_follows_the_clock() -> None:
+    kept = np.array([i for i in range(2400) if not 101 <= i <= 201])  # 2 Hz, frames 101-201 dropped
+    samples, _table = _one_pixel_scene(np.full(10, 100.0))
+    samples = _replace(samples, fps=(kept.size - 1) / (0.5 * (kept[-1] - kept[0])), frame_seconds=0.5 * kept)
+    frame = samples.frame_at(600.0)
+    assert samples.frame_seconds[frame] == 600.0 and frame == 1099
+    assert samples.frame_at(-10.0) == round(-10.0 * samples.fps)  # before the recording: extrapolated
+    # through analyse: the ignition frame and the workbook origin agree with the clock (R2)
+    ir = 120.0 + 10.0 * np.sin(np.arange(1300.0) / 50.0)
+    scene, _t = _one_pixel_scene(ir)
+    scene = _replace(scene, fps=samples.fps, frame_seconds=0.5 * kept)
+    table = TcTable(times=np.arange(600.0), values=ir[600:1200, None], names=("TC A",))
+    result, _l, _s = tcmatch.analyse(scene, table, MatchOptions(spot=1, lag_s=600.0, pixels={"TC A": (0, 0)}))
+    assert result.ignition_frame == 1099 and tcmatch.workbook_origin(result) == (1099, 0.0)
+
+
+def test_h4_jumps_in_invalid_readings_do_not_hold_valid_ones() -> None:
+    t = np.arange(100.0)
+    tc = 100.0 + 0.5 * t
+    tc[50:60] += 400.0  # a spurious excursion outside the validity window
+    samples, table = _one_pixel_scene(tc, counts_for(100.0 + 0.5 * t, 0.8))
+    options = MatchOptions(spot=1, lag_s=0.0, pixels={"TC A": (0, 0)}, valid={"TC A": ((60, 99),)})
+    result, _l, _s = tcmatch.analyse(samples, table, options)
+    events = result.channels[0].events
+    assert [(e.start_s, e.end_s) for e in events] == [(60.0, 99.0)]
+    assert events[0].fit.eps == pytest.approx(0.8, abs=0.002)
+
+
+def test_h5_agreeing_tcs_report_their_median_not_a_pulled_pooled_fit() -> None:
+    t = np.arange(700.0)
+    a = 150.0 - 40.0 * np.cos(t / 30.0)  # never below the start: a TC falling far below it counts as failed
+    b = 160.0 - 35.0 * np.cos(t / 25.0)
+    seen_a = np.where(t < 100, counts_for(a, 0.8), counts_for(a, 0.2))  # A: two short events at 0.8, one long at 0.2
+    mean = np.stack([seen_a, counts_for(b, 0.8)], axis=1).astype(np.float32).reshape(700, 1, 2)
+    spread = np.zeros_like(mean)
+    spread[40:50, 0, 0] = 5000.0  # flames in front of A split its events
+    spread[90:100, 0, 0] = 5000.0
+    samples = Samples(path=Path("synthetic.seq"), times=t, mean=mean, spread=spread,
+                      counts=np.full(700, 30, dtype=np.int32), first_frame=np.arange(700, dtype=np.int64) * 30,
+                      origin=(0, 0), size=(2, 1), fps=30.0, step=1.0, report=REPORT, params=PARAMS,
+                      info={"camera": "synthetic", "frames": 21000})
+    table = TcTable(times=t, values=np.column_stack([a, b]), names=("A", "B"))
+    options = MatchOptions(spot=1, lag_s=0.0, pixels={"A": (0, 0), "B": (0, 1)})
+    result, _l, _s = tcmatch.analyse(samples, table, options)
+    assert result.channels[0].eps_events == 3 and result.channels[0].eps[1] == pytest.approx(0.8, abs=0.002)
+    assert result.tcs_agree and result.common_eps == pytest.approx(0.8, abs=0.002)
+    assert result.pooled.eps < 0.7  # the long 0.2 event pulls the pooled fit
+    text = tcmatch.summary_text(result)
+    assert "The TCs agree: emissivity 0.80" in text and "the median is the better value" in text
+
+
+def test_h6_h7_time_units_and_words() -> None:
+    for unit, factor in (("[min]", 60.0), ("[h]", 3600.0)):
+        table = parse_rows([(unit, "TC1")] + [(k / 2, 100.0 + k * k) for k in range(5)])
+        np.testing.assert_allclose(table.times, factor * np.arange(5) / 2)  # not the rising TC
+        assert table.names == ("TC1",)
+    section = parse_rows([("Time [s]", "TC Section 1", "TC2")] + [(2 * k, 100.0 + 2 * k, 23.0) for k in range(6)])
+    assert section.names == ("TC Section 1", "TC2")  # "Section" is no time word
+    compound = parse_rows([("Scan", "ElapsedTime", "TC1")] + [(k + 1, 5.0 * k, 100.0 + k * k) for k in range(6)])
+    np.testing.assert_allclose(compound.times, 5.0 * np.arange(6))  # "ElapsedTime" is a time word (R3)
+    assert compound.names == ("TC1",)
+    south = parse_rows([("Time [s]", "TC (S)", "TC (N)"), (None, "[°C]", "[°C]")]
+                       + [(2 * k, 100.0 + 2 * k, 23.0) for k in range(6)])
+    assert south.names == ("TC (S)", "TC (N)")  # "(S)" is south here, not seconds (R4)
+
+
+def test_h8_a_truncated_layout_cache_is_scanned_again(tmp_path) -> None:
+    info = _Info([_Preset(False, 0), _Preset(True, 10, 523.15, 873.15), _Preset(True, 10, 773.15, 1473.15)])
+    start = datetime(2026, 9, 3, 10, 51, 49)
+    im = _FakeImager(np.zeros((20, 1, 1), np.float32), presets=[1 + (i % 2) for i in range(20)],
+                     clock=[start + timedelta(seconds=0.5 * i) for i in range(20)])
+    im.source_info = info
+    path = tmp_path / "rec.ats"
+    path.write_bytes(b"x")
+    store = tmp_path / f"{tcmatch._file_key(path, 'presets', 1)}_presets.npz"
+    store.write_bytes(bytes([0x50, 0x4B, 0x03, 0x04]) + b" truncated")  # a ZIP signature, then nothing valid
+    layout = tcmatch._cached_layout(im, path, tmp_path, None, None, None)
+    np.testing.assert_array_equal(layout.frames[2], np.arange(1, 20, 2))
+    assert not list(tmp_path.glob("*.partial.npz"))  # the rewrite replaced the broken file
+    im._presets = None  # a second scan would fail now
+    again = tcmatch._cached_layout(im, path, tmp_path, None, None, None)
+    np.testing.assert_array_equal(again.seconds, layout.seconds)
+
+
+def test_h9_a_template_sheet_is_no_tc_sheet(tmp_path) -> None:
+    import xlsxwriter
+    path = tmp_path / "lab.xlsx"
+    book = xlsxwriter.Workbook(str(path))
+    log = book.add_worksheet("Log")
+    log.write_row(0, 0, ["Time", "TC1"])
+    for k in range(10):
+        log.write_row(1 + k, 0, [k, 20.0 + k * k])
+    template = book.add_worksheet("Template")
+    template.write_row(0, 0, ["Time", "X"])
+    for k in range(5):
+        template.write_row(1 + k, 0, [k, 1.0])
+    book.close()
+    table = read_tc_table(path)
+    assert "[Log]" in table.source and any("most rows" in note for note in table.notes)
+
+
+def test_h10_compound_time_names_in_any_case_and_a_forced_offset_without_overlap() -> None:
+    for header in ("elapsedtime", "ELAPSEDTIME", "ElapsedTime", "Elapsed_Time"):
+        table = parse_rows([("Scan", header, "TC1")] + [(k + 1, 5.0 * k, 100.0 + k * k) for k in range(6)])
+        np.testing.assert_allclose(table.times, 5.0 * np.arange(6))
+        assert table.names == ("TC1",)
+    samples, table = _one_pixel_scene(100.0 + np.arange(100.0))  # logger and recording both 0-99 s
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_s=200.0, pixels={"TC A": (0, 0)}))
+    assert not result.channels[0].events and result.channels[0].eps is None  # no overlap: no events, no crash
