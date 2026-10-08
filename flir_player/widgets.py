@@ -2065,6 +2065,7 @@ class InspectorPanel(QWidget):
     isotherm_changed = Signal(str, float, float)
     object_parameters_applied = Signal(dict)
     object_parameters_reset = Signal()
+    tc_fit_requested = Signal()
     overlays_changed = Signal(bool, bool)
     flips_changed = Signal(bool, bool)
     corrections_changed = Signal(bool, bool)
@@ -2344,6 +2345,12 @@ class InspectorPanel(QWidget):
         self.params_panel.applied.connect(self.object_parameters_applied)
         self.params_panel.reset_requested.connect(self.object_parameters_reset)
         layout.addWidget(self.params_panel)
+        self.tc_fit_button = QPushButton("Fit Emissivity from TCs…")
+        self.tc_fit_button.setProperty("variant", "ghost")
+        self.tc_fit_button.setToolTip("Find the thermocouples in the recording and fit the emissivity "
+                                      "from their readings (a TC logger file is needed)")
+        self.tc_fit_button.clicked.connect(self.tc_fit_requested)
+        layout.addWidget(self.tc_fit_button)
 
         layout.addSpacing(8)
         layout.addWidget(self._hairline())
@@ -2860,6 +2867,7 @@ class InspectorPanel(QWidget):
         self.iso_limit1_spin.setEnabled(iso_on)
         self.iso_limit2_spin.setEnabled(iso_on and iso_mode == "interval")
         self.params_panel.setEnabled(enabled and self.params_panel._snapshot.get("can_change", False))
+        self.tc_fit_button.setEnabled(enabled)
         self.clipping_check.setEnabled(enabled)
         self.markers_check.setEnabled(enabled)
         self.flip_h_button.setEnabled(enabled)

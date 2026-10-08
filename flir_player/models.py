@@ -101,6 +101,16 @@ class FrameRate:
 
 
 @dataclass(frozen=True, slots=True)
+class PresetRange:
+    """One preset of a superframing recording: its index, frame count and calibrated range (K)."""
+
+    index: int
+    frames: int
+    min_k: float | None = None
+    max_k: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class VideoMetadata:
     """Metadata needed by the player without retaining the SDK object."""
 
@@ -122,6 +132,7 @@ class VideoMetadata:
     # recorded values; the player opens with the camera's values instead.
     saved_parameters: dict[str, float] | None = None
     saved_by: str = ""  # "ResearchIR" when its workspace XML holds the override
+    presets: tuple[PresetRange, ...] = ()  # superframing presets; empty for one preset
 
     @property
     def filename(self) -> str:

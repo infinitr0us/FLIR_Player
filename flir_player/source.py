@@ -27,6 +27,7 @@ from .models import (
     CadenceInfo,
     FramePacket,
     FrameRate,
+    PresetRange,
     RoiShape,
     RoiStats,
     UnitOption,
@@ -187,6 +188,21 @@ def _cadence_rows(cadence: CadenceInfo | None, average_fps: float,
             )
         )
     return tuple(rows)
+
+
+def _superframing_presets(im: Any) -> tuple[PresetRange, ...]:
+    """The presets a superframing recording cycles through (empty for one preset)."""
+    info = getattr(im, "source_info", None)
+    presets = []
+    for index, preset in enumerate(getattr(info, "preset_info", ()) or ()):
+        frames = int(getattr(preset, "num_frames", 0) or 0)
+        if not getattr(preset, "available", False) or frames <= 0:
+            continue
+        calibrated = bool(getattr(preset, "calibrated", False))
+        presets.append(PresetRange(index=index, frames=frames,
+                                   min_k=float(preset.min_temp) if calibrated else None,
+                                   max_k=float(preset.max_temp) if calibrated else None))
+    return tuple(presets) if len(presets) >= 2 else ()
 
 
 def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
@@ -405,6 +421,7 @@ class FlirVideoSource:
                 rate=rate,
                 saved_parameters=saved_parameters,
                 saved_by=saved_by,
+                presets=_superframing_presets(self._im),
             )
             return self._metadata
         except Exception:

@@ -175,7 +175,11 @@ class DecoderThread(QThread):
     extract_progress = Signal(int, int)
     extract_finished = Signal(bool, str)
     export_progress = Signal(int, int)
+    export_stage = Signal(str)  # what a long job is doing now, for its progress label
     export_finished = Signal(bool, str)
+    # TC calibration: ok, message, the tcmatch.RunOutput (None on failure);
+    # the job owns the export progress dialog like the exports.
+    tc_finished = Signal(bool, str, object)
     # Bitmask exports have no progress dialog, so they report separately: a
     # queued one must never close the dialog of an export started after it.
     bitmasks_finished = Signal(bool, str)
@@ -278,6 +282,18 @@ class DecoderThread(QThread):
         token = CancellationToken()
         self._tokens.append(token)
         self._commands.put(("export_excel", dict(params, _token=token)))
+
+    def request_tc_match(self, params: dict) -> None:
+        """Find the TC pixels in the open recording and fit the emissivity (``tcmatch``)."""
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("tc_match", dict(params, _token=token)))
+
+    def request_tc_workbook(self, params: dict) -> None:
+        """Excel workbook of a TC calibration result (ROIs at the TC pixels, TC data filled in)."""
+        token = CancellationToken()
+        self._tokens.append(token)
+        self._commands.put(("tc_workbook", dict(params, _token=token)))
 
     def request_export_bitmasks(self, folder: str, overwrite=()) -> None:
         """``overwrite``: existing bitmask files the user agreed to replace."""
@@ -418,6 +434,18 @@ class DecoderThread(QThread):
                         ok, message = self._run_export_excel(source, payload)
                         self.export_finished.emit(ok, message)
                         self.busy_changed.emit(False, "")
+                    elif command == "tc_match":
+                        self._abort = payload["_token"]()
+                        self.busy_changed.emit(True, "Fitting the emissivity from TCs…")
+                        ok, message, output = self._run_tc_match(source, payload)
+                        self.tc_finished.emit(ok, message, output)
+                        self.busy_changed.emit(False, "")
+                    elif command == "tc_workbook":
+                        self._abort = payload["_token"]()
+                        self.busy_changed.emit(True, "Exporting Excel workbook…")
+                        ok, message = self._run_tc_workbook(source, payload)
+                        self.export_finished.emit(ok, message)
+                        self.busy_changed.emit(False, "")
                     elif command == "export_bitmasks":
                         self.busy_changed.emit(True, "Exporting ROI bitmasks…")
                         written = source.export_roi_bitmasks(
@@ -441,8 +469,10 @@ class DecoderThread(QThread):
                     message = f"{type(exc).__name__}: {exc}"
                     if command == "extract":
                         self.extract_finished.emit(False, message)
-                    elif command in {"export_sequence", "batch_extract", "export_excel"}:
+                    elif command in {"export_sequence", "batch_extract", "export_excel", "tc_workbook"}:
                         self.export_finished.emit(False, message)
+                    elif command == "tc_match":
+                        self.tc_finished.emit(False, message, None)
                     elif command == "export_bitmasks":
                         self.bitmasks_finished.emit(False, message)
                     elif command == "open":
@@ -567,6 +597,60 @@ class DecoderThread(QThread):
                 progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
                 abort=lambda: self._job_aborted(payload),
                 replace=payload.get("replace", ()), tool_version=__version__)
+            return True, message
+        except JobCancelled:
+            return False, "Export cancelled"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _lent_handle(source: FlirVideoSource, payload: dict) -> Any | None:
+        """The open recording's handle for a TC job, or None to let the job open its own.
+
+        As in the Excel export: a user-calibrated recording under a File SDK
+        with the unit-change bug keeps the player's handle out of the job.
+        """
+        from .calibration import user_calibration_risk
+
+        if not source.is_open:
+            raise RuntimeError("No recording is open")
+        if Path(payload["recording"]).resolve() != Path(source.metadata.path).resolve():
+            raise RuntimeError("Another recording was opened; start again")
+        im = source.sdk_handle()
+        return None if im is None or user_calibration_risk(im) else im
+
+    def _run_tc_match(self, source: FlirVideoSource, payload: dict) -> tuple[bool, str, Any]:
+        """TC calibration of the open recording (``tcmatch.run_analysis``); its handle is lent."""
+        from .tcmatch import run_analysis
+
+        try:
+            im = self._lent_handle(source, payload)
+            parameters = source.read_object_parameters() if payload.get("parameters_from") == "player" else None
+            output = run_analysis(
+                payload["recording"], payload["tc_file"], payload["options"], out_dir=payload.get("out_dir"),
+                cache_dir=payload.get("cache_dir"), sheet=payload.get("sheet"), im=im, parameters=parameters,
+                progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
+                abort=lambda: self._job_aborted(payload), stage=self.export_stage.emit)
+            return True, "", output
+        except JobCancelled:
+            return False, "Cancelled", None
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}", None
+
+    def _run_tc_workbook(self, source: FlirVideoSource, payload: dict) -> tuple[bool, str]:
+        """Workbook of a TC calibration result (``tcmatch.write_workbook``); the handle is lent."""
+        from . import __version__
+        from .tcmatch import write_workbook
+
+        try:
+            im = self._lent_handle(source, payload)
+            key = Path(payload["recording"]).resolve()
+            message = write_workbook(
+                payload["dest"], payload["recording"], payload["result"], payload["table"],
+                handles={key: im} if im is not None else None, parameters=payload.get("parameters"),
+                progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
+                abort=lambda: self._job_aborted(payload), replace=payload.get("replace", ()),
+                tool_version=__version__)
             return True, message
         except JobCancelled:
             return False, "Export cancelled"

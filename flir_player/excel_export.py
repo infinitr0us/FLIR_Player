@@ -142,7 +142,8 @@ class TcPrefill:
 
     ``times`` are on the workbook's axis (seconds from ignition) after
     ``offset_s``, the sheet's logger time offset; ``columns`` hold one TC each
-    (°C, NaN = blank). ``roi_tc`` pre-selects a TC column for ROIs by name and
+    (°C, NaN = blank). ``roi_tc`` pre-selects a TC column for ROIs by name,
+    ``roi_eps`` fills ROIs' emissivity overrides (e.g. fitted to their TC) and
     ``window`` sets the Summary's TC comparison window.
     """
 
@@ -152,6 +153,7 @@ class TcPrefill:
     roi_tc: tuple[tuple[str, str], ...] = ()
     window: tuple[float, float] | None = None
     offset_s: float = 0.0
+    roi_eps: tuple[tuple[str, float], ...] = ()
 
     def check(self, capacity: int, width: int) -> None:
         if len(self.names) != len(self.columns) or not 0 < len(self.names) <= width:
@@ -163,6 +165,8 @@ class TcPrefill:
         unknown = {tc for _roi, tc in self.roi_tc} - set(self.names)
         if unknown:
             raise ValueError(f"No TC column named {', '.join(sorted(unknown))}")
+        if any(not (math.isfinite(eps) and 0.0 < eps <= 1.0) for _roi, eps in self.roi_eps):
+            raise ValueError("An ROI emissivity must lie in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)

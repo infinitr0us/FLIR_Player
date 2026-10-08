@@ -45,6 +45,8 @@ from .export_dialogs import (
 from .excel_dialog import ExcelExportDialog
 from .excel_export import RoiSet, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
+from .tc_dialog import TcCalibrationDialog, TcResultsDialog
+from .tcmatch import roi_shapes, workbook_origin
 from .geometry import roi_coordinates
 from .settings import app_settings
 from .models import (
@@ -191,6 +193,8 @@ class MainWindow(QMainWindow):
         self._reference_params: dict | None = None
         self._object_params: dict | None = None  # latest measurement-parameter snapshot
         self._ignition_frames: dict[str, int] = {}  # recording path → ignition frame (0-based)
+        # recording path → the last TC fit's request (dialog settings) and output (tcmatch.RunOutput)
+        self._tc_runs: dict[str, dict] = {}
         self._temporal: dict[int, dict[int, tuple[float, object]]] = {}
         self._plot_clock = QElapsedTimer()
         self._stats_clock = QElapsedTimer()
@@ -230,6 +234,8 @@ class MainWindow(QMainWindow):
         self.decoder.extract_finished.connect(self._on_extract_finished)
         self.decoder.export_progress.connect(self._on_export_progress)
         self.decoder.export_finished.connect(self._on_export_finished)
+        self.decoder.export_stage.connect(self._on_export_stage)
+        self.decoder.tc_finished.connect(self._on_tc_finished)
         self.decoder.bitmasks_finished.connect(self._on_bitmasks_finished)
         self.decoder.busy_changed.connect(self._set_busy)
         self.decoder.failed.connect(self._on_decode_failed)
@@ -336,6 +342,7 @@ class MainWindow(QMainWindow):
         self.inspector.isotherm_changed.connect(self._change_isotherm)
         self.inspector.object_parameters_applied.connect(self._apply_object_parameters)
         self.inspector.object_parameters_reset.connect(self._reset_object_parameters)
+        self.inspector.tc_fit_requested.connect(self._open_tc_dialog)
         self.inspector.overlays_changed.connect(self._change_overlays)
         self.inspector.flips_changed.connect(self._change_flips)
         self.inspector.corrections_changed.connect(self._change_corrections)
@@ -1188,6 +1195,115 @@ class MainWindow(QMainWindow):
         elif message and message != "Export cancelled":
             self._show_error("Export failed", message)
 
+    def _on_export_stage(self, text: str) -> None:
+        dialog = getattr(self, "_export_progress", None)
+        if dialog is None or dialog.wasCanceled():
+            return  # "Cancelling…" stays until the job stops
+        dialog.setLabelText(f"{text}…")
+        dialog.setMaximum(0)  # busy until the step reports progress
+        dialog.setValue(0)
+
+    # --- emissivity from thermocouples ---------------------------------------------
+
+    def _open_tc_dialog(self) -> None:
+        if self.metadata is None or self.current_packet is None or self._busy:
+            return
+        self.pause_playback(invalidate=True)
+        if not any(key.startswith("temperature_factory") for key in getattr(self, "_unit_keys", ())):
+            MessageDialog.information(
+                self, "Fit Emissivity from TCs",
+                "This recording has no factory temperature calibration (counts only, or a ResearchIR user "
+                "calibration), so its emissivity cannot be fitted from TCs.")
+            return
+        run = self._tc_runs.get(str(self.metadata.path), {})
+        dialog = TcCalibrationDialog(self.metadata, tuple(self._rois), self.current_packet.index,
+                                     selected_roi_id=self._selected_roi_id, ignition_frame=self._ignition_frame(),
+                                     previous=run.get("request"), has_results="output" in run, parent=self)
+        code = dialog.exec()
+        if code == TcCalibrationDialog.LAST_RESULTS:
+            self._show_tc_results()
+            return
+        if code != TcCalibrationDialog.DialogCode.Accepted:
+            return
+        params = dialog.parameters()
+        # the request is remembered at once (the next dialog starts from it); results only on success
+        self._tc_runs.setdefault(str(self.metadata.path), {})["request"] = params
+        self._tc_pending = params
+        self._export_progress = self._progress_dialog("Fit Emissivity from TCs", "Starting…")
+        self._export_progress.canceled.connect(self.decoder.cancel_extract)
+        self.decoder.request_tc_match(params)
+
+    def _on_tc_finished(self, ok: bool, message: str, output) -> None:
+        dialog = getattr(self, "_export_progress", None)
+        if dialog is not None:
+            dialog.reset()
+            dialog.deleteLater()
+            self._export_progress = None
+        if not ok:
+            if message and message != "Cancelled":
+                self._show_error("Fit emissivity from TCs", message)
+            return
+        recording = str(output.result.recording)
+        if self.metadata is None or self.metadata.path.name != recording:
+            return  # another recording was opened meanwhile
+        run = self._tc_runs.setdefault(str(self.metadata.path), {})
+        run["output"] = output
+        run["out_dir"] = (getattr(self, "_tc_pending", None) or {}).get("out_dir")
+        self._show_tc_results()
+
+    def _show_tc_results(self) -> None:
+        if self.metadata is None:
+            return
+        run = self._tc_runs.get(str(self.metadata.path), {})
+        output = run.get("output")
+        if output is None:
+            return
+        out_dir = run.get("out_dir")
+        dialog = TcResultsDialog(output, Path(out_dir) if out_dir else None, parent=self)
+        dialog.add_rois_requested.connect(lambda: self._add_tc_rois(output))
+        dialog.emissivity_requested.connect(lambda eps: self._apply_object_parameters({"emissivity": eps}))
+        if dialog.exec() == TcResultsDialog.WORKBOOK:
+            self._save_tc_workbook(output, Path(out_dir) if out_dir else self.metadata.path.parent)
+
+    def _add_tc_rois(self, output) -> None:
+        """A box at each TC pixel, the block the fit used (replacing earlier ones of the same names);
+        ignition = logger time 0. The workbook also gets single-pixel spots."""
+        if self.metadata is None or self.current_packet is None:
+            return
+        shapes = [shape for shape in roi_shapes(output.result)
+                  if shape.kind == "rect" and self._covers_pixels(shape.kind, shape.points)]
+        names = {shape.name for shape in shapes}
+        self._rois = [shape for shape in self._rois if shape.name not in names]
+        if self._selected_roi_id not in {shape.id for shape in self._rois}:
+            self._selected_roi_id = None
+        for shape in shapes:
+            self._rois.append(RoiShape(id=self._roi_next_id, kind=shape.kind, points=shape.points, name=shape.name))
+            self._roi_next_id += 1
+        frame, _offset = workbook_origin(output.result)
+        self._ignition_frames[str(self.metadata.path)] = frame
+        if not self.bottom_panel.isVisible():
+            self._toggle_statistics(True)
+        self._push_rois()
+        self._notify(f"Added {len(shapes)} ROI(s) at the TC pixels; ignition (t = 0) is frame {frame + 1}")
+
+    def _save_tc_workbook(self, output, folder: Path) -> None:
+        if self.metadata is None:
+            return
+        default = folder / f"{self.metadata.path.stem}_vs_TC.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Excel workbook", str(default), "Excel workbook (*.xlsx)")
+        if not path:
+            return
+        dest = Path(path) if Path(path).suffix.lower() == ".xlsx" else Path(path).with_suffix(".xlsx")
+        replace = confirm_replace(self, [dest], [path])
+        if replace is None:
+            return
+        self._export_done_text = f"Saved {dest.name}"
+        self._export_progress = self._progress_dialog("Export Excel Workbook", "Export Excel Workbook…")
+        self._export_progress.canceled.connect(self.decoder.cancel_extract)
+        self.decoder.request_tc_workbook({
+            "recording": str(self.metadata.path), "dest": str(dest), "result": output.result,
+            "table": output.table, "parameters": output.parameters, "replace": [str(p) for p in replace]})
+
     def _on_bitmasks_finished(self, ok: bool, message: str) -> None:
         if ok:
             self._notify(message)
@@ -1606,6 +1722,7 @@ class MainWindow(QMainWindow):
         self.title_bar.set_filename(metadata.filename)
         self.title_bar.export_button.setEnabled(True)
         self.inspector.set_available_units(options, packet.unit.key)
+        self._unit_keys = frozenset(option.key for option in options)
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)

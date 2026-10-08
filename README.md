@@ -87,6 +87,10 @@ all decoding work off the GUI thread.
   Also: a TC Compare sheet with matching emissivity, a Summary with peaks and
   threshold times, ROI maps, and saved ROI sets (with the ignition frame) for
   reuse across tests.
+- Emissivity from thermocouples: given the TC logger file of a test, the player
+  finds each thermocouple's pixel and the logger's time offset, fits the
+  emissivity per TC where IR and TC can be compared, and hands the result to
+  the player (ROIs, ignition frame, emissivity) or to an Excel workbook.
 - Dynamic per-frame scaling or a user-defined fixed range.
 - Live cursor coordinates and radiometric value inspection in every ROI tool,
   plus the pixel extent of the ROI being drawn, edited or hovered (box and
@@ -362,6 +366,46 @@ Recordings without a factory calibration, such as ResearchIR user
 calibrations, are exported as counts only. *Export → Save ROI set…* stores the
 ROIs and the ignition frame next to the recording (`<file>.rois.json`) for
 reuse and for multi-camera workbooks.
+
+## Emissivity from thermocouples
+
+*Measurement → Fit Emissivity from TCs…* compares the open recording with the
+thermocouples of the same test. Choose the logger export (`.xlsx` with a sheet
+named like TC data, or `.csv`/`.txt`, time in seconds or minutes in one of the
+first columns) and tick the TCs that sit on a surface the camera sees; TCs in
+air or gas have no pixel. A box ROI around the battery, chosen as the search
+region, makes the run faster. The first run reads every frame once and keeps
+per-second statistics in the results folder, so later runs with other options
+take a minute or two.
+
+What it does (`flir_player/tcmatch.py`, also a command line:
+`python -m flir_player.tcmatch RECORDING TC_FILE`):
+
+1. **Time and pixels.** Every pixel's counts are correlated with each TC's
+   blackbody signal over all time offsets. Counts are linear in that signal at
+   the TC's own pixel whatever the emissivity, so the best match gives the
+   logger's time 0 in the recording (one offset for all TCs) and each TC's
+   pixel, with the nearby pixels that match almost as well. The offset can be
+   given instead (*Logger time 0 is at frame…*).
+2. **Events.** Stretches where IR and TC can be compared are chosen by rules
+   that never compare them: the TC is working and hot enough, there are no
+   flames in front of the spot (flicker), the IR is in the camera's range, and
+   the TC has not just jumped (a flame or jet on a TC makes it read neither the
+   gas nor the surface for a while).
+3. **Emissivity.** Each event gets the emissivity that best explains the IR;
+   events that would need more than 1 are reported, not used. A TC's value is
+   the median of its events. TCs on differently painted spots keep their own
+   values; one common value is given only when they agree.
+
+The results dialog lists each TC (pixel, match, emissivity, events, spread),
+shows the summary and a figure per TC, and can add an N × N box at each TC
+pixel (the block the fit used; the ignition frame is set to logger time 0), set
+the player's emissivity to a TC's value, or save an Excel workbook whose ROIs
+start at their TC's emissivity with the logger data on the TC Compare sheet. The results
+folder keeps `summary.txt`, `result.json`, `overview.png` and the ROI set.
+Superframing recordings use the frames of one preset; their workbook cannot
+separate presets yet. Recordings without a factory calibration cannot be
+fitted.
 
 Known SDK issue (fixed by FileSDK 2026.1): with FileSDK 5.0.1, switching
 units on recordings that carry a ResearchIR user calibration

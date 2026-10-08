@@ -35,10 +35,11 @@ dependencies = [
     "imageio>=2.34,<3",
     "imageio-ffmpeg>=0.5,<1",
     "XlsxWriter>=3.2,<4",
+    "openpyxl>=3.1,<4",  # reading TC logger workbooks
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "openpyxl>=3.1,<4"]
+dev = ["pytest>=8,<10"]
 
 [project.urls]
 Homepage = "https://github.com/infinitr0us/FLIR_Player"

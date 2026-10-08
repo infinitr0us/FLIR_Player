@@ -35,6 +35,8 @@ _UNIT_ONLY = re.compile(r"^[\[\(]?\s*(°\s*[CFK]|deg\.?\s*[CFK]|[CFK]|degrees?\s
 _TIME_HINT = re.compile(r"(?<![a-z])(time|times|timestamp|timestamps|sec|secs|second|seconds|elapsed|elapsedtime|"
                         r"date|datetime|clock)(?![a-z])", re.IGNORECASE)  # compounds without case boundaries too
 _SHEET_HINT = re.compile(r"(?<![a-z])(tcs?|thermo\w*|temp|temps|temperatures?)(?![a-z])", re.IGNORECASE)
+WORKBOOK_SUFFIXES = (".xlsx", ".xlsm")
+TEXT_SUFFIXES = (".csv", ".txt", ".tsv", ".dat")
 _TEMPERATURE_UNIT = re.compile(r"°\s*[CFK]\b|\bdeg\.?\s*[CFK]\b|^[\[\(]\s*[CFK]\s*[\]\)]$|^[CFK]$", re.IGNORECASE)
 
 
@@ -67,6 +69,7 @@ class TcTable:
     source: str = ""
     time_label: str = ""
     notes: tuple[str, ...] = ()
+    sheet: str = ""  # the workbook sheet read ("" for a text table)
 
     @property
     def interval(self) -> float:
@@ -104,15 +107,15 @@ def read_tc_table(path: str | Path, *, sheet: str | None = None, time_column: in
     """
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix in (".xlsx", ".xlsm"):
-        sheets = _xlsx_rows(path)
-    elif suffix in (".csv", ".txt", ".tsv", ".dat"):
+    if suffix in WORKBOOK_SUFFIXES:
+        sheets = _xlsx_rows(path, only=sheet)
+    elif suffix in TEXT_SUFFIXES:
         sheets = {path.stem: _text_rows(path)}
     else:
         raise ValueError(f"{path.name}: unsupported TC file type (use .xlsx, .csv or .txt)")
     if sheet is not None:
         if sheet not in sheets:
-            raise ValueError(f"{path.name} has no sheet {sheet!r} (sheets: {', '.join(sheets)})")
+            raise ValueError(f"{path.name} has no sheet {sheet!r} (sheets: {', '.join(sheet_names(path))})")
         sheets = {sheet: sheets[sheet]}
     tables: list[tuple[str, TcTable]] = []
     errors = []
@@ -130,17 +133,41 @@ def read_tc_table(path: str | Path, *, sheet: str | None = None, time_column: in
         why = "its name suggests TC data" if hinted else "it has the most rows"
         others = ", ".join(repr(other) for other, _t in tables if other != name)
         best = replace(best, notes=best.notes + (f"sheet {name!r} used ({why}); other sheets with data: {others}",))
-    return best
+    return replace(best, sheet=name if suffix in WORKBOOK_SUFFIXES else "")
 
 
-def _xlsx_rows(path: Path) -> dict[str, list[tuple]]:
+def sheet_names(path: str | Path) -> list[str]:
+    """The sheets of a workbook (fast: no cells are read); a text table counts as one sheet."""
+    path = Path(path)
+    if path.suffix.lower() not in WORKBOOK_SUFFIXES:
+        return [path.stem]
+    book = _open_workbook(path)
+    try:
+        return [ws.title for ws in book.worksheets]
+    finally:
+        book.close()
+
+
+def suggest_sheet(names: Sequence[str]) -> str | None:
+    """The sheet whose name suggests TC data ("TC", "Thermocouples", "Temperature"), if exactly one does."""
+    hinted = [name for name in names if _SHEET_HINT.search(_words(name))]
+    return hinted[0] if len(hinted) == 1 else None
+
+
+def _open_workbook(path: Path):
     try:
         import openpyxl
     except ModuleNotFoundError as exc:  # pragma: no cover - environment
         raise ValueError("Reading .xlsx TC files needs the openpyxl package") from exc
-    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    return openpyxl.load_workbook(path, read_only=True, data_only=True)
+
+
+def _xlsx_rows(path: Path, only: str | None = None) -> dict[str, list[tuple]]:
+    """Cell rows of every sheet, or of the sheet ``only`` (an absent name gives no sheets)."""
+    book = _open_workbook(path)
     try:
-        return {ws.title: [tuple(row) for row in ws.iter_rows(values_only=True)] for ws in book.worksheets}
+        return {ws.title: [tuple(row) for row in ws.iter_rows(values_only=True)] for ws in book.worksheets
+                if only is None or ws.title == only}
     finally:
         book.close()
 

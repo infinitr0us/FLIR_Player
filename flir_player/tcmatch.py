@@ -41,7 +41,7 @@ import sys
 import time
 import warnings
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace  # write_workbook has a replace= argument
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -98,6 +98,7 @@ class MatchOptions:
     scope: tuple[float, float] | None = None  # logger window for all channels (e.g. before a quench)
     search_outside_windows: bool = False  # True: the offset/pixel search also uses data outside ``valid``
     lag_s: float | None = None  # fixed offset (recording seconds of logger time 0)
+    lag_frame: int | None = None  # fixed offset as the frame (0-based) of logger time 0; wins over ``lag_s``
     lag_range: tuple[float, float] | None = None  # search window for the offset (recording seconds)
     pixels: Mapping[str, tuple[int, int]] = field(default_factory=dict)  # fixed (row, col) per channel
     spot: int = 3  # spot block N (N × N pixels)
@@ -155,6 +156,17 @@ class Samples:
         """Temperature (°C) at emissivity 1 for counts of this recording."""
         return object_temperature(self.calibration, self.params.with_(emissivity=1.0), counts) - KELVIN
 
+    def seconds_at(self, frame: int) -> float:
+        """Recording time of frame ``frame`` (the inverse of ``frame_at``)."""
+        t = self.frame_seconds
+        if t is None or t.size == 0:
+            return frame / self.fps
+        if frame <= 0:
+            return float(t[0] + frame / self.fps)
+        if frame >= t.size:
+            return float(t[-1] + (frame - t.size + 1) / self.fps)
+        return float(t[frame])
+
     def frame_at(self, seconds: float) -> int:
         """Frame index at recording time ``seconds`` (beyond the ends: extrapolated at the frame rate)."""
         t = self.frame_seconds
@@ -191,9 +203,7 @@ def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progre
     frames of a superframing recording are always timed by their clock.
     """
     info = getattr(im, "source_info", None)
-    presets = [p for p in (getattr(info, "preset_info", ()) or ())
-               if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
-    if len(presets) < 2:
+    if not _superframing(im):
         return PresetLayout()
     n = int(im.num_frames)
     repair = repair or (lambda stamp: stamp)
@@ -260,8 +270,18 @@ def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = Fal
     return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []))
 
 
-def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress, abort) -> PresetLayout:
+def _superframing(im: Any) -> bool:
+    info = getattr(im, "source_info", None)
+    presets = [p for p in (getattr(info, "preset_info", ()) or ())
+               if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
+    return len(presets) >= 2
+
+
+def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress, abort,
+                   stage: Callable[[str], None] | None = None) -> PresetLayout:
     """``preset_frames``, kept in ``cache_dir`` (the scan reads every frame header)."""
+    if not _superframing(im):
+        return PresetLayout()
     store = Path(cache_dir) / f"{_file_key(path, 'presets', 1)}_presets.npz" if cache_dir is not None else None
     if store is not None and store.exists():
         try:
@@ -272,6 +292,8 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
                                     seconds=data["seconds"], breaks=int(data["breaks"]))
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
             pass  # unreadable (e.g. a run stopped while writing it): scan again
+    if stage is not None:
+        stage("Reading the frame headers (superframing presets)")
     layout = preset_frames(im, repair=repair, progress=progress, abort=abort)
     if store is not None and layout:
         arrays = {f"frames_{p}": f for p, f in layout.frames.items()}
@@ -285,18 +307,20 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
 
 def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float = 1.0, im: Any = None,
                      progress: Progress | None = None, abort: Abort | None = None,
-                     cache_dir: str | Path | None = None) -> Samples:
+                     cache_dir: str | Path | None = None, stage: Callable[[str], None] | None = None) -> Samples:
     """Read the recording once into per-bin statistics (see the module docstring).
 
     ``im`` lends an open ImagerFile (its state is restored); otherwise the
     file is opened and closed here. ``cache_dir`` keeps the statistics on disk
-    for later runs with the same region, preset and bin width.
+    for later runs with the same region, preset and bin width. ``stage`` hears
+    which step runs (for a progress label).
     """
     path = Path(path)
     owned = im is None
     if owned:
         im = fnv.file.ImagerFile(str(path))
     abort = abort or (lambda: False)
+    stage = stage or (lambda text: None)
     try:
         with preserved_state(im):
             set_unit_safely(im, fnv.Unit.COUNTS)
@@ -312,7 +336,7 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             if cache_dir is not None:
                 cache_dir = Path(cache_dir)
                 cache_dir.mkdir(parents=True, exist_ok=True)
-            layout = _cached_layout(im, path, cache_dir, repair, progress, abort)
+            layout = _cached_layout(im, path, cache_dir, repair, progress, abort, stage)
             info: dict[str, Any] = {
                 "camera": str(getattr(im.source_info, "camera_model", "") or "").strip(),
                 "frames": n, "fps": fps, "clock_fps": rate.clock_fps, "rate_corrected": rate.corrected,
@@ -334,12 +358,15 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             key = _cache_key(path, options, step, clock=layout.seconds is not None) if cache_dir is not None else None
             cached = _load_cache(cache_dir, key) if key else None
             if cached is not None:
+                stage("Using the frame statistics saved by an earlier run")
                 times, mean, spread, counts, first_frame = cached
             else:
+                stage(f"Reading {frames.size:,} frames")
                 times, mean, spread, counts, first_frame = _accumulate(
                     im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key)
             if abort():
                 raise JobCancelled("Cancelled")
+            stage("Checking the temperature calibration")
             indices = None
             if layout:  # calibrate on this preset's frames: the hottest bins and a spread
                 peak = np.array([np.nanmax(mean[k]) if counts[k] else -np.inf for k in range(mean.shape[0])])
@@ -779,7 +806,9 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
             k2 = int(np.argmax(np.where(far, score, -np.inf)))
             runner_lag, runner = float(lags_s[k2]), float(score[k2])
     else:
-        best = int(np.nanargmax(np.nanmax(curve, axis=1))) if np.any(np.isfinite(curve)) else 0
+        with warnings.catch_warnings():  # offsets without overlap are all-NaN rows
+            warnings.simplefilter("ignore", RuntimeWarning)
+            best = int(np.nanargmax(np.nanmax(curve, axis=1))) if np.any(np.isfinite(curve)) else 0
         lag_bins = int(lags_all[best])
     if options.lag_s is None and found and b > 1:
         refined_bins, refined = _refine_lag(samples, b, lag_bins, lags_all, where, found, grid_bins, Y, U,
@@ -1148,6 +1177,8 @@ class MatchResult:
 def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress: Progress | None = None,
             abort: Abort | None = None) -> tuple[MatchResult, Location, dict]:
     """Locate, select events, fit. Returns the result, the location and the per-channel series."""
+    if options.lag_frame is not None:  # a frame is timed as the statistics are (by the clock on superframing)
+        options = dataclass_replace(options, lag_s=samples.seconds_at(int(options.lag_frame)), lag_frame=None)
     grid, channels = prepare_channels(table, options, samples.step)
     location = locate(samples, grid, channels, options, progress=progress, abort=abort)
     step = samples.step
@@ -1441,7 +1472,8 @@ def workbook_origin(result: MatchResult) -> tuple[int, float]:
 
 
 def tc_prefill(result: MatchResult, table: TcTable):
-    """TC Compare sheet contents for the workbook: the logger data, each ROI's TC, the best event window."""
+    """TC Compare sheet contents for the workbook: the logger data, each ROI's TC and fitted
+    emissivity (its override on Settings), the best event window."""
     from .excel_export import TcPrefill
 
     _frame, offset = workbook_origin(result)
@@ -1449,11 +1481,13 @@ def tc_prefill(result: MatchResult, table: TcTable):
     names = tuple(ch.name for ch in result.channels)[:10]
     columns = tuple(tuple(float(v) for v in table.values[:, table.index(name) if name in table.names else k])
                     for k, name in enumerate(names))
-    roi_tc = []
+    roi_tc, roi_eps = [], []
     for shape in roi_shapes(result):
         for ch in used:
             if shape.name.startswith(ch.name.split(" (")[0] + " ") and ch.name in names:
                 roi_tc.append((shape.name, ch.name))
+                if ch.eps is not None and math.isfinite(ch.eps[1]) and ch.eps[1] > 0:
+                    roi_eps.append((shape.name, round(min(1.0, ch.eps[1]), 3)))
                 break
     events = [e for ch in result.channels for e in ch.events if e.used]
     window = None
@@ -1461,16 +1495,20 @@ def tc_prefill(result: MatchResult, table: TcTable):
         best = max(events, key=lambda e: e.fit.n)
         window = (best.start_s + offset, best.end_s + offset)  # on the workbook's axis
     return TcPrefill(times=tuple(float(t) for t in table.times), columns=columns, names=names,
-                     roi_tc=tuple(roi_tc), window=window, offset_s=offset)
+                     roi_tc=tuple(roi_tc), window=window, offset_s=offset, roi_eps=tuple(roi_eps))
 
 
 def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult, table: TcTable, *,
-                   progress: Progress | None = None, abort: Abort | None = None) -> str:
+                   progress: Progress | None = None, abort: Abort | None = None, handles: dict | None = None,
+                   parameters: dict | None = None, replace=(), tool_version: str = "") -> str:
     """Excel workbook (``excel_export``) with spots/boxes at the TC pixels and the logger data filled in.
 
     Time 0 is logger time 0 (the ignition frame is the matched frame) and the
     sheet's logger offset is 0, unless logger time 0 lies outside the recording
-    (``workbook_origin``). Rows cover the logger's span at its interval.
+    (``workbook_origin``). Rows cover the logger's span at its interval. Each
+    TC's ROIs start at its fitted emissivity. ``handles``, ``replace`` and
+    ``tool_version`` go to ``run_export``; ``parameters`` (SDK values) replace
+    the recording's own object parameters, as in the analysis.
     """
     from .excel_export import ExportOptions, SourceSpec, run_export
 
@@ -1480,10 +1518,11 @@ def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult,
     if not shapes:
         raise ValueError("No TC pixel was found, so the workbook would have no ROIs")
     frame, offset = workbook_origin(result)
-    spec = SourceSpec(path=Path(recording), rois=shapes, ignition_frame=frame)
+    spec = SourceSpec(path=Path(recording), rois=shapes, ignition_frame=frame, parameters=parameters)
     options = ExportOptions(start_s=float(table.times[0]) + offset, end_s=float(table.times[-1]) + offset,
                             step_s=result.step, tc_prefill=tc_prefill(result, table))
-    return run_export(dest, [spec], options, progress=progress, abort=abort)
+    return run_export(dest, [spec], options, handles=handles, progress=progress, abort=abort, replace=replace,
+                      tool_version=tool_version)
 
 
 def roi_shapes(result: MatchResult) -> list[RoiShape]:
@@ -1570,6 +1609,16 @@ def save_figure(path: str | Path, result: MatchResult, location: Location, serie
 # --- orchestration ----------------------------------------------------------------------------------
 
 
+@dataclass
+class RunOutput:
+    """What ``run_analysis`` produced: the result, the TC table it used, and the files written."""
+
+    result: MatchResult
+    table: TcTable
+    files: dict[str, Path] = field(default_factory=dict)  # "summary", "json", "rois", "figure", "workbook"
+    parameters: dict | None = None  # the SDK object parameters used instead of the recording's own
+
+
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
         cache_dir: str | Path | None = None, sheet: str | None = None, time_column: int | str | None = None,
         figure: bool = True, workbook: bool = False,
@@ -1579,37 +1628,71 @@ def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, ou
 
     ``workbook`` also writes ``<recording>_vs_TC.xlsx`` there (see ``write_workbook``).
     """
+    return run_analysis(recording, tc_file, options, out_dir=out_dir, cache_dir=cache_dir, sheet=sheet,
+                        time_column=time_column, figure=figure, workbook=workbook, progress=progress, abort=abort,
+                        log=log).result
+
+
+def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptions, *,
+                 out_dir: str | Path | None = None, cache_dir: str | Path | None = None, sheet: str | None = None,
+                 time_column: int | str | None = None, figure: bool = True, workbook: bool = False,
+                 im: Any = None, parameters: dict | None = None,
+                 progress: Progress | None = None, abort: Abort | None = None,
+                 log: Callable[[str], None] | None = None,
+                 stage: Callable[[str], None] | None = None) -> RunOutput:
+    """``run``, keeping the TC table and the paths written; for the player's dialog.
+
+    ``im`` lends the open recording (see ``sample_recording``); ``parameters``
+    (SDK object-parameter values, e.g. the player's) replace the recording's
+    own distance, reflected temperature and atmosphere; the emissivity is what
+    the fit finds. ``stage`` hears which step runs.
+    """
     from .excel_export import RoiSet, save_roi_set
 
     say = log or (lambda text: None)
+    stage = stage or (lambda text: None)
+    stage("Reading the TC file")
     table = read_tc_table(tc_file, sheet=sheet, time_column=time_column)
     step = options.step_s or table.interval
     say(f"TC file: {len(table.names)} channel(s), {table.times.size} rows every {table.interval:g} s")
-    t0 = time.time()
-    samples = sample_recording(recording, options, step_s=step, progress=progress, abort=abort, cache_dir=cache_dir)
-    say(f"Read {samples.info['frames']} frames in {time.time() - t0:.0f} s; {samples.report.message}")
-    result, location, series = analyse(samples, table, options, abort=abort)
     _check(abort)
+    t0 = time.time()
+    samples = sample_recording(recording, options, step_s=step, im=im, progress=progress, abort=abort,
+                               cache_dir=cache_dir, stage=stage)
+    if parameters is not None:
+        samples.params = MeasurementParameters.from_sdk(parameters)
+    say(f"Read {samples.info['frames']} frames in {time.time() - t0:.0f} s; {samples.report.message}")
+    stage("Matching the TCs to pixels and fitting the emissivity")
+    result, location, series = analyse(samples, table, options, progress=progress, abort=abort)
+    _check(abort)
+    output = RunOutput(result=result, table=table, parameters=dict(parameters) if parameters is not None else None)
     if out_dir is not None:
+        stage("Saving the results")
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        (out / "result.json").write_text(json.dumps(result.to_dict(), indent=1), encoding="utf-8")
-        (out / "summary.txt").write_text(summary_text(result), encoding="utf-8")
+        files = output.files
+        files["json"] = out / "result.json"
+        files["json"].write_text(json.dumps(result.to_dict(), indent=1), encoding="utf-8")
+        files["summary"] = out / "summary.txt"
+        files["summary"].write_text(summary_text(result), encoding="utf-8")
         width, height = samples.size
-        save_roi_set(out / f"{Path(recording).name}.rois.json",
-                     RoiSet(rois=tuple(roi_shapes(result)), ignition_frame=workbook_origin(result)[0],
-                            recording=Path(recording).name, size=(width, height)))
-        if figure:
+        files["rois"] = out / f"{Path(recording).name}.rois.json"
+        save_roi_set(files["rois"], RoiSet(rois=tuple(roi_shapes(result)), ignition_frame=workbook_origin(result)[0],
+                                           recording=Path(recording).name, size=(width, height)))
+        if figure and series:
             grid, _channels = prepare_channels(table, options, samples.step)
-            save_figure(out / "overview.png", result, location, series, samples, grid)
+            files["figure"] = out / "overview.png"
+            save_figure(files["figure"], result, location, series, samples, grid)
         if workbook:
             if result.preset is not None or not roi_shapes(result):
                 say("No workbook: " + ("the Excel export cannot separate superframing presets yet"
                                        if result.preset is not None else "no TC pixel was found"))
             else:
-                say(write_workbook(out / f"{Path(recording).stem}_vs_TC.xlsx", recording, result, table,
-                                   abort=abort))
-    return result
+                files["workbook"] = out / f"{Path(recording).stem}_vs_TC.xlsx"
+                say(write_workbook(files["workbook"], recording, result, table, abort=abort,
+                                   handles={Path(recording).resolve(): im} if im is not None else None,
+                                   parameters=parameters))
+    return output
 
 
 def _pair(text: str, kind=float) -> tuple:

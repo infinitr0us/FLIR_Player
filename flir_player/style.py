@@ -892,6 +892,29 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     height: 0;
 }
 
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px 4px 2px 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background: $CONTROL_HOVER;
+    border-radius: 4px;
+    min-width: 24px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: $BORDER_HOVER;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
+    border: none;
+    width: 0;
+}
+
 /* Compact spin rows (measurement/object parameters) */
 
 QDoubleSpinBox[compact="true"], QSpinBox[compact="true"] {
@@ -990,6 +1013,16 @@ QTextEdit#MessageText {
     background: transparent;
     border: none;
     color: $TEXT_SECONDARY;
+    selection-background-color: $ACCENT_TINT;
+    selection-color: $TEXT;
+}
+
+/* A read-only report inside a tab card (TC calibration summary) */
+QTextEdit#ReportText {
+    background: transparent;
+    border: none;
+    color: $TEXT_SECONDARY;
+    padding: 4px;
     selection-background-color: $ACCENT_TINT;
     selection-color: $TEXT;
 }

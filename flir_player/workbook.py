@@ -152,6 +152,7 @@ class _Writer:
             prefill.check(TC_CAPACITY, TC_COLUMNS)
         self._tc_names: list[str] = list(prefill.names) if prefill is not None else []
         self._roi_tc: dict[str, str] = dict(prefill.roi_tc) if prefill is not None else {}
+        self._roi_eps: dict[str, float] = dict(prefill.roi_eps) if prefill is not None else {}
 
     def _add_sheets(self) -> None:
         """Create the worksheets (each opens a constant-memory row file)."""
@@ -469,7 +470,7 @@ class _Writer:
             put(r, 2, roi.shape.name)
             put(r, 3, kinds.get(roi.shape.kind, roi.shape.kind) + (" (bins)" if roi.mode == "bins" else ""))
             put(r, 4, roi.pixels, self.f_int)
-            put(r, 5, None, self.f_input_num)
+            put(r, 5, self._roi_eps.get(roi.shape.name), self.f_input_num)
             put(r, 6, None, self.f_input_num)
             mapped = self._roi_tc.get(roi.shape.name) if "TC Compare" in self.sheets else None
             put(r, 7, mapped, self.f_input)
@@ -538,10 +539,12 @@ class _Writer:
                 "tau": tau, "wtau": p.window_transmission, "wt": p.window_k}
 
     def _params(self, layout: _RoiLayout) -> MeasurementParameters:
+        """The ROI's parameters as the Settings formulas start: its emissivity override, if any."""
         p = layout.source.initial
         cal = layout.source.report.calibration if layout.source.report.verified else None
         tau = transmission_used(cal, p) if cal is not None else (p.transmission or 1.0)
-        return p.with_(transmission=tau)
+        eps = self._roi_eps.get(layout.roi.shape.name, p.emissivity)
+        return p.with_(transmission=tau, emissivity=eps)
 
     def _roi_cached(self, layout: _RoiLayout) -> dict:
         cal = layout.source.report.calibration if layout.source.report.verified else None

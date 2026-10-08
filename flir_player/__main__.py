@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             dest.unlink(missing_ok=True)
             spot = RoiShape(1, "cursor", ((metadata.width / 2, metadata.height / 2),), "Smoke")
             window.decoder.export_finished.connect(
-                lambda ok, _message: finish(0 if ok and dest.is_file() else 6))
+                lambda ok, _message: exercise_tc() if ok and dest.is_file() else finish(6))
             window.decoder.request_export_excel({
                 "kind": "excel", "dest": str(dest), "replace": [], "parameters_from": "file",
                 "sources": [{"path": str(metadata.path), "label": "smoke", "rois": (spot,),
@@ -100,6 +100,38 @@ def main(argv: list[str] | None = None) -> int:
                 "options": ExportOptions(start_s=0.0, end_s=2.0, step_s=1.0,
                                          sheets=frozenset({"validation"})),
             })
+
+        def exercise_tc() -> None:
+            """Read a TC workbook and run the TC job on a small region (openpyxl and engine bundling)."""
+            import shutil
+            import tempfile
+
+            import xlsxwriter
+
+            from .tcmatch import MatchOptions
+
+            metadata = window.metadata
+            folder = Path(tempfile.gettempdir()) / "flir-smoke-tc"
+            shutil.rmtree(folder, ignore_errors=True)
+            folder.mkdir(parents=True)
+            book_path = folder / "tc.xlsx"
+            book = xlsxwriter.Workbook(str(book_path))
+            sheet = book.add_worksheet("TC")
+            sheet.write_row(0, 0, ["Time (s)", "TC 1"])
+            for k in range(120):
+                sheet.write_row(k + 1, 0, [k, 20.0 + k])
+            book.close()
+            x, y = metadata.width // 2, metadata.height // 2
+            window.decoder.tc_finished.disconnect(window._on_tc_finished)  # no results dialog
+            # a counts-only recording reads the TC file, then stops at the calibration check
+            window.decoder.tc_finished.connect(
+                lambda ok, message, output: finish(
+                    0 if (ok and output is not None and (folder / "summary.txt").is_file())
+                    or (not ok and "No verified temperature calibration" in message) else 7))
+            window.decoder.request_tc_match({
+                "recording": str(metadata.path), "tc_file": str(book_path), "sheet": "TC",
+                "options": MatchOptions(roi=(x - 8, y - 8, x + 8, y + 8)), "out_dir": str(folder),
+                "cache_dir": None, "parameters_from": "file"})
 
         window.decoder.opened.connect(exercise_playback)
         window.decoder.failed.connect(lambda _message: finish(2))
