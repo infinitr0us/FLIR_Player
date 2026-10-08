@@ -1243,8 +1243,8 @@ class MainWindow(QMainWindow):
             if message and message != "Cancelled":
                 self._show_error("Fit emissivity from TCs", message)
             return
-        recording = str(output.result.recording)
-        if self.metadata is None or self.metadata.path.name != recording:
+        request = getattr(self, "_tc_pending", None) or {}
+        if self.metadata is None or Path(request.get("recording", "")).resolve() != self.metadata.path.resolve():
             return  # another recording was opened meanwhile
         run = self._tc_runs.setdefault(str(self.metadata.path), {})
         run["output"] = output
@@ -1261,9 +1261,16 @@ class MainWindow(QMainWindow):
         out_dir = run.get("out_dir")
         dialog = TcResultsDialog(output, Path(out_dir) if out_dir else None, parent=self)
         dialog.add_rois_requested.connect(lambda: self._add_tc_rois(output))
-        dialog.emissivity_requested.connect(lambda eps: self._apply_object_parameters({"emissivity": eps}))
+        dialog.emissivity_requested.connect(self._set_tc_emissivity)
         if dialog.exec() == TcResultsDialog.WORKBOOK:
             self._save_tc_workbook(output, Path(out_dir) if out_dir else self.metadata.path.parent)
+
+    def _set_tc_emissivity(self, eps: float) -> None:
+        if self.current_packet is None or self._busy or not (self._object_params or {}).get("can_change", True):
+            self._notify("The emissivity of this recording cannot be changed now")
+            return
+        self._apply_object_parameters({"emissivity": float(eps)})
+        self._notify(f"Emissivity set to {eps:.2f} (Measurement panel)")
 
     def _add_tc_rois(self, output) -> None:
         """A box at each TC pixel, the block the fit used (replacing earlier ones of the same names);

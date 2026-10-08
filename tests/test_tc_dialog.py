@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog
+from PySide6.QtWidgets import QDialog, QLineEdit
 
 from conftest import wait_until
 from flir_player import tcmatch
@@ -258,6 +258,35 @@ def test_setup_dialog_guards_memory_windows_and_old_results(qapp, tmp_path, monk
     dialog.deleteLater()
 
 
+def test_enter_only_finishes_typing_and_focus_changes_do_not_reread(qapp, tmp_path) -> None:
+    from PySide6.QtTest import QTest
+
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[k, 20.0 + k] for k in range(60)])
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0)
+    dialog.show()
+    QTest.mouseClick(dialog.file_edit, Qt.MouseButton.LeftButton)  # as a user would: the dialog has focus
+    dialog.file_edit.setText(str(tc))
+    dialog._load(sheet=None)
+    assert _loaded(qapp, dialog)
+    request = dialog._request
+    dialog._file_edited()  # the path field loses focus to the Run button: no re-read, Run stays enabled
+    assert dialog._request == request and dialog.table is not None
+    QTest.keyClick(dialog.file_edit, Qt.Key.Key_Return)  # Enter in a field does not start the run
+    table = dialog.channel_table
+    QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=table.visualItemRect(table.item(0, 2)).center())
+    editor = table.viewport().findChild(QLineEdit)  # one click opened the cell's editor
+    assert editor is not None
+    QTest.keyClicks(editor, "0-30")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    qapp.processEvents()
+    assert dialog.isVisible() and dialog.result() != QDialog.DialogCode.Accepted
+    assert dialog.options().valid == {"A": ((0.0, 30.0),)}
+    dialog.close()
+    dialog.deleteLater()
+
+
 def test_setup_dialog_starts_from_the_previous_run(qapp, tmp_path) -> None:
     from flir_player.tc_dialog import TcCalibrationDialog
 
@@ -420,3 +449,156 @@ def test_the_whole_flow_through_the_player(qapp, tmp_path, monkeypatch) -> None:
         assert window.current_packet.unit.key == unit
     finally:
         window.close()
+
+
+# --- Codex review 2026-10-07 (local/notes/2026-10-07-tc-dialog/codex/, run review-tc-dialog) -------
+
+
+def _renamed(result, names):
+    """The scene's two found TCs repeated under ``names``, at distinct pixels."""
+    import dataclasses
+
+    a, b, _c = result.channels
+    channels = []
+    for k, name in enumerate(names):
+        source = (a, b)[k % 2]
+        eps = (0.5 + 0.04 * k,) * 3
+        channels.append(dataclasses.replace(source, name=name, eps=eps, eps_events=1))
+    return dataclasses.replace(result, channels=channels)
+
+
+def test_c1_rois_carry_their_own_tc_even_when_names_collide() -> None:
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1))
+    names = ("TC (front)", "TC (back)", "TC 1", "TC 1 wall")
+    result = _renamed(result, names)
+    table = TcTable(times=table.times, values=np.column_stack([table.values[:, 0]] * 4), names=names)
+    pairs = tcmatch.tc_rois(result)
+    assert [channel for _shape, channel in pairs] == [n for n in names for _ in (0, 1)]
+    labels = [shape.name for shape, _channel in pairs]
+    assert len(set(labels)) == len(labels)
+    assert labels[:2] == ["TC (front) spot", "TC (front) 1×1"]  # shared short name "TC": full names
+    assert labels[4:] == ["TC 1 spot", "TC 1 1×1", "TC 1 wall spot", "TC 1 wall 1×1"]
+    prefill = tcmatch.tc_prefill(result, table)
+    eps = dict(prefill.roi_eps)
+    tc = dict(prefill.roi_tc)
+    for shape, channel in pairs:
+        assert tc[shape.name] == channel
+        assert eps[shape.name] == round(next(ch.eps[1] for ch in result.channels if ch.name == channel), 3)
+
+
+def test_c5_every_tc_gets_its_emissivity_beyond_the_ten_compare_columns() -> None:
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1))
+    names = tuple(f"T{k + 1}" for k in range(11))
+    result = _renamed(result, names)
+    table = TcTable(times=table.times, values=np.column_stack([table.values[:, 0]] * 11), names=names)
+    prefill = tcmatch.tc_prefill(result, table)
+    assert len(prefill.names) == 10 and "T11 spot" not in dict(prefill.roi_tc)
+    assert dict(prefill.roi_eps)["T11 spot"] == round(result.channels[10].eps[1], 3)
+    assert len(prefill.roi_eps) == 22
+
+
+def test_c2_a_given_frame_between_bins_stays_that_frame() -> None:
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_frame=4121))
+    assert result.lag_fixed and result.ignition_frame == 4121
+    assert result.lag_s == pytest.approx(4121 / 30.0)
+    frame, offset = tcmatch.workbook_origin(result)
+    assert frame == 4121 and offset == pytest.approx(0.0, abs=1e-9)
+
+
+def test_c6_a_job_dropped_from_the_queue_still_reports(qapp) -> None:
+    from flir_player.decoder import DecoderThread
+
+    decoder = DecoderThread()  # not started: the jobs wait in its queue
+    seen = []
+    decoder.tc_finished.connect(lambda ok, message, output: seen.append(("tc", ok, message, output)))
+    decoder.export_finished.connect(lambda ok, message: seen.append(("export", ok, message)))
+    decoder.request_tc_match({"recording": "a.seq"})
+    decoder.request_tc_workbook({"recording": "a.seq"})
+    decoder.request_open("b.seq")
+    assert seen == [("tc", False, "Cancelled", None), ("export", False, "Export cancelled")]
+    assert [command for command, _payload in decoder._commands.queue] == ["open"]
+
+
+def _fake_run(monkeypatch, samples, table):
+    def fake_sample(path, options, *, step_s, im, progress, abort, cache_dir, stage):
+        stage("Reading 1 frames")
+        return samples
+
+    monkeypatch.setattr(tcmatch, "read_tc_table", lambda path, sheet=None, time_column=None: table)
+    monkeypatch.setattr(tcmatch, "sample_recording", fake_sample)
+
+
+def test_c7_cancelling_late_is_a_cancel_and_publishes_nothing(tmp_path, monkeypatch) -> None:
+    from flir_player.jobs import JobCancelled
+
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    with pytest.raises(JobCancelled):  # cancelled during the calibration check: not "no calibration"
+        tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), abort=lambda: True)
+    state = {"saving": False}
+
+    def at_saving(text):
+        state["saving"] = state["saving"] or text == "Saving the results"
+
+    out = tmp_path / "out"
+    with pytest.raises(JobCancelled):
+        tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), out_dir=out, stage=at_saving,
+                             abort=lambda: state["saving"])
+    assert not (out / "summary.txt").exists() and not (out / "result.json").exists()
+
+
+def test_c8_results_replace_only_what_the_user_confirmed(tmp_path, monkeypatch) -> None:
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "summary.txt").write_text("someone else's", encoding="utf-8")
+    with pytest.raises((OSError, ValueError)):
+        tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), out_dir=out, replace=[])
+    assert (out / "summary.txt").read_text(encoding="utf-8") == "someone else's"
+    assert not (out / "result.json").exists()  # all or nothing
+    output = tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), out_dir=out,
+                                  replace=[out / "summary.txt"])
+    assert (out / "summary.txt").read_text(encoding="utf-8").startswith("Recording:")
+    assert all(path.exists() for path in output.files.values())
+
+
+def test_c9_a_read_for_an_earlier_path_does_not_land(qapp, tmp_path) -> None:
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[k, 20.0 + k] for k in range(60)])
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0)
+    dialog.file_edit.setText(str(tc))
+    dialog._load(sheet=None)
+    dialog.file_edit.setText(str(tmp_path / "missing.csv"))
+    dialog._file_edited()
+    wait_until(qapp, lambda: False, timeout=1.0)  # let the first read finish
+    run = dialog.button_box.button(dialog.button_box.StandardButton.Ok)
+    assert dialog.table is None and not run.isEnabled() and "No such file" in dialog.table_label.text()
+    dialog.deleteLater()
+
+
+def test_c10_the_size_estimate_uses_the_engines_bin_width(qapp, tmp_path) -> None:
+    import dataclasses
+
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[k / 100.0, 20.0 + k] for k in range(600)])  # 0.01 s logger
+    box = RoiShape(1, "rect", ((0.0, 0.0), (200.0, 200.0)), "Box 1")
+    metadata = VideoMetadata(path=tmp_path / "r.csq", width=640, height=480, num_frames=3000, start_time=None,
+                             end_time=None, duration_seconds=100.0, nominal_fps=30.0)
+    dialog = TcCalibrationDialog(metadata, (box,), current_frame=0, selected_roi_id=1)
+    dialog.file_edit.setText(str(tc))
+    dialog._load(sheet=None)
+    assert _loaded(qapp, dialog) and dialog.table.interval == pytest.approx(0.01)
+    # bins follow the frames (1/30 s), not the 0.01 s logger: 3,001 bins of 200 × 200 pixels
+    assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 * 30 + 1) * 200 * 200)
+    presets = (PresetRange(1, 1500, 523.15, 873.15), PresetRange(2, 1500, 773.15, 1473.15))
+    dialog.metadata = dataclasses.replace(metadata, presets=presets)
+    assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 * 15 + 1) * 200 * 200)  # one preset: 15 Hz
+    dialog.deleteLater()

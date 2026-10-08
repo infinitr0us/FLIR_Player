@@ -18,6 +18,7 @@ import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -56,6 +57,20 @@ LARGE_STATISTICS = 4e9  # bytes of frame statistics worth a hint to draw a small
 _AIR_HINT = re.compile(r"(?<![a-z])(tree|air|gas|duct|ambient|room|plume|flame|exhaust)(?![a-z])", re.IGNORECASE)
 _LAST_DIR_KEY = "tcmatch/last_dir"
 _ALIVE: set[QThread] = set()  # readers outliving a closed dialog finish here
+
+
+def _keep_until_done(reader: QThread) -> None:
+    """Hold a reader until it ends; the application waits for it before quitting.
+
+    A QThread destroyed while it runs aborts the process, as it would when the
+    player closes during a read (a lab workbook takes a few seconds).
+    """
+    app = QApplication.instance()
+    if app is not None and not app.property("tcReadersHooked"):
+        app.aboutToQuit.connect(lambda: [thread.wait() for thread in tuple(_ALIVE)])
+        app.setProperty("tcReadersHooked", True)
+    _ALIVE.add(reader)
+    reader.finished.connect(lambda: (_ALIVE.discard(reader), reader.deleteLater()))
 
 
 def results_folder(recording: Path) -> Path:
@@ -109,8 +124,9 @@ class TcCalibrationDialog(FramelessDialog):
         self.table: TcTable | None = None
         self._sheets: list[str] = []
         self._request = 0
+        self._read_path = ""  # the TC file last read (or being read)
         self._confirmed: list[str] = []
-        self._replace: list[str] = []
+        self._replace: list[str] = []  # existing results the user agreed to replace
         previous = dict(previous or {})
         self._pending = {name: (checked, text) for name, checked, text in previous.get("channel_rows", ())}
 
@@ -136,7 +152,7 @@ class TcCalibrationDialog(FramelessDialog):
         frame, box = _panel("Thermocouple data")
         row, self.file_edit, browse = _path_row("Choose the TC file (.xlsx or .csv)")
         self.file_edit.setPlaceholderText("Logger export: .xlsx, .csv or .txt, time in the first columns")
-        self.file_edit.editingFinished.connect(lambda: self._load(sheet=None))
+        self.file_edit.editingFinished.connect(self._file_edited)
         browse.clicked.connect(self._browse_tc)
         box.addLayout(row)
         sheet_row = QHBoxLayout()
@@ -154,6 +170,7 @@ class TcCalibrationDialog(FramelessDialog):
         self.channel_table.setHorizontalHeaderLabels(["Thermocouple", "Readings (°C)", "Use only (s)"])
         self.channel_table.verticalHeader().setVisible(False)
         self.channel_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.channel_table.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)  # one click edits
         header = self.channel_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -338,6 +355,14 @@ class TcCalibrationDialog(FramelessDialog):
         wanted = content.sizeHint().height() + fixed + 16 * self.body.count() + 40
         self.resize(max(self.minimumWidth(), content.sizeHint().width() + 48), min(wanted, int(available * 0.9)))
 
+    def keyPressEvent(self, event) -> None:
+        # Enter finishes typing (a path, a "Use only" cell); it never starts a minutes-long run
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not isinstance(
+                self.focusWidget(), QAbstractButton):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     # --- TC file ---------------------------------------------------------------------------
 
     def _browse_tc(self) -> None:
@@ -351,9 +376,16 @@ class TcCalibrationDialog(FramelessDialog):
             app_settings().setValue(_LAST_DIR_KEY, str(Path(path).parent))
             self._load(sheet=None)
 
+    def _file_edited(self) -> None:
+        # editingFinished also fires when the field merely loses focus (e.g. on a click on Run)
+        if self.file_edit.text().strip() != self._read_path:
+            self._load(sheet=None)
+
     def _load(self, sheet: str | None) -> None:
         """Read the TC file (in the background); ``sheet`` None = the one named like TC data."""
         text = self.file_edit.text().strip()
+        self._read_path = text
+        self._request += 1  # a read still under way for another path is now stale
         path = Path(text) if text else None
         if path is None or not path.is_file():
             self.table = None
@@ -366,14 +398,12 @@ class TcCalibrationDialog(FramelessDialog):
             return
         if self.table is not None and not self._pending:  # keep the user's choices for a re-read sheet
             self._pending = self._channel_rows()
-        self._request += 1
         self.table = None
         self.table_label.setText("Reading the TC file…")
         self._update()
         reader = _TableReader(self._request, path, sheet)
         reader.read.connect(self._loaded)
-        _ALIVE.add(reader)
-        reader.finished.connect(lambda reader=reader: (_ALIVE.discard(reader), reader.deleteLater()))
+        _keep_until_done(reader)
         reader.start()
 
     def _loaded(self, request: int, names, table, error: str) -> None:
@@ -479,9 +509,17 @@ class TcCalibrationDialog(FramelessDialog):
         )
 
     def _statistics_bytes(self) -> float:
-        """Size of the frame statistics: two float32 values per pixel and time bin."""
+        """Size of the frame statistics: two float32 values per pixel and time bin.
+
+        Bins are the logger interval, or the time between the frames used when
+        that is longer (as ``tcmatch.sample_recording`` chooses them).
+        """
         x0, y0, x1, y1 = self.region() or (0, 0, self.metadata.width, self.metadata.height)
         step = self.table.interval if self.table is not None else 1.0
+        fps = self.metadata.nominal_fps or 0.0
+        if fps > 0:
+            frame_interval = max(1, len(self.metadata.presets)) / fps  # one preset's frames on superframing
+            step = step if frame_interval <= 1.01 * step else frame_interval
         bins = self.metadata.duration_seconds / max(step, 1e-3) + 1
         return 8.0 * bins * (x1 - x0) * (y1 - y0)
 
@@ -572,6 +610,7 @@ class TcCalibrationDialog(FramelessDialog):
             "out_dir": str(out),
             "cache_dir": str(out / "cache") if self.cache_check.isChecked() else None,
             "parameters_from": str(self.params_combo.currentData()),
+            "replace": list(self._replace),
             "channel_rows": [(name, checked, text) for name, (checked, text) in self._channel_rows().items()],
         }
 
@@ -716,7 +755,6 @@ class TcResultsDialog(FramelessDialog):
         value = self.eps_combo.currentData()
         if value is not None:
             self.emissivity_requested.emit(float(value))
-            self.eps_button.setText("Set")
 
     def _add_rois(self) -> None:
         self.add_rois_requested.emit()

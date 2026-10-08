@@ -375,8 +375,8 @@ named like TC data, or `.csv`/`.txt`, time in seconds or minutes in one of the
 first columns) and tick the TCs that sit on a surface the camera sees; TCs in
 air or gas have no pixel. A box ROI around the battery, chosen as the search
 region, makes the run faster. The first run reads every frame once and keeps
-per-second statistics in the results folder, so later runs with other options
-take a minute or two.
+per-second statistics in the results folder (`cache/`; delete it to free the
+space), so later runs with the same search region take a minute or two.
 
 What it does (`flir_player/tcmatch.py`, also a command line:
 `python -m flir_player.tcmatch RECORDING TC_FILE`):

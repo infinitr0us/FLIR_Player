@@ -629,6 +629,7 @@ class DecoderThread(QThread):
             output = run_analysis(
                 payload["recording"], payload["tc_file"], payload["options"], out_dir=payload.get("out_dir"),
                 cache_dir=payload.get("cache_dir"), sheet=payload.get("sheet"), im=im, parameters=parameters,
+                replace=payload.get("replace", ()),
                 progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
                 abort=lambda: self._job_aborted(payload), stage=self.export_stage.emit)
             return True, "", output
@@ -707,10 +708,21 @@ class DecoderThread(QThread):
         return (not cancelled and succeeded == len(files), f"{summary} Report: {report}")
 
     def _clear_pending_commands(self) -> None:
+        dropped = []
         with self._commands.mutex:
-            for _, payload in self._commands.queue:
+            for command, payload in self._commands.queue:
                 if isinstance(payload, dict) and payload.get("_token") in self._tokens:
                     token = payload["_token"]
                     token.cancel()
                     self._tokens.remove(token)
+                    dropped.append(command)
             self._commands.queue.clear()
+        # A job dropped before it started still reports, so its progress dialog closes
+        # (emitted outside the queue lock: the handlers run on the caller's thread).
+        for command in dropped:
+            if command == "extract":
+                self.extract_finished.emit(False, "Extraction cancelled")
+            elif command == "tc_match":
+                self.tc_finished.emit(False, "Cancelled", None)
+            elif command in {"export_sequence", "batch_extract", "export_excel", "tc_workbook"}:
+                self.export_finished.emit(False, "Export cancelled")

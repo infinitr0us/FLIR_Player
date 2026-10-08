@@ -55,7 +55,7 @@ except ModuleNotFoundError:  # pure parts stay importable without the SDK
     fnv = None  # type: ignore[assignment]
 
 from .calibration import CalibrationReport, derive_calibration, preserved_state, read_array, set_unit_safely
-from .jobs import JobCancelled
+from .jobs import JobCancelled, OutputTransaction
 from .models import RoiShape
 from .radiometry import (
     KELVIN,
@@ -1327,7 +1327,9 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         common = medians[0]
     else:
         common = None
-    ignition = samples.frame_at(location.lag_s)
+    # a given offset is kept exactly (a given frame stays that frame); the search and fits work in whole bins
+    lag_s = float(options.lag_s) if options.lag_s is not None else location.lag_s
+    ignition = samples.frame_at(lag_s)
     n_frames = int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1))
     origin_frame = min(max(ignition, 0), max(0, n_frames - 1))
     clock = samples.frame_seconds
@@ -1336,7 +1338,7 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     _nb, h, w = samples.mean.shape
     result = MatchResult(
         recording=samples.path.name, tc_source=table.source, camera=samples.info.get("camera", ""),
-        fps=samples.fps, step=step, lag_s=location.lag_s, lag_fixed=location.lag_fixed, lag_score=location.score,
+        fps=samples.fps, step=step, lag_s=lag_s, lag_fixed=location.lag_fixed, lag_score=location.score,
         runner_up_lag_s=location.runner_up_lag_s, ignition_frame=ignition,
         num_frames=int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1)),
         region=[x0, y0, x0 + w, y0 + h], preset=samples.info.get("preset"), channels=results,
@@ -1472,23 +1474,22 @@ def workbook_origin(result: MatchResult) -> tuple[int, float]:
 
 
 def tc_prefill(result: MatchResult, table: TcTable):
-    """TC Compare sheet contents for the workbook: the logger data, each ROI's TC and fitted
-    emissivity (its override on Settings), the best event window."""
+    """TC Compare sheet contents for the workbook: the logger data, each ROI's TC (the sheet's first
+    ten) and fitted emissivity (its override on Settings, for every TC), the best event window."""
     from .excel_export import TcPrefill
 
     _frame, offset = workbook_origin(result)
-    used = [ch for ch in result.channels if ch.match.found and ch.match.pixel is not None]
     names = tuple(ch.name for ch in result.channels)[:10]
     columns = tuple(tuple(float(v) for v in table.values[:, table.index(name) if name in table.names else k])
                     for k, name in enumerate(names))
+    eps = {ch.name: ch.eps[1] for ch in result.channels
+           if ch.eps is not None and math.isfinite(ch.eps[1]) and ch.eps[1] > 0}
     roi_tc, roi_eps = [], []
-    for shape in roi_shapes(result):
-        for ch in used:
-            if shape.name.startswith(ch.name.split(" (")[0] + " ") and ch.name in names:
-                roi_tc.append((shape.name, ch.name))
-                if ch.eps is not None and math.isfinite(ch.eps[1]) and ch.eps[1] > 0:
-                    roi_eps.append((shape.name, round(min(1.0, ch.eps[1]), 3)))
-                break
+    for shape, channel in tc_rois(result):
+        if channel in names:
+            roi_tc.append((shape.name, channel))
+        if channel in eps:
+            roi_eps.append((shape.name, round(min(1.0, eps[channel]), 3)))
     events = [e for ch in result.channels for e in ch.events if e.used]
     window = None
     if events:
@@ -1527,22 +1528,33 @@ def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult,
 
 def roi_shapes(result: MatchResult) -> list[RoiShape]:
     """A spot and an N × N box at every found TC pixel, for the Excel export."""
-    shapes: list[RoiShape] = []
+    return [shape for shape, _channel in tc_rois(result)]
+
+
+def tc_rois(result: MatchResult) -> list[tuple[RoiShape, str]]:
+    """(ROI, the TC channel it belongs to): a spot and an N × N box at every found TC pixel.
+
+    ROIs carry the channel's short name ("T1 (BatteryCell#3)" → "T1 spot"), or its full
+    name where two found channels share a short name.
+    """
+    found = [ch for ch in result.channels if ch.match.found and ch.match.pixel is not None]
+    short = [ch.name.split(" (")[0] for ch in found]
+    out: list[tuple[RoiShape, str]] = []
     number = 1
-    for ch in result.channels:
-        m = ch.match
-        if not m.found or m.pixel is None:
-            continue
-        row, col = m.pixel
-        short = ch.name.split(" (")[0]
-        shapes.append(RoiShape(id=number, kind="cursor", points=((col + 0.5, row + 0.5),), name=f"{short} spot"))
+    for ch, label in zip(found, short):
+        if short.count(label) > 1:
+            label = ch.name
+        row, col = ch.match.pixel
+        out.append((RoiShape(id=number, kind="cursor", points=((col + 0.5, row + 0.5),), name=f"{label} spot"),
+                    ch.name))
         number += 1
-        r0, r1, c0, c1 = spot_rect(m.pixel, result.spot, result.region)
+        r0, r1, c0, c1 = spot_rect(ch.match.pixel, result.spot, result.region)
         if r1 <= r0 or c1 <= c0:
             continue
-        shapes.append(RoiShape(id=number, kind="rect", points=((c0, r0), (c1, r1)), name=f"{short} {c1 - c0}×{r1 - r0}"))
+        out.append((RoiShape(id=number, kind="rect", points=((c0, r0), (c1, r1)),
+                             name=f"{label} {c1 - c0}×{r1 - r0}"), ch.name))
         number += 1
-    return shapes
+    return out
 
 
 def save_figure(path: str | Path, result: MatchResult, location: Location, series: dict, samples: Samples,
@@ -1639,13 +1651,17 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                  im: Any = None, parameters: dict | None = None,
                  progress: Progress | None = None, abort: Abort | None = None,
                  log: Callable[[str], None] | None = None,
-                 stage: Callable[[str], None] | None = None) -> RunOutput:
+                 stage: Callable[[str], None] | None = None,
+                 replace: Sequence[str | Path] | None = None) -> RunOutput:
     """``run``, keeping the TC table and the paths written; for the player's dialog.
 
     ``im`` lends the open recording (see ``sample_recording``); ``parameters``
     (SDK object-parameter values, e.g. the player's) replace the recording's
     own distance, reflected temperature and atmosphere; the emissivity is what
-    the fit finds. ``stage`` hears which step runs.
+    the fit finds. ``stage`` hears which step runs. The result files are
+    published together once complete: ``replace`` lists the existing ones the
+    user agreed to replace (None: any, as on the command line), others are
+    refused, and a cancelled run publishes nothing.
     """
     from .excel_export import RoiSet, save_roi_set
 
@@ -1659,6 +1675,7 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     t0 = time.time()
     samples = sample_recording(recording, options, step_s=step, im=im, progress=progress, abort=abort,
                                cache_dir=cache_dir, stage=stage)
+    _check(abort)  # a cancelled calibration check leaves no calibration, which is no error
     if parameters is not None:
         samples.params = MeasurementParameters.from_sdk(parameters)
     say(f"Read {samples.info['frames']} frames in {time.time() - t0:.0f} s; {samples.report.message}")
@@ -1669,29 +1686,34 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     if out_dir is not None:
         stage("Saving the results")
         out = Path(out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        files = output.files
-        files["json"] = out / "result.json"
-        files["json"].write_text(json.dumps(result.to_dict(), indent=1), encoding="utf-8")
-        files["summary"] = out / "summary.txt"
-        files["summary"].write_text(summary_text(result), encoding="utf-8")
-        width, height = samples.size
-        files["rois"] = out / f"{Path(recording).name}.rois.json"
-        save_roi_set(files["rois"], RoiSet(rois=tuple(roi_shapes(result)), ignition_frame=workbook_origin(result)[0],
-                                           recording=Path(recording).name, size=(width, height)))
+        files = {"json": out / "result.json", "summary": out / "summary.txt",
+                 "rois": out / f"{Path(recording).name}.rois.json"}
         if figure and series:
-            grid, _channels = prepare_channels(table, options, samples.step)
             files["figure"] = out / "overview.png"
-            save_figure(files["figure"], result, location, series, samples, grid)
+        confirmed = list(files.values()) if replace is None else list(replace)
+        with OutputTransaction([recording, tc_file], abort, replace=confirmed) as job:
+            staged = {key: job.stage(path) for key, path in files.items()}
+            staged["json"].write_text(json.dumps(result.to_dict(), indent=1), encoding="utf-8")
+            staged["summary"].write_text(summary_text(result), encoding="utf-8")
+            width, height = samples.size
+            save_roi_set(staged["rois"], RoiSet(rois=tuple(roi_shapes(result)),
+                                                ignition_frame=workbook_origin(result)[0],
+                                                recording=Path(recording).name, size=(width, height)))
+            if "figure" in staged:
+                grid, _channels = prepare_channels(table, options, samples.step)
+                save_figure(staged["figure"], result, location, series, samples, grid)
+            job.commit()
+        output.files.update(files)
         if workbook:
             if result.preset is not None or not roi_shapes(result):
                 say("No workbook: " + ("the Excel export cannot separate superframing presets yet"
                                        if result.preset is not None else "no TC pixel was found"))
             else:
-                files["workbook"] = out / f"{Path(recording).stem}_vs_TC.xlsx"
-                say(write_workbook(files["workbook"], recording, result, table, abort=abort,
+                dest = out / f"{Path(recording).stem}_vs_TC.xlsx"
+                say(write_workbook(dest, recording, result, table, abort=abort,
                                    handles={Path(recording).resolve(): im} if im is not None else None,
-                                   parameters=parameters))
+                                   parameters=parameters, replace=[dest] if replace is None else replace))
+                output.files["workbook"] = dest
     return output
 
 
