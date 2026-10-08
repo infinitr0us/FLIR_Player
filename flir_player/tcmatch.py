@@ -1501,7 +1501,8 @@ def tc_prefill(result: MatchResult, table: TcTable):
 
 def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult, table: TcTable, *,
                    progress: Progress | None = None, abort: Abort | None = None, handles: dict | None = None,
-                   parameters: dict | None = None, replace=(), tool_version: str = "") -> str:
+                   parameters: dict | None = None, replace=(), tool_version: str = "",
+                   protect: Sequence[str | Path] = ()) -> str:
     """Excel workbook (``excel_export``) with spots/boxes at the TC pixels and the logger data filled in.
 
     Time 0 is logger time 0 (the ignition frame is the matched frame) and the
@@ -1509,9 +1510,14 @@ def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult,
     (``workbook_origin``). Rows cover the logger's span at its interval. Each
     TC's ROIs start at its fitted emissivity. ``handles``, ``replace`` and
     ``tool_version`` go to ``run_export``; ``parameters`` (SDK values) replace
-    the recording's own object parameters, as in the analysis.
+    the recording's own object parameters, as in the analysis. ``protect``
+    lists other inputs (the TC file) the workbook must never replace.
     """
     from .excel_export import ExportOptions, SourceSpec, run_export
+    from .jobs import aliases
+
+    if any(aliases(Path(dest), Path(path)) for path in protect):
+        raise ValueError(f"{Path(dest).name} is the TC file; choose another name for the workbook")
 
     if result.preset is not None:
         raise ValueError("The Excel export cannot separate the presets of a superframing recording yet")
@@ -1629,6 +1635,7 @@ class RunOutput:
     table: TcTable
     files: dict[str, Path] = field(default_factory=dict)  # "summary", "json", "rois", "figure", "workbook"
     parameters: dict | None = None  # the SDK object parameters used instead of the recording's own
+    tc_file: Path | None = None  # the logger file read
 
 
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
@@ -1682,7 +1689,8 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     stage("Matching the TCs to pixels and fitting the emissivity")
     result, location, series = analyse(samples, table, options, progress=progress, abort=abort)
     _check(abort)
-    output = RunOutput(result=result, table=table, parameters=dict(parameters) if parameters is not None else None)
+    output = RunOutput(result=result, table=table, parameters=dict(parameters) if parameters is not None else None,
+                       tc_file=Path(tc_file))
     if out_dir is not None:
         stage("Saving the results")
         out = Path(out_dir)
@@ -1690,6 +1698,12 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                  "rois": out / f"{Path(recording).name}.rois.json"}
         if figure and series:
             files["figure"] = out / "overview.png"
+        if workbook:
+            if result.preset is not None or not roi_shapes(result):
+                say("No workbook: " + ("the Excel export cannot separate superframing presets yet"
+                                       if result.preset is not None else "no TC pixel was found"))
+            else:
+                files["workbook"] = out / f"{Path(recording).stem}_vs_TC.xlsx"
         confirmed = list(files.values()) if replace is None else list(replace)
         with OutputTransaction([recording, tc_file], abort, replace=confirmed) as job:
             staged = {key: job.stage(path) for key, path in files.items()}
@@ -1702,18 +1716,13 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
             if "figure" in staged:
                 grid, _channels = prepare_channels(table, options, samples.step)
                 save_figure(staged["figure"], result, location, series, samples, grid)
+            if "workbook" in staged:
+                write_workbook(staged["workbook"], recording, result, table, abort=abort,
+                               handles={Path(recording).resolve(): im} if im is not None else None,
+                               parameters=parameters)
+                say(f"Workbook: {files['workbook']}")
             job.commit()
         output.files.update(files)
-        if workbook:
-            if result.preset is not None or not roi_shapes(result):
-                say("No workbook: " + ("the Excel export cannot separate superframing presets yet"
-                                       if result.preset is not None else "no TC pixel was found"))
-            else:
-                dest = out / f"{Path(recording).stem}_vs_TC.xlsx"
-                say(write_workbook(dest, recording, result, table, abort=abort,
-                                   handles={Path(recording).resolve(): im} if im is not None else None,
-                                   parameters=parameters, replace=[dest] if replace is None else replace))
-                output.files["workbook"] = dest
     return output
 
 

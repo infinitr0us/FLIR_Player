@@ -651,7 +651,7 @@ class DecoderThread(QThread):
                 handles={key: im} if im is not None else None, parameters=payload.get("parameters"),
                 progress=lambda done, total: self.export_progress.emit(int(done), int(total)),
                 abort=lambda: self._job_aborted(payload), replace=payload.get("replace", ()),
-                tool_version=__version__)
+                tool_version=__version__, protect=[payload["tc_file"]] if payload.get("tc_file") else ())
             return True, message
         except JobCancelled:
             return False, "Export cancelled"

@@ -6,6 +6,7 @@ workbook, ``run_analysis`` and the setup and results dialogs, and the job throug
 from __future__ import annotations
 
 import csv
+import dataclasses
 import math
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import QDialog, QLineEdit
 
 from conftest import wait_until
 from flir_player import tcmatch
+from flir_player.calibration import CalibrationReport
 from flir_player.excel_export import TcPrefill
 from flir_player.models import PresetRange, RoiShape, VideoMetadata
 from flir_player.tcdata import TcTable, read_tc_table, sheet_names, suggest_sheet
@@ -537,8 +539,19 @@ def test_c7_cancelling_late_is_a_cancel_and_publishes_nothing(tmp_path, monkeypa
     samples, table = make_scene()
     samples.info["frames"] = int(samples.counts.sum())
     _fake_run(monkeypatch, samples, table)
-    with pytest.raises(JobCancelled):  # cancelled during the calibration check: not "no calibration"
-        tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), abort=lambda: True)
+    # cancelled during the calibration check (the sampling returns, its calibration unverified):
+    # a cancel, not "no verified calibration"
+    unverified = dataclasses.replace(samples, report=CalibrationReport(None, "unavailable", "Cancelled"))
+    sampled = {"done": False}
+
+    def cancelled_while_sampling(path, options, *, step_s, im, progress, abort, cache_dir, stage):
+        sampled["done"] = True
+        return unverified
+
+    monkeypatch.setattr(tcmatch, "sample_recording", cancelled_while_sampling)
+    with pytest.raises(JobCancelled):
+        tcmatch.run_analysis("synthetic.seq", "tc.csv", MatchOptions(spot=1), abort=lambda: sampled["done"])
+    _fake_run(monkeypatch, samples, table)
     state = {"saving": False}
 
     def at_saving(text):
@@ -601,4 +614,129 @@ def test_c10_the_size_estimate_uses_the_engines_bin_width(qapp, tmp_path) -> Non
     presets = (PresetRange(1, 1500, 523.15, 873.15), PresetRange(2, 1500, 773.15, 1473.15))
     dialog.metadata = dataclasses.replace(metadata, presets=presets)
     assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 * 15 + 1) * 200 * 200)  # one preset: 15 Hz
+    dialog.deleteLater()
+
+
+# --- Codex follow-up 2026-10-07 (run review-tc-dialog-cont: N1-N5) ------------------------------
+
+
+def test_n1_a_workbook_never_replaces_the_tc_file(tmp_path) -> None:
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1))
+    tc = tmp_path / "tc.xlsx"
+    tc.write_bytes(b"logger data")
+    with pytest.raises(ValueError, match="is the TC file"):
+        tcmatch.write_workbook(tc, "synthetic.seq", result, table, protect=[tc], replace=[tc])
+    assert tc.read_bytes() == b"logger data"
+
+
+def test_n2_the_command_line_workbook_is_published_with_the_other_results(tmp_path, monkeypatch) -> None:
+    from flir_player.jobs import JobCancelled
+
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    written = {}
+
+    def fake_workbook(dest, *args, **kwargs):
+        written["dest"] = Path(dest)
+        Path(dest).write_bytes(b"workbook")
+        return "ok"
+
+    monkeypatch.setattr(tcmatch, "write_workbook", fake_workbook)
+    out = tmp_path / "out"
+    output = tcmatch.run_analysis("synthetic.seq", tmp_path / "tc.csv", MatchOptions(spot=1), out_dir=out,
+                                  workbook=True)
+    assert output.files["workbook"] == out / "synthetic_vs_TC.xlsx"
+    assert (out / "synthetic_vs_TC.xlsx").read_bytes() == b"workbook"
+    assert written["dest"] != out / "synthetic_vs_TC.xlsx"  # written staged, published by the transaction
+    # cancelled while the workbook is made: none of the run's files is published
+    again = tmp_path / "again"
+
+    def cancelled(dest, *args, **kwargs):
+        raise JobCancelled("Cancelled")
+
+    monkeypatch.setattr(tcmatch, "write_workbook", cancelled)
+    with pytest.raises(JobCancelled):
+        tcmatch.run_analysis("synthetic.seq", tmp_path / "tc.csv", MatchOptions(spot=1), out_dir=again,
+                             workbook=True)
+    assert not any(path.is_file() for path in again.rglob("*")) if again.exists() else True
+    # the TC file itself is an input: a workbook named like it is refused
+    clash = tmp_path / "clash"
+    clash.mkdir()
+    tc = clash / "synthetic_vs_TC.xlsx"
+    tc.write_bytes(b"logger data")
+    monkeypatch.setattr(tcmatch, "write_workbook", fake_workbook)
+    with pytest.raises(ValueError):
+        tcmatch.run_analysis("synthetic.seq", tc, MatchOptions(spot=1), out_dir=clash, workbook=True)
+    assert tc.read_bytes() == b"logger data"
+
+
+def test_n3_held_in_memory_the_statistics_keep_a_margin(qapp, tmp_path, monkeypatch) -> None:
+    from flir_player import tc_dialog
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[k, 20.0 + k] for k in range(60)])
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0)
+    dialog.file_edit.setText(str(tc))
+    dialog._load(sheet=None)
+    assert _loaded(qapp, dialog)
+    dialog.cache_check.setChecked(False)
+    size = dialog._statistics_bytes()
+    run = dialog.button_box.button(dialog.button_box.StandardButton.Ok)
+    monkeypatch.setattr(tc_dialog, "MEMORY_LIMIT", size * 1.1)  # fits, but not with the margin
+    dialog._update()
+    assert not run.isEnabled() and "too large" in dialog.estimate_label.text()
+    monkeypatch.setattr(tc_dialog, "MEMORY_LIMIT", size * 1.3)
+    dialog._update()
+    assert run.isEnabled()
+    dialog.deleteLater()
+
+
+def test_n4_a_rerun_replaces_the_earlier_boxes_whatever_their_names(qapp, tmp_path, monkeypatch) -> None:
+    import dataclasses
+
+    from flir_player.main_window import MainWindow
+
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1))
+    first = _renamed(result, ("TC (front)",))
+    second = _renamed(result, ("TC (front)", "TC (back)"))
+    second.channels[0] = dataclasses.replace(second.channels[0], match=dataclasses.replace(
+        second.channels[0].match, pixel=(second.channels[0].match.pixel[0] + 2, second.channels[0].match.pixel[1])))
+    window = MainWindow()
+    try:
+        monkeypatch.setattr(window, "_push_rois", lambda: None)
+        window.metadata = _metadata(tmp_path)
+        window.current_packet = object()
+        window._rois.append(RoiShape(window._roi_next_id, "rect", ((0.0, 0.0), (5.0, 5.0)), "Box 1"))
+        window._roi_next_id += 1
+        window._add_tc_rois(RunOutput(result=first, table=table))
+        assert [roi.name for roi in window._rois] == ["Box 1", "TC 1×1"]
+        window._add_tc_rois(RunOutput(result=second, table=table))
+        assert [roi.name for roi in window._rois] == ["Box 1", "TC (front) 1×1", "TC (back) 1×1"]
+    finally:
+        window.current_packet = None
+        window.metadata = None
+        window.close()
+
+
+def test_n5_enter_on_a_check_box_or_the_disclosure_does_not_run(qapp, tmp_path) -> None:
+    from PySide6.QtTest import QTest
+
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[k, 20.0 + k] for k in range(60)])
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0)
+    dialog.show()
+    dialog.file_edit.setText(str(tc))
+    dialog._load(sheet=None)
+    assert _loaded(qapp, dialog)
+    dialog.advanced_button.setChecked(True)
+    for widget in (dialog.below_check, dialog.cache_check, dialog.advanced_button):
+        widget.setFocus()
+        QTest.keyClick(widget, Qt.Key.Key_Return)
+        qapp.processEvents()
+        assert dialog.isVisible() and dialog.result() != QDialog.DialogCode.Accepted
+    dialog.close()
     dialog.deleteLater()

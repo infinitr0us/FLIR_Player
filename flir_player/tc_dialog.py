@@ -18,7 +18,6 @@ import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -53,6 +52,9 @@ from .widgets import ICON_MUTED, ChevronComboBox, FramelessDialog, MessageDialog
 
 RESULT_FILES = ("result.json", "summary.txt", "overview.png")  # what a run writes besides the ROI set
 LARGE_STATISTICS = 4e9  # bytes of frame statistics worth a hint to draw a smaller region
+# The size is estimated from the average frame rate; dropped frames (superframing) can make the
+# engine's bins finer, so held in memory it must fit with this margin.
+MEMORY_MARGIN = 1.25
 # Channels that measure air or gas have no surface pixel: unticked at first (the user decides).
 _AIR_HINT = re.compile(r"(?<![a-z])(tree|air|gas|duct|ambient|room|plume|flame|exhaust)(?![a-z])", re.IGNORECASE)
 _LAST_DIR_KEY = "tcmatch/last_dir"
@@ -356,9 +358,10 @@ class TcCalibrationDialog(FramelessDialog):
         self.resize(max(self.minimumWidth(), content.sizeHint().width() + 48), min(wanted, int(available * 0.9)))
 
     def keyPressEvent(self, event) -> None:
-        # Enter finishes typing (a path, a "Use only" cell); it never starts a minutes-long run
+        # Enter finishes typing (a path, a "Use only" cell) or does nothing on a check box; it never
+        # starts a minutes-long run unless a push button has the focus
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not isinstance(
-                self.focusWidget(), QAbstractButton):
+                self.focusWidget(), QPushButton):
             event.accept()
             return
         super().keyPressEvent(event)
@@ -535,7 +538,7 @@ class TcCalibrationDialog(FramelessDialog):
         elif not self.chosen_channels():
             text = "Tick at least one thermocouple."
             valid = False
-        elif not self.cache_check.isChecked() and size > MEMORY_LIMIT:
+        elif not self.cache_check.isChecked() and size * MEMORY_MARGIN > MEMORY_LIMIT:
             text = (f"The frame statistics ({gigabytes}) are too large to hold in memory: draw a box ROI "
                     "around the battery, or keep the statistics in the results folder.")
             valid = False

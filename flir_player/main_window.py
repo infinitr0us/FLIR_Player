@@ -758,6 +758,7 @@ class MainWindow(QMainWindow):
 
     def _clear_rois(self) -> None:
         self._rois = []
+        self._tc_roi_ids: set[int] = set()  # ROIs from "Fit Emissivity from TCs" (ids restart)
         self._roi_next_id = 1
         self._roi_name_counts = {}
         self._selected_roi_id = None
@@ -1280,11 +1281,14 @@ class MainWindow(QMainWindow):
         shapes = [shape for shape in roi_shapes(output.result)
                   if shape.kind == "rect" and self._covers_pixels(shape.kind, shape.points)]
         names = {shape.name for shape in shapes}
-        self._rois = [shape for shape in self._rois if shape.name not in names]
+        earlier = getattr(self, "_tc_roi_ids", set())  # added by an earlier fit (labels can change)
+        self._rois = [shape for shape in self._rois if shape.name not in names and shape.id not in earlier]
         if self._selected_roi_id not in {shape.id for shape in self._rois}:
             self._selected_roi_id = None
+        self._tc_roi_ids = set()
         for shape in shapes:
             self._rois.append(RoiShape(id=self._roi_next_id, kind=shape.kind, points=shape.points, name=shape.name))
+            self._tc_roi_ids.add(self._roi_next_id)
             self._roi_next_id += 1
         frame, _offset = workbook_origin(output.result)
         self._ignition_frames[str(self.metadata.path)] = frame
@@ -1309,7 +1313,8 @@ class MainWindow(QMainWindow):
         self._export_progress.canceled.connect(self.decoder.cancel_extract)
         self.decoder.request_tc_workbook({
             "recording": str(self.metadata.path), "dest": str(dest), "result": output.result,
-            "table": output.table, "parameters": output.parameters, "replace": [str(p) for p in replace]})
+            "table": output.table, "parameters": output.parameters, "replace": [str(p) for p in replace],
+            "tc_file": str(output.tc_file) if output.tc_file is not None else None})
 
     def _on_bitmasks_finished(self, ok: bool, message: str) -> None:
         if ok:
