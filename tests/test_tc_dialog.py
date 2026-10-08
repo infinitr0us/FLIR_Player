@@ -613,7 +613,8 @@ def test_c10_the_size_estimate_uses_the_engines_bin_width(qapp, tmp_path) -> Non
     assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 * 30 + 1) * 200 * 200)
     presets = (PresetRange(1, 1500, 523.15, 873.15), PresetRange(2, 1500, 773.15, 1473.15))
     dialog.metadata = dataclasses.replace(metadata, presets=presets)
-    assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 * 15 + 1) * 200 * 200)  # one preset: 15 Hz
+    # superframing is clock-timed and may have gaps the dialog cannot see: bins as fine as the logger's
+    assert dialog._statistics_bytes() == pytest.approx(8.0 * (100.0 / 0.01 + 1) * 200 * 200)
     dialog.deleteLater()
 
 

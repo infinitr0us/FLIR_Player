@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.6.0 — 2026-10-07
+
+Emissivity from thermocouples. Fire tests film battery cells that carry
+thermocouples (TCs); the player can now find each TC in the recording and fit
+the surface emissivity from its readings, the method the engineers used by
+hand on the 0922 test. Developed on two battery fire tests (0922 and 0903).
+
+### Fit Emissivity from TCs
+
+- *Measurement → Fit Emissivity from TCs…* opens the setup: the TC logger
+  file (`.xlsx`, `.csv` or `.txt`; a workbook's sheet named like TC data is
+  picked, any other can be chosen), the TCs to use (TCs in air or gas start
+  unticked) with an optional "Use only" window of seconds per TC, the search
+  region (whole image or a box ROI), the preset of a superframing recording,
+  the object parameters (the Measurement panel's or the recording's own), and
+  the time match (automatic, or "logger time 0 is at frame…").
+- The run reads every frame once and keeps per-second statistics in the
+  results folder (`<recording>_tcmatch` next to it), so later runs with the
+  same region take a minute or two. Its progress names each step; Cancel
+  stops it.
+- It finds the logger's time offset and each TC's pixel by correlating
+  every pixel's counts with the TC's blackbody signal, chooses the stretches
+  to fit by rules that never compare IR with TC (TC working and hot enough, no
+  flames in front of the spot, IR in range, no flame or jet on the TC itself),
+  and fits the emissivity per stretch. A TC's value is the median of its
+  stretches; TCs on differently painted spots keep their own values.
+- The results list each TC's pixel, match, emissivity, number of stretches
+  and spread, with the summary and a figure per TC. From there: add a box at
+  each TC pixel (the block the fit used) and set the ignition frame to logger
+  time 0; set the player's emissivity to a TC's value; or save an Excel
+  workbook whose ROIs sit at the TC pixels, start at their TC's emissivity,
+  and are compared with the logger data already filled into TC Compare.
+- Recordings without a factory temperature calibration are refused before
+  the run. The workbook cannot separate superframing presets yet.
+
+### Excel workbook
+
+- An ROI's emissivity override on Settings can now be pre-filled (the TC
+  workbook does this); the cached values follow it.
+
+### Under the hood
+
+- `tcmatch` (Qt-free) and `tcdata` hold the method; `python -m
+  flir_player.tcmatch RECORDING TC_FILE` runs it from the command line.
+  `run_analysis` borrows the player's open recording on the decoder thread,
+  like the Excel export.
+- openpyxl is a runtime dependency (reading TC workbooks). The build's smoke
+  test also reads a TC workbook and runs the TC job.
+- Horizontal scroll bars are themed like the vertical ones.
+- 26 new tests for the dialogs, the job and the workbook. Two review passes
+  found fifteen issues (TCs with similar names sharing an emissivity, a given
+  frame rounded to a whole second, late cancels reported as errors or
+  successes, result files replaced without asking or over the TC file, a
+  crash when quitting during a file read, Enter starting a run); all are
+  fixed.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.5.3...v0.6.0)
+
 ## 0.5.3 — 2026-10-04
 
 Fixes for FLIR A700 recordings saved by ResearchIR, found in the data of a

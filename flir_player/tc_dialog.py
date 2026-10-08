@@ -52,8 +52,8 @@ from .widgets import ICON_MUTED, ChevronComboBox, FramelessDialog, MessageDialog
 
 RESULT_FILES = ("result.json", "summary.txt", "overview.png")  # what a run writes besides the ROI set
 LARGE_STATISTICS = 4e9  # bytes of frame statistics worth a hint to draw a smaller region
-# The size is estimated from the average frame rate; dropped frames (superframing) can make the
-# engine's bins finer, so held in memory it must fit with this margin.
+# Held in memory, the estimated statistics must fit with this margin (the engine times frames by the
+# recording's own rate, which can differ slightly from the nominal one shown here).
 MEMORY_MARGIN = 1.25
 # Channels that measure air or gas have no surface pixel: unticked at first (the user decides).
 _AIR_HINT = re.compile(r"(?<![a-z])(tree|air|gas|duct|ambient|room|plume|flame|exhaust)(?![a-z])", re.IGNORECASE)
@@ -515,13 +515,16 @@ class TcCalibrationDialog(FramelessDialog):
         """Size of the frame statistics: two float32 values per pixel and time bin.
 
         Bins are the logger interval, or the time between the frames used when
-        that is longer (as ``tcmatch.sample_recording`` chooses them).
+        that is longer (as ``tcmatch.sample_recording`` chooses them). A
+        superframing recording is timed by its clock, whose gaps the dialog
+        cannot see, so its bins are taken as fine as the logger's: an upper
+        bound, never an underestimate.
         """
         x0, y0, x1, y1 = self.region() or (0, 0, self.metadata.width, self.metadata.height)
         step = self.table.interval if self.table is not None else 1.0
         fps = self.metadata.nominal_fps or 0.0
-        if fps > 0:
-            frame_interval = max(1, len(self.metadata.presets)) / fps  # one preset's frames on superframing
+        if fps > 0 and not self.metadata.presets:
+            frame_interval = 1.0 / fps
             step = step if frame_interval <= 1.01 * step else frame_interval
         bins = self.metadata.duration_seconds / max(step, 1e-3) + 1
         return 8.0 * bins * (x1 - x0) * (y1 - y0)

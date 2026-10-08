@@ -22,8 +22,8 @@ if errorlevel 1 goto :error
 
 rem Smoke-test the built executable as on a user's PC: with a Windows-only PATH,
 rem so no Conda runtime DLL can mask a missing bundled one. Open local\data\2.seq
-rem (and 1.ats when present), verify playback advances and that an Excel workbook
-rem export succeeds. A crash exits with a negative NTSTATUS code, which
+rem (and 1.ats when present), verify playback advances, that an Excel workbook
+rem export succeeds, and that the TC job reads a TC workbook. A crash exits with a negative NTSTATUS code, which
 rem "if errorlevel 1" would miss, so the exit code must be exactly 0.
 rem Throw-away preferences keep builds out of the developer's recent files.
 set "FLIR_SETTINGS_FILE=%TEMP%\flir-build-smoke-settings.ini"
