@@ -216,3 +216,35 @@ def test_excel_dialog_fills_tc_compare_from_the_fit_for_zones(qapp) -> None:
                                tc_run=RunOutput(result=replace(result, preset=2), table=table))
     assert not preset.tc_check.isEnabled() and "superframing" in preset.tc_label.text()
     assert np.isfinite(options.tc_prefill.offset_s)
+
+
+def test_z1_the_split_dialog_refuses_names_other_rois_carry(qapp) -> None:
+    seen = []
+    dialog = ZoneSplitDialog(ZoneSpec(box=BOX), 640, 480, taken={"Cell 3", "Box 1"})
+    dialog.preview.connect(seen.append)
+    dialog.show()
+    qapp.processEvents()
+    ok = dialog.button_box.button(dialog.button_box.StandardButton.Ok)
+    assert seen[-1] == [] and not ok.isEnabled() and "Cell 3" in dialog.info_label.text()
+    dialog.prefix_edit.setText("Top")
+    assert ok.isEnabled() and seen[-1][0][0] == "Top 1"
+    dialog.close()
+
+
+def test_z1_the_excel_dialog_explains_repeated_names(qapp) -> None:
+    from test_tcmatch import SPOT_A, SPOT_B, make_scene
+
+    from flir_player import tcmatch
+    from flir_player.excel_dialog import ExcelExportDialog
+    from flir_player.models import VideoMetadata
+    from flir_player.tcmatch import MatchOptions, RunOutput
+
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=3))
+    metadata = VideoMetadata(path=Path("C:/data/scene.seq"), width=48, height=40, num_frames=30_000,
+                             start_time=None, end_time=None, duration_seconds=1000.0, nominal_fps=30.0)
+    rois = (RoiShape(1, "rect", ((SPOT_A[1] - 1.0, SPOT_A[0] - 1.0), (SPOT_A[1] + 2.0, SPOT_A[0] + 2.0)), "Cell"),
+            RoiShape(2, "rect", ((SPOT_B[1] - 1.0, SPOT_B[0] - 1.0), (SPOT_B[1] + 2.0, SPOT_B[0] + 2.0)), "Cell"))
+    dialog = ExcelExportDialog(metadata, rois, current_frame=0, tc_run=RunOutput(result=result, table=table))
+    assert not dialog.tc_check.isEnabled() and "More than one ROI is named Cell" in dialog.tc_label.text()
+    assert dialog.options().tc_prefill is None

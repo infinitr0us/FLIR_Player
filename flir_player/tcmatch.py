@@ -1521,7 +1521,11 @@ def tc_prefill(result: MatchResult, table: TcTable, *, rois: Sequence[RoiShape] 
         width, height = size
         pixels = {ch.name: ch.match.pixel for ch in result.channels
                   if ch.name in names and ch.match.found and ch.match.pixel is not None}
-        roi_tc = [(roi, channel) for channel, roi in pair_tcs(pixels, rois, height, width).pairs.items()]
+        pairing = pair_tcs(pixels, rois, height, width)
+        if pairing.duplicates:
+            raise ValueError(f"More than one ROI is named {', '.join(pairing.duplicates)}; the workbook pairs ROIs "
+                             "and TCs by name, so give them different names")
+        roi_tc = [(roi, channel) for channel, roi in pairing.pairs.items()]
     half = result.step / 2
     channels = {ch.name: ch for ch in result.channels}
     roi_use = []

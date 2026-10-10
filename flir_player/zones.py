@@ -99,6 +99,7 @@ class Pairing:
     pairs: dict[str, str] = field(default_factory=dict)  # TC → ROI name
     outside: list[str] = field(default_factory=list)  # TCs whose pixel lies in no ROI
     shared: dict[str, list[str]] = field(default_factory=dict)  # ROI → every TC inside it (when several)
+    duplicates: list[str] = field(default_factory=list)  # names of paired ROIs that other ROIs also carry
 
     def describe(self) -> str:
         """One line for a dialog: "T1 → Cell 3 · T2 → Cell 6; T3 is in no ROI"."""
@@ -107,6 +108,8 @@ class Pairing:
             text += f"; {', '.join(self.outside)} {'is' if len(self.outside) == 1 else 'are'} in no ROI"
         for roi, tcs in self.shared.items():
             text += f"; {roi} holds {', '.join(tcs)} (paired with {tcs[0]})"
+        for roi in self.duplicates:
+            text += f"; more than one ROI is named {roi}"
         return text
 
 
@@ -115,28 +118,34 @@ def pair_tcs(pixels: Mapping[str, tuple[int, int]], rois: Sequence, height: int,
 
     The smallest ROI wins, so a search box around the whole module never takes a TC from its zone.
     Lines (profiles) are not paired. An ROI holding several TC pixels is paired with the first of
-    them (in ``pixels`` order); the others stay unpaired and are listed in ``shared``.
+    them (in ``pixels`` order); the others stay unpaired and are listed in ``shared``. The workbook pairs
+    ROIs and TCs by name, so a paired ROI whose name another ROI also carries is listed in ``duplicates``.
     """
+    rois = list(rois)
     areas = []
-    for shape in rois:
+    for index, shape in enumerate(rois):
         if shape.kind == "line":
             continue
         ys, xs = roi_coordinates(shape, height, width)
         if ys.size:
-            areas.append((int(ys.size), shape, set(zip(ys.tolist(), xs.tolist()))))
+            areas.append((int(ys.size), index, set(zip(ys.tolist(), xs.tolist()))))
     areas.sort(key=lambda item: item[0])
     result = Pairing()
-    inside: dict[str, list[str]] = {}
+    inside: dict[int, list[str]] = {}  # by position: two ROIs may share a name
     for tc, (row, col) in pixels.items():
-        owner = next((shape.name for _n, shape, cells in areas if (int(row), int(col)) in cells), None)
+        owner = next((index for _n, index, cells in areas if (int(row), int(col)) in cells), None)
         if owner is None:
             result.outside.append(tc)
             continue
         inside.setdefault(owner, []).append(tc)
-    for roi, tcs in inside.items():
+    names = [shape.name for shape in rois]
+    for index, tcs in inside.items():
+        roi = names[index]
         result.pairs[tcs[0]] = roi
         if len(tcs) > 1:
             result.shared[roi] = tcs
+        if names.count(roi) > 1 and roi not in result.duplicates:
+            result.duplicates.append(roi)
     order = list(pixels)
     result.pairs = dict(sorted(result.pairs.items(), key=lambda item: order.index(item[0])))
     return result

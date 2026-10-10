@@ -3,7 +3,7 @@
 """Split a box ROI into equal cell zones, previewed on the image while the dialog is open."""
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Collection, Mapping
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -36,11 +36,12 @@ class ZoneSplitDialog(FramelessDialog):
 
     def __init__(self, spec: ZoneSpec, width: int, height: int, *,
                  tc_pixels: Mapping[str, tuple[int, int]] | None = None, regroup: bool = False,
-                 parent=None) -> None:
+                 taken: Collection[str] = (), parent=None) -> None:
         super().__init__("Split Box into Zones", parent)
         self.setMinimumWidth(460)
         self._width, self._height = width, height
         self._tc_pixels = dict(tc_pixels or {})
+        self._taken = set(taken)  # names of the other ROIs: zones must not repeat them
         self._zones: list = []
         intro = QLabel("Equal zones along the box, one per cell. Zone 1 is at the end you choose (the heater end "
                        "on the fire tests). The gap leaves out the mixed pixels where two cells meet.")
@@ -146,6 +147,11 @@ class ZoneSplitDialog(FramelessDialog):
         ok = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
         try:
             self._zones = split_box(spec, self._width, self._height)
+            clash = [name for name, _points in self._zones if name in self._taken]
+            if clash:
+                shown = ", ".join(clash[:3]) + ("…" if len(clash) > 3 else "")
+                raise ValueError(f"Other ROIs already use the names {shown}: choose other names (the workbook "
+                                 "pairs ROIs and TCs by name)")
         except ValueError as exc:
             self._zones = []
             self.info_label.setText(str(exc))

@@ -388,3 +388,86 @@ def test_row_formulas_cite_cells_not_names(tmp_path) -> None:
     fit = [c.value for c in book["TC Compare"][10]
            if isinstance(c.value, str) and c.value.startswith("=IF(AND(") and "=1," in c.value][0]
     assert "'Emissivity Match'!$B$9" in fit and "'Emissivity Match'!$B$10" in fit  # the window
+
+
+# --- Codex review 2026-10-10 (local/notes/2026-10-10-cell-zones/codex/, run review-cell-zones) -------------
+
+
+def _match_with(tmp_path, name, *, eps=None, lo=None, hi=None, step=None, **prefill_extra):
+    """A zone workbook whose Match inputs start at other values (the defaults are module constants)."""
+    import flir_player.workbook as wbmod
+
+    source, temps = _zone_source(eps=eps)
+    saved = wbmod.MATCH_DEFAULTS
+    defaults = list(saved)
+    for k, value in enumerate((lo, hi, step)):
+        if value is not None:
+            defaults[k] = value
+    wbmod.MATCH_DEFAULTS = tuple(defaults)
+    try:
+        path = _write(tmp_path, source, _prefill(temps, **prefill_extra), name=name)
+    finally:
+        wbmod.MATCH_DEFAULTS = saved
+    return path
+
+
+def test_z1_rois_sharing_a_name_are_not_paired_by_name(tmp_path) -> None:
+    from test_tcmatch import SPOT_A, SPOT_B
+
+    from flir_player import tcmatch
+    from flir_player.zones import pair_tcs
+
+    a = RoiShape(1, "rect", ((SPOT_A[1] - 1.0, SPOT_A[0] - 1.0), (SPOT_A[1] + 2.0, SPOT_A[0] + 2.0)), "Cell 3")
+    b = RoiShape(2, "rect", ((SPOT_B[1] - 1.0, SPOT_B[0] - 1.0), (SPOT_B[1] + 2.0, SPOT_B[0] + 2.0)), "Cell 3")
+    pairing = pair_tcs({"TC A": SPOT_A, "TC B": SPOT_B}, [a, b], 40, 48)
+    assert pairing.shared == {}  # two ROIs, one TC each: nothing is shared
+    assert pairing.duplicates == ["Cell 3"] and "more than one ROI is named Cell 3" in pairing.describe()
+    _tcmatch, result, table = _scene_result()
+    with pytest.raises(ValueError, match="named Cell 3"):
+        tcmatch.tc_prefill(result, table, rois=[a, b], frame=0, size=(48, 40))
+
+
+def test_z2_a_fine_step_still_reaches_the_highest_emissivity(tmp_path) -> None:
+    path = _match_with(tmp_path, "fine.xlsx", eps={"Cell 3": 0.97, "Cell 6": 0.97}, step=0.001)
+    match = _Match(path, 2)
+    eps = [e for e in match.eps if isinstance(e, float)]
+    assert len(eps) == MATCH_CANDIDATES and eps[0] == pytest.approx(0.90) and eps[-1] == pytest.approx(0.98)
+    assert match.best == pytest.approx(0.97, abs=0.0011)  # step widened to 0.002
+    formulas = openpyxl.load_workbook(path)[MATCH]
+    assert "MATCH_STEPUSED" in formulas.cell(14, 12).value and formulas["C8"].value.startswith("=MAX(MATCH_STEP,")
+
+
+def test_z3_limit_notes_follow_the_limits_entered(tmp_path) -> None:
+    # step 0.03: 0.90, 0.93, 0.96 and the highest limit 0.98 itself; 0.96 is inside the limits
+    match = _Match(_match_with(tmp_path, "coarse.xlsx", eps={"Cell 3": 0.96, "Cell 6": 0.96}, step=0.03), 2)
+    assert [e for e in match.eps if isinstance(e, float)] == pytest.approx([0.90, 0.93, 0.96, 0.98])
+    assert match.best == pytest.approx(0.96) and match.note == "Inside the limits."
+    single = _Match(_match_with(tmp_path, "one.xlsx", eps={"Cell 3": 0.98, "Cell 6": 0.98}, lo=0.95, hi=0.95), 2)
+    assert single.best == pytest.approx(0.95) and single.note.startswith("Only one emissivity is tried")
+
+
+def test_z4_per_roi_emissivities_are_named_on_the_match_sheet(tmp_path) -> None:
+    path = _match_with(tmp_path, "overrides.xlsx", roi_eps=(("Cell 3", 0.8),))
+    ws = openpyxl.load_workbook(path)[MATCH]
+    assert "clear those cells" in ws["A5"].value
+    plain = openpyxl.load_workbook(_match_with(tmp_path, "plain.xlsx"))[MATCH]
+    assert plain["A5"].value is None
+
+
+def test_z5_a_hand_paired_zone_workbook_keeps_every_chart(tmp_path) -> None:
+    source, _temps = _zone_source(zones=18)
+    charts = _chart_xml(_write(tmp_path, source, None))  # TCs pasted and picked later in Excel
+    titles = [re.findall(r"<a:t>([^<]*)</a:t>", xml)[0] for xml in charts]
+    assert {f"Cell {k}" for k in range(1, 19)} <= set(titles)
+    match_chart = charts[titles.index("Error against emissivity")]
+    assert match_chart.count("<c:ser>") == 19  # all TCs + every zone (empty until paired)
+
+
+def test_z6_direct_references_leave_string_literals_alone() -> None:
+    from flir_player.workbook import _Writer
+
+    writer = _Writer.__new__(_Writer)
+    writer._refs = {"ROI_01_K1": "'Settings'!$S$27", "UNIT_A": "'Settings'!$T$4"}
+    out = writer._direct('=IF(ROI_01_K1>0,"ROI_01_K1 UNIT_A",UNIT_A*ROI_01_K1)')
+    assert out == "=IF('Settings'!$S$27>0,\"ROI_01_K1 UNIT_A\",'Settings'!$T$4*'Settings'!$S$27)"
+    assert writer._direct("=ROI_01_TCR+ROI_01_K10") == "=ROI_01_TCR+ROI_01_K10"  # unknown names stay

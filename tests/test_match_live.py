@@ -142,3 +142,19 @@ def test_excel_flags_tcs_that_disagree(excel, tmp_path) -> None:
         assert np.isfinite(sheet.Range("G7").Value)
     finally:
         book.Close(False)
+
+
+@pytest.mark.parametrize("step, eps", [(0.03, 0.96), (0.001, 0.97)])
+def test_excel_candidate_grid_reaches_the_highest_limit(excel, tmp_path, step, eps) -> None:
+    from test_emissivity_match import _match_with
+
+    path = _match_with(tmp_path, f"grid_{step}.xlsx", eps={"Cell 3": eps, "Cell 6": eps}, step=step)
+    book = _open(excel, path)
+    try:
+        _compare_sheet(book, path, range(13, 13 + 41), range(12, 16))  # candidates, all TCs, both ROIs
+        _compare_sheet(book, path, range(6, 9), (7,))
+        _compare_sheet(book, path, (9,), (4,))
+        sheet = book.Worksheets("Emissivity Match")
+        assert sheet.Range("C8").Value == pytest.approx(max(step, 0.08 / 40))
+    finally:
+        book.Close(False)

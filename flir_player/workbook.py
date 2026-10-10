@@ -116,11 +116,22 @@ def _ramp(n: int) -> list[str]:
     return out
 
 
+def _step_used(lo: float, hi: float, step: float) -> float:
+    """The Match table's step: the one asked for, or wider so its rows reach the highest emissivity."""
+    return max(step, (hi - lo) / (MATCH_CANDIDATES - 1))
+
+
 def _candidates(lo: float, hi: float, step: float) -> list[float]:
-    """The candidate emissivities of the Match table's formulas: lo, lo + step, … ≤ hi."""
+    """The candidate emissivities of the Match table's formulas: lo, lo + step, …, and hi itself last."""
     if not (step > 0 and hi >= lo):
-        return [lo] if step > 0 and hi == lo else []
-    return [lo + k * step for k in range(MATCH_CANDIDATES) if lo + k * step <= hi + 1e-9]
+        return []
+    used = _step_used(lo, hi, step)
+    out = [lo]
+    for j in range(1, MATCH_CANDIDATES):
+        if not lo + (j - 1) * used < hi - 1e-9:
+            break
+        out.append(min(lo + j * used, hi))
+    return out
 
 
 class _Buffered:
@@ -237,6 +248,7 @@ class _Writer:
         self.f_best = f({"bold": True, "font_size": 14, "num_format": "0.000", "bg_color": "#C6EFCE",
                          "font_color": "#006100", "border": 1})
         self.f_k = f({"num_format": "0.0"})
+        self.f_used = f({"num_format": '"used "0.000', "font_color": "#595959", "italic": True})
         self.f_hide = f({"font_color": "#FFFFFF"})  # #N/A where a candidate or ROI has no value
         self.f_calc = f({"bg_color": "#F2F2F2", "border": 1, "num_format": "0.000000"})
         self.f_calc_text = f({"bg_color": "#F2F2F2", "border": 1})
@@ -360,7 +372,9 @@ class _Writer:
         (local/notes/2026-10-10-cell-zones). The row-by-row formulas of Data and TC Compare
         therefore cite cells; the names stay defined for reading and for the few summary formulas.
         """
-        return _NAME_TOKEN.sub(lambda m: self._refs.get(m.group(0), m.group(0)), formula)
+        parts = re.split(r'("[^"]*")', formula)  # string literals (odd parts) stay as written
+        return "".join(part if k % 2 else _NAME_TOKEN.sub(lambda m: self._refs.get(m.group(0), m.group(0)), part)
+                       for k, part in enumerate(parts))
 
     # --- Settings --------------------------------------------------------------------------
 
@@ -1134,8 +1148,11 @@ class _Writer:
         ws.write(2, 0, "Rows counted: Use = 1 on TC Compare (yellow), IR and TC both present, the ROI's mean "
                        "signal inside the camera's calibrated range, inside the window. Pick each ROI's TC on "
                        "Settings.", self.f_note)
-        ws.write(3, 0, "When you have the value, type it as the emissivity on Settings: every ROI, chart and "
-                       "summary follows.", self.f_note)
+        ws.write(3, 0, "When you have the value, type it as the emissivity on Settings: every ROI without its own "
+                       "emissivity there, and every chart and summary, follows.", self.f_note)
+        if any(layout.roi.shape.name in self._roi_eps for layout in layouts):
+            ws.write(4, 0, "Some ROIs start with their own emissivity on Settings (the TC fit's values), which comes "
+                           "before the common one: clear those cells to let one emissivity drive them.", self.f_note)
         t0, t1 = float(self.times[0]), float(self.times[-1])
         inputs = (("MATCH_LO", "Lowest emissivity", lo), ("MATCH_HI", "Highest emissivity", hi),
                   ("MATCH_STEP", "Step", step), ("MATCH_FROM", "Window from (s)", t0),
@@ -1146,6 +1163,10 @@ class _Writer:
             self._name(name, M, 5 + k, 1)
         ws.data_validation(5, 1, 7, 1, {"validate": "decimal", "criteria": "between", "minimum": 0.001,
                                         "maximum": 1.0, "error_message": "Emissivity values lie in (0, 1]"})
+        # the table has MATCH_CANDIDATES rows: a step too fine to reach the highest value is widened
+        ws.write_formula(7, 2, f"=MAX(MATCH_STEP,(MATCH_HI-MATCH_LO)/{MATCH_CANDIDATES - 1})", self.f_used,
+                         _step_used(lo, hi, step))
+        self._name("MATCH_STEPUSED", M, 7, 2)
         n = len(layouts)
         p0 = 12  # first ROI row of the pairs table (columns A-J)
         c0, cc = p0, 11  # first candidate row and column (L): the candidate table sits to the right
@@ -1180,11 +1201,13 @@ class _Writer:
                      "hot gas in front of the zones, reflections, or TCs reading low (loose contact).")
         none_text = ("No ROI has rows to compare yet: pick each zone's TC on Settings, and check Use (TC Compare) "
                      "and the window.")
-        ws.write_formula(8, 3, f'=IF(NOT(ISNUMBER(MATCH_BEST)),"{none_text}",IF(MATCH_BEST<=_xlfn.AGGREGATE(5,6,'
-                               f'MATCH_EPS)+1E-9,"{low_text}",IF(MATCH_BEST>=_xlfn.AGGREGATE(4,6,MATCH_EPS)-1E-9,'
-                               f'"{high_text}","Inside the limits.")))', self.f_note,
-                         none_text if best is None else low_text if best == 0 else
-                         high_text if best == len(eps) - 1 else "Inside the limits.")
+        one_text = "Only one emissivity is tried: the lowest and highest emissivity are the same."
+        ws.write_formula(8, 3, f'=IF(NOT(ISNUMBER(MATCH_BEST)),"{none_text}",IF(MATCH_HI-MATCH_LO<1E-9,"{one_text}",'
+                               f'IF(MATCH_BEST<=MATCH_LO+1E-9,"{low_text}",IF(MATCH_BEST>=MATCH_HI-1E-9,'
+                               f'"{high_text}","Inside the limits."))))', self.f_note,
+                         none_text if best is None else one_text if hi - lo < 1e-9 else
+                         low_text if eps[best] <= lo + 1e-9 else high_text if eps[best] >= hi - 1e-9
+                         else "Inside the limits.")
         own = _range(M, p0, 8, p0 + max(n, 1) - 1, 8)
         mask = f'({include}="Yes")*ISNUMBER({own})'
         spread_cached = ""
@@ -1244,8 +1267,10 @@ class _Writer:
             r = c0 + j
             R = r + 1
             value = eps[j] if j < len(eps) else "#N/A"
-            ws.write_formula(r, cc, f"=IF(MATCH_LO+{j}*MATCH_STEP<=MATCH_HI+1E-9,MATCH_LO+{j}*MATCH_STEP,NA())",
-                             self.f_eps, value)
+            candidate = ("=IF(MATCH_HI>=MATCH_LO,MATCH_LO,NA())" if j == 0 else
+                         f"=IF(MATCH_LO+{j - 1}*MATCH_STEPUSED<MATCH_HI-1E-9,"
+                         f"MIN(MATCH_LO+{j}*MATCH_STEPUSED,MATCH_HI),NA())")
+            ws.write_formula(r, cc, candidate, self.f_eps, value)
             row_cells = _range(M, r, cc + 2, r, cc + 1 + max(n, 1))
             combined = ref["combined"][j] if j < len(eps) and math.isfinite(ref["combined"][j]) else "#N/A"
             ws.write_array_formula(r, cc + 1, r, cc + 1,
@@ -1287,6 +1312,8 @@ class _Writer:
                                                                            "fill": {"color": INK},
                                                                            "border": {"color": INK}}})
         shown = [(k, layout) for k, layout in enumerate(layouts) if self._roi_tc.get(layout.roi.shape.name)]
+        if not shown:  # TCs are picked later in Excel: every ROI's series (empty until then)
+            shown = list(enumerate(layouts))
         for j, (k, layout) in enumerate(shown):
             color = SERIES[j % len(SERIES)]
             chart.add_series({"name": [M, c0 - 1, cc + 2 + k], "categories": x,
@@ -1448,11 +1475,12 @@ class _Writer:
         first, last = HEADER_ROWS, self.last
         x = ["Data", first, 0, last, 0]
         verified = [layout for layout in self.layouts if layout.source.report.verified]
-        # many ROIs (cell zones): one ordered ramp, and own charts only for ROIs with a TC
+        # many ROIs (cell zones): one ordered ramp; when the TC fit paired some, own charts only for those
+        # (TCs picked later in Excel need every ROI's chart, as before)
         many = len(verified) > len(PALETTE)
         groups: dict[str, list[_RoiLayout]] = {}
         for layout in verified:
-            if not many or self._roi_tc.get(layout.roi.shape.name):
+            if not (many and self._tc_only_paired) or self._roi_tc.get(layout.roi.shape.name):
                 groups.setdefault(layout.roi.shape.name, []).append(layout)
         palette = list(PALETTE)
         overview_colors = _ramp(len(verified)) if many else None

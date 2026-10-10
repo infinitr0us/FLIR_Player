@@ -377,6 +377,9 @@ class ExcelExportDialog(FramelessDialog):
             return "The TC fit's time offset is on the frame-number time base; choose that time base."
         if not self._tc_pairing.pairs:
             return "No TC pixel of the last fit lies in an ROI."
+        if self._tc_pairing.duplicates:
+            return (f"More than one ROI is named {', '.join(self._tc_pairing.duplicates)}: the workbook pairs ROIs "
+                    "and TCs by name, so give them different names (e.g. split again with other names).")
         return ""
 
     def tc_prefill(self):

@@ -814,7 +814,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_rois(others + shapes, None)
 
         dialog = ZoneSplitDialog(spec, width, height, tc_pixels=self._tc_pixels(), regroup=group is not None,
-                                 parent=self)
+                                 taken={shape.name for shape in others}, parent=self)
         dialog.preview.connect(preview)
         code = dialog.exec()
         if code == ZoneSplitDialog.DialogCode.Accepted and dialog.zones():
