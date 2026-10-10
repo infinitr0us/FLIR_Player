@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.1 — 2026-10-10
+
+Smaller steps for the TC and cell-zone route, found while writing the
+engineers' step-by-step guide.
+
+### TC fit
+
+- The player reopens a recording's last TC fit from its results folder
+  (`<recording>_tcmatch`) when the recording is opened again, so the workbook
+  can be filled from the fit in a later session without running it again. The
+  TC file is read again in the background (it is looked for where the fit read
+  it, then next to the recording); a notice says when the fit is back, or why
+  not. `result.json` now records the TC file, its sheet and the object
+  parameters the fit used.
+- The setup dialog offers the last run's search region even when its box is
+  gone, so a rerun still finds its saved frame statistics (they are kept per
+  region) and takes about a minute.
+
+### Excel workbook
+
+- With *Fill TC Compare from the last TC fit*, the export starts at logger
+  time 0 (the ignition frame is the fit's) and covers the logger's first to last
+  second, so the workbook's seconds are the TC file's. Any other time 0 still
+  works; the dialog says which frame logger time 0 is.
+- An area measured by its mean signal (cell zones) is flagged outside the
+  calibrated range only when its mean count is, not when one of its pixels is:
+  its temperature is that of its mean count. A clipped pixel still flags the
+  row as saturated.
+
+### Player
+
+- The Export button opens its menu on any click (the Excel workbook is there).
+  Ctrl+E, and the menu's first entry, still save the frame as a PNG.
+- The Measurement panel says why it is greyed out in Counts (the values apply
+  to temperatures), and the notice about a file's saved ResearchIR values says
+  to set Unit to a temperature first.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.7.0...v0.7.1)
+
 ## 0.7.0 — 2026-10-10
 
 Cell zones and one emissivity. The fire-safety engineers want the temperature of

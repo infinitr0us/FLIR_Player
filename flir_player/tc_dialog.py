@@ -47,7 +47,7 @@ from .export_dialogs import _path_row, confirm_replace
 from .models import RoiShape, VideoMetadata
 from .settings import app_settings
 from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES, TcTable, parse_windows, read_tc_table, sheet_names, suggest_sheet
-from .tcmatch import MEMORY_LIMIT, MatchOptions, RunOutput, roi_shapes
+from .tcmatch import MEMORY_LIMIT, MatchOptions, RunOutput, SavedRun, load_saved_run, roi_shapes
 from .widgets import ICON_MUTED, ChevronComboBox, FramelessDialog, MessageDialog, awesome_icon
 
 RESULT_FILES = ("result.json", "summary.txt", "overview.png")  # what a run writes besides the ROI set
@@ -102,6 +102,51 @@ class _TableReader(QThread):
             except Exception:
                 pass
             self.read.emit(self.request, names, None, str(exc) or type(exc).__name__)
+
+
+class SavedFitReader(QThread):
+    """Reopens a recording's last TC fit from its results folder off the UI thread (the TC file is read
+    again: seconds for a lab workbook). ``done`` carries (key, saved run, RunOutput or None, error)."""
+
+    done = Signal(str, object, object, str)
+
+    def __init__(self, key: str, saved: SavedRun) -> None:
+        super().__init__()
+        self.key, self.saved = key, saved
+
+    def run(self) -> None:
+        try:
+            output = load_saved_run(self.saved)
+            self.done.emit(self.key, self.saved, output, "")
+        except Exception as exc:  # reported as a notice; the fit can be run again
+            self.done.emit(self.key, self.saved, None, str(exc) or type(exc).__name__)
+
+    def start_kept(self) -> None:
+        _keep_until_done(self)
+        self.start()
+
+
+def saved_request(saved: SavedRun, table: TcTable | None) -> dict:
+    """The setup dialog's ``previous`` settings for a reopened fit: TC file, channels, region, options."""
+    options = saved.options
+    names = table.names if table is not None else options.channels
+    chosen = set(options.channels) if options.channels else None
+    rows = []
+    for name in names:
+        checked = name in chosen if chosen is not None else not _AIR_HINT.search(name)
+        windows = ", ".join(f"{a:g}-{b:g}" for a, b in options.valid.get(name, ()))
+        rows.append((name, checked, windows))
+    return {
+        "kind": "tc",
+        "tc_file": str(saved.tc_file) if saved.tc_file is not None else "",
+        "sheet": saved.sheet,
+        "options": options,
+        "out_dir": str(saved.folder),
+        "cache_dir": str(saved.folder / "cache"),
+        # the player's runs pass its parameters; older results do not say, and the player is the default
+        "parameters_from": "file" if saved.run_info and saved.parameters is None else "player",
+        "channel_rows": rows,
+    }
 
 
 def _box_region(shape: RoiShape, width: int, height: int) -> tuple[int, int, int, int]:
@@ -212,6 +257,12 @@ class TcCalibrationDialog(FramelessDialog):
                 self.region_combo.addItem(f"{shape.name}: columns {x0}-{x1 - 1}, rows {y0}-{y1 - 1}", region)
                 if shape.id == selected_roi_id:
                     self.region_combo.setCurrentIndex(self.region_combo.count() - 1)
+        last: MatchOptions | None = (previous or {}).get("options")
+        if last is not None and last.roi is not None and all(
+                self.region_combo.itemData(k) != tuple(last.roi) for k in range(self.region_combo.count())):
+            # the previous run's region without its box (e.g. a reopened fit): its saved statistics still match
+            x0, y0, x1, y1 = last.roi
+            self.region_combo.addItem(f"Last run's region: columns {x0}-{x1 - 1}, rows {y0}-{y1 - 1}", tuple(last.roi))
         self.region_combo.setToolTip("Where to look for the TCs. A box ROI around the battery makes the run "
                                      "faster and its saved statistics smaller.")
         grid.addWidget(QLabel("Search region"), 0, 0)

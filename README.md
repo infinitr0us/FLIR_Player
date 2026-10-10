@@ -30,6 +30,7 @@ all decoding work off the GUI thread.
 - Editable measurement (object) parameters — emissivity, reflected and
   atmosphere temperature, atmospheric transmission, distance, relative
   humidity, and external optics — with one-click reset to the file defaults.
+  They apply to temperatures: in Counts the panel stays greyed out and says so.
 - Analysis ROIs: box, ellipse, line, and pinned spot meters drawn directly on
   the image, with selection, move, resize, and per-ROI color coding.
 - A tabbed analysis panel with: per-ROI statistics (min/max/mean/std-dev/
@@ -355,6 +356,8 @@ those counts, so they follow the Settings sheet:
   temperature) or, above 400 pixels, 128 bins of equal apparent-temperature
   width, whose mean is within 0.01 K of the exact one. Samples outside the
   camera's calibrated range are shown grey (extrapolated), saturated ones red.
+  An area measured by its mean signal is grey only when its mean count is
+  outside the range (a clipped pixel still marks it saturated).
 - **TC Compare:** paste logger data; each ROI can be mapped to a thermocouple
   column. It gives IR − TC and the emissivity that would make them agree. A
   value above 1 means no emissivity can: the camera sees flames, hot gas or a
@@ -411,8 +414,9 @@ For a battery module seen from the side:
 3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
    ticked: each TC is paired with its zone, the logger data sit at the fitted
    time offset, and Use = 1 marks the seconds the fit used (no flames on the TC,
-   IR in range). Only the zones with a TC are compared, which keeps the workbook
-   quick to open.
+   IR in range). Time 0 starts at logger time 0 and the range at the logger's
+   first to last second, so the workbook's seconds are the TC file's. Only the
+   zones with a TC are compared, which keeps the workbook quick to open.
 4. In the workbook, the Emissivity Match sheet gives the best emissivity within
    the limits; set it on Settings.
 
@@ -466,6 +470,10 @@ pixel (the block the fit used; the ignition frame is set to logger time 0), set
 the player's emissivity to a TC's value, or save an Excel workbook whose ROIs
 start at their TC's emissivity with the logger data on the TC Compare sheet. The results
 folder keeps `summary.txt`, `result.json`, `overview.png` and the ROI set.
+When the recording is opened again, the player reopens the last fit from its
+default results folder (`<recording>_tcmatch`, reading the TC file again), so a
+workbook can be filled from it in a later session; the setup dialog also offers
+the last run's search region, whose saved statistics make a rerun quick.
 Superframing recordings use the frames of one preset; their workbook cannot
 separate presets yet. Recordings without a factory calibration cannot be
 fitted.

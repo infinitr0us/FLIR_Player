@@ -251,6 +251,25 @@ QToolButton#ExportButton:focus {
     border-color: $ACCENT;
 }
 
+/* The export button opens its menu on any click (InstantPopup): the same chevron, right-centred,
+   with room kept for it on the right. */
+QToolButton#ExportButton {
+    padding-right: 30px;
+}
+
+QToolButton#ExportButton::menu-indicator {
+    image: url("$CHEVRON_ICON");
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    width: 10px;
+    height: 10px;
+    right: 10px;
+}
+
+QToolButton#ExportButton::menu-indicator:disabled {
+    image: url("$CHEVRON_DISABLED_ICON");
+}
+
 /* Generic push buttons (dialogs, message boxes) */
 QPushButton {
     background: $CONTROL;

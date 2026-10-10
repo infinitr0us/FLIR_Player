@@ -23,7 +23,7 @@ import math
 from dataclasses import dataclass, field, replace as dataclass_replace  # run_export has a replace= argument
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -334,6 +334,23 @@ def estimate(rows: int, rois: list[tuple[str, int]], options: ExportOptions) -> 
     return {"rows": rows, "cells": cells, "megabytes": cells * 14 / 1e6}
 
 
+def roi_status(calibration, mode: str, counts: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Status per row (``radiometry.STATUS_LABELS``) of an ROI from its counts.
+
+    A spot or an area of pixel temperatures is outside the calibrated range where its coldest or
+    hottest pixel is. An area measured by its mean signal (mode "mean") has the temperature of its mean
+    count, so its range follows that count: one cold edge pixel does not grey a cell zone. A clipped
+    pixel still biases that mean, so saturation follows the extremes.
+    """
+    low = counts.get("min", counts.get("value"))
+    high = counts.get("max", counts.get("value"))
+    status = count_status(calibration, low, high)
+    if mode == "mean":
+        mean = counts["mean"]
+        status = np.where(status == 3, 3, count_status(calibration, mean, mean))
+    return np.asarray(status, dtype=np.int8)
+
+
 def area_mode(pixels: int, options: ExportOptions) -> tuple[str, int]:
     """(RoiData mode, Pixels-sheet columns) of an area ROI with ``pixels`` pixels."""
     if options.area_means == "signal":
@@ -550,7 +567,7 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
             high = roi.counts.get("max", roi.counts.get("value"))
             present = np.isfinite(high)
             if report.verified:
-                status = count_status(report.calibration, low, high)
+                status = roi_status(report.calibration, roi.mode, roi.counts)
             else:
                 status = np.zeros(rows, dtype=np.int8)
                 if saturation:

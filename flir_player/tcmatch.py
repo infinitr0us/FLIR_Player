@@ -41,7 +41,7 @@ import sys
 import time
 import warnings
 import zipfile
-from dataclasses import asdict, dataclass, field, replace as dataclass_replace  # write_workbook has a replace= argument
+from dataclasses import asdict, dataclass, field, fields, replace as dataclass_replace  # write_workbook has a replace= argument
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -1174,6 +1174,86 @@ class MatchResult:
             return value
         return clean(asdict(self))
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MatchResult":
+        """The result ``to_dict`` wrote (e.g. a results folder's ``result.json``); non-finite floats, which
+        ``to_dict`` writes as null, come back as NaN. Correlation maps are not kept."""
+        def num(value) -> float:
+            return math.nan if value is None else float(value)
+
+        def nums(values) -> tuple[float, ...]:
+            return tuple(num(v) for v in values)
+
+        def opt(value) -> float | None:
+            return None if value is None else float(value)
+
+        def fit(d: Mapping[str, Any] | None) -> EpsFit | None:
+            if d is None:
+                return None
+            return EpsFit(n=int(d["n"]), eps_ls=num(d["eps_ls"]), eps=num(d["eps"]), rmse_k=num(d["rmse_k"]),
+                          bias_k=num(d["bias_k"]), matching_median=num(d["matching_median"]),
+                          matching_p10=num(d["matching_p10"]), matching_p90=num(d["matching_p90"]),
+                          at_bound=bool(d["at_bound"]))
+
+        def match(d: Mapping[str, Any]) -> ChannelMatch:
+            return ChannelMatch(
+                name=str(d["name"]), found=bool(d["found"]), r=num(d["r"]),
+                pixel=tuple(int(v) for v in d["pixel"]) if d.get("pixel") is not None else None,
+                candidates=[tuple(int(v) for v in p) for p in d.get("candidates") or ()],
+                own_lag_s=opt(d.get("own_lag_s")), own_r=num(d.get("own_r")),
+                runner_up_lag_s=opt(d.get("runner_up_lag_s")), runner_up_r=num(d.get("runner_up_r")),
+                fixed=bool(d.get("fixed", False)))
+
+        def event(d: Mapping[str, Any]) -> EventResult:
+            return EventResult(
+                channel=str(d["channel"]), start_s=num(d["start_s"]), end_s=num(d["end_s"]),
+                samples=int(d["samples"]), excluded_bound=int(d["excluded_bound"]), tc_min_c=num(d["tc_min_c"]),
+                tc_max_c=num(d["tc_max_c"]), fit=fit(d["fit"]), pixel_eps=nums(d["pixel_eps"]),
+                pixel_eps_ls=nums(d["pixel_eps_ls"]), pixel_n=int(d.get("pixel_n", 0)),
+                physical=bool(d.get("physical", True)), used=bool(d.get("used", True)),
+                fitted=tuple((num(a), num(b)) for a, b in d.get("fitted") or ()))
+
+        def channel(d: Mapping[str, Any]) -> ChannelResult:
+            return ChannelResult(
+                name=str(d["name"]), match=match(d["match"]), flags=list(d.get("flags") or ()),
+                events=[event(e) for e in d.get("events") or ()],
+                rules={str(k): int(v) for k, v in (d.get("rules") or {}).items()},
+                usable_bins=int(d.get("usable_bins", 0)), trusted=bool(d.get("trusted", True)),
+                eps=nums(d["eps"]) if d.get("eps") is not None else None, eps_events=int(d.get("eps_events", 0)))
+
+        return cls(
+            recording=str(data["recording"]), tc_source=str(data["tc_source"]), camera=str(data["camera"]),
+            fps=num(data["fps"]), step=num(data["step"]), lag_s=num(data["lag_s"]), lag_fixed=bool(data["lag_fixed"]),
+            lag_score=num(data.get("lag_score")), runner_up_lag_s=opt(data.get("runner_up_lag_s")),
+            ignition_frame=int(data["ignition_frame"]), num_frames=int(data["num_frames"]),
+            region=[int(v) for v in data["region"]],
+            preset=int(data["preset"]) if data.get("preset") is not None else None,
+            channels=[channel(c) for c in data["channels"]], pooled=fit(data.get("pooled")),
+            cross=[dict(c) for c in data.get("cross") or ()], spread=opt(data.get("spread")),
+            consistent=data.get("consistent"), overlapping=data.get("overlapping"),
+            tc_spread=opt(data.get("tc_spread")), tcs_agree=data.get("tcs_agree"),
+            common_eps=opt(data.get("common_eps")), origin_s=opt(data.get("origin_s")),
+            warnings=list(data.get("warnings") or ()), notes=list(data.get("notes") or ()),
+            reflected_c=num(data["reflected_c"]), calibration=str(data["calibration"]), spot=int(data["spot"]),
+            options=dict(data.get("options") or {}))
+
+
+def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
+    """The ``MatchOptions`` a result's ``options`` record (lists back to tuples; unknown keys ignored)."""
+    def pair(value):
+        return tuple(float(v) for v in value) if value is not None else None
+
+    known = {f.name for f in fields(MatchOptions)}
+    values = {key: value for key, value in data.items() if key in known}
+    if values.get("roi") is not None:
+        values["roi"] = tuple(int(v) for v in values["roi"])
+    values["channels"] = tuple(values.get("channels") or ())
+    values["valid"] = {str(name): tuple(pair(w) for w in windows) for name, windows in (values.get("valid") or {}).items()}
+    values["pixels"] = {str(name): tuple(int(v) for v in pixel) for name, pixel in (values.get("pixels") or {}).items()}
+    for key in ("scope", "lag_range"):
+        values[key] = pair(values.get(key))
+    return MatchOptions(**values)
+
 
 def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress: Progress | None = None,
             abort: Abort | None = None) -> tuple[MatchResult, Location, dict]:
@@ -1682,6 +1762,76 @@ class RunOutput:
     tc_file: Path | None = None  # the logger file read
 
 
+@dataclass
+class SavedRun:
+    """The last run saved in a results folder, and what using it again needs (see ``saved_run``)."""
+
+    result: MatchResult
+    folder: Path
+    tc_file: Path | None  # the logger file, when it can still be found
+    tc_name: str  # its file name, as the result records it
+    sheet: str | None
+    time_column: int | str | None
+    parameters: dict | None  # the object parameters the fit used instead of the recording's own (None: its own)
+    options: MatchOptions
+    run_info: bool = True  # False: written before 0.7.1, without the TC file's path and the parameters
+
+
+def _source_parts(source: str) -> tuple[str, str | None]:
+    """("name.xlsx", "Sheet") from a TC table's source label "name.xlsx [Sheet]"."""
+    if source.endswith("]") and " [" in source:
+        cut = source.rindex(" [")
+        return source[:cut], source[cut + 2:-1]
+    return source, None
+
+
+def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None = None) -> SavedRun | None:
+    """The run saved in ``folder`` (its ``result.json``) for ``recording``; None when there is none or it
+    belongs to another recording (name or frame count). ValueError when the file cannot be read.
+
+    Results written before 0.7.1 do not record the TC file's folder: it is looked for next to the
+    recording and next to the results folder.
+    """
+    folder = Path(folder)
+    path = folder / "result.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        result = MatchResult.from_dict(data)
+        options = options_from_dict(result.options)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"{path.name} in {folder.name} cannot be read ({type(exc).__name__}: {exc})") from exc
+    recording = Path(recording)
+    if result.recording != recording.name or (num_frames is not None and result.num_frames != int(num_frames)):
+        return None
+    run = data.get("run") or {}
+    name, sheet = _source_parts(result.tc_source)
+    sheet = run.get("sheet", sheet) or None
+    candidates = [Path(run["tc_file"])] if run.get("tc_file") else []
+    candidates += [recording.parent / name, folder.parent / name, folder / name]
+    tc_file = next((p for p in candidates if p.is_file()), None)
+    return SavedRun(result=result, folder=folder, tc_file=tc_file, tc_name=Path(run.get("tc_file") or name).name,
+                    sheet=sheet, time_column=run.get("time_column"), parameters=run.get("parameters"), options=options,
+                    run_info=bool(run))
+
+
+def load_saved_run(saved: SavedRun) -> RunOutput:
+    """The ``RunOutput`` of a saved run: its result with the TC table read again (seconds for a lab
+    workbook). ValueError when the TC file is gone or no longer has the fit's TCs."""
+    if saved.tc_file is None:
+        raise ValueError(f"the TC file {saved.tc_name} was not found")
+    table = read_tc_table(saved.tc_file, sheet=saved.sheet, time_column=saved.time_column)
+    missing = [ch.name for ch in saved.result.channels if ch.name not in table.names]
+    if missing:
+        raise ValueError(f"{saved.tc_file.name} has no column {', '.join(missing)} any more")
+    names = {"json": "result.json", "summary": "summary.txt", "rois": f"{saved.result.recording}.rois.json",
+             "figure": "overview.png"}
+    files = {key: saved.folder / name for key, name in names.items() if (saved.folder / name).is_file()}
+    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters,
+                     tc_file=saved.tc_file)
+
+
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
         cache_dir: str | Path | None = None, sheet: str | None = None, time_column: int | str | None = None,
         figure: bool = True, workbook: bool = False,
@@ -1751,7 +1901,11 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
         confirmed = list(files.values()) if replace is None else list(replace)
         with OutputTransaction([recording, tc_file], abort, replace=confirmed) as job:
             staged = {key: job.stage(path) for key, path in files.items()}
-            staged["json"].write_text(json.dumps(result.to_dict(), indent=1), encoding="utf-8")
+            # "run": what reopening the fit needs besides the result (saved_run / load_saved_run)
+            run_info = {"tc_file": str(Path(tc_file).resolve()), "sheet": table.sheet or None,
+                        "time_column": time_column if isinstance(time_column, (int, str)) else None,
+                        "parameters": dict(parameters) if parameters is not None else None}
+            staged["json"].write_text(json.dumps({**result.to_dict(), "run": run_info}, indent=1), encoding="utf-8")
             staged["summary"].write_text(summary_text(result), encoding="utf-8")
             width, height = samples.size
             save_roi_set(staged["rois"], RoiSet(rois=tuple(roi_shapes(result)),

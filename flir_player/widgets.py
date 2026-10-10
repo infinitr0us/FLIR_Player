@@ -282,7 +282,7 @@ class TitleBar(QWidget):
         self.export_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.export_button.setIcon(awesome_icon("fa6s.file-export", ICON_ACCENT))
         self.export_button.setIconSize(QSize(15, 15))
-        self.export_button.setToolTip("Export the current frame (Ctrl+E)")
+        self.export_button.setToolTip("Excel workbook, images, movies, ROI sets… (Ctrl+E saves the frame as a PNG)")
         self.export_button.clicked.connect(self.export_requested)
         self.export_button.setEnabled(False)
         layout.addWidget(self.export_button)
@@ -312,7 +312,9 @@ class TitleBar(QWidget):
 
     def set_export_menu(self, menu: QMenu) -> None:
         self.export_button.setMenu(menu)
-        self.export_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        # the whole button opens the menu: a click on "Export" used to save a PNG of the frame, which
+        # surprised users looking for the workbook (Ctrl+E and the menu's first entry still do that)
+        self.export_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
 
     def set_open_menu(self, menu: QMenu) -> None:
         self.open_button.setMenu(menu)
@@ -2369,6 +2371,11 @@ class InspectorPanel(QWidget):
         self.params_heading.setObjectName("SectionTitle")
         layout.addWidget(self.params_heading)
         layout.addSpacing(2)
+        self.params_hint = QLabel("These values apply to temperatures: set Unit to a temperature to change them.")
+        self.params_hint.setObjectName("FieldLabel")
+        self.params_hint.setWordWrap(True)
+        self.params_hint.setVisible(False)
+        layout.addWidget(self.params_hint)
         self.params_panel = ObjectParametersPanel()
         self.params_panel.applied.connect(self.object_parameters_applied)
         self.params_panel.reset_requested.connect(self.object_parameters_reset)
@@ -2752,6 +2759,8 @@ class InspectorPanel(QWidget):
 
     def set_object_parameters(self, snapshot: dict) -> None:
         self.params_panel.set_parameters(snapshot)
+        # in Counts the SDK keeps the object parameters fixed (they only convert counts to temperatures)
+        self.params_hint.setVisible(not snapshot.get("can_change", True))
 
     def set_saved_parameters(self, values: dict | None, saved_by: str = "ResearchIR") -> None:
         self.params_panel.set_saved_parameters(values, saved_by)

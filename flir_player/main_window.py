@@ -45,8 +45,8 @@ from .export_dialogs import (
 from .excel_dialog import ExcelExportDialog
 from .excel_export import RoiSet, ZoneGroup, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
-from .tc_dialog import TcCalibrationDialog, TcResultsDialog
-from .tcmatch import roi_shapes, workbook_origin
+from .tc_dialog import SavedFitReader, TcCalibrationDialog, TcResultsDialog, results_folder, saved_request
+from .tcmatch import roi_shapes, saved_run, workbook_origin
 from .zone_dialog import ZoneSplitDialog
 from .zones import ZoneSpec, normalized_box
 from .geometry import roi_coordinates
@@ -1363,6 +1363,42 @@ class MainWindow(QMainWindow):
         if dialog.exec() == TcResultsDialog.WORKBOOK:
             self._save_tc_workbook(output, Path(out_dir) if out_dir else self.metadata.path.parent)
 
+    def _reopen_saved_tc_fit(self, metadata: VideoMetadata) -> None:
+        """Reopen the recording's last TC fit from its results folder, as if it had just been run.
+
+        Only the default folder (``<recording>_tcmatch``) is looked at, and only when this session has
+        no fit of the recording yet. The TC file is read again in the background.
+        """
+        key = str(metadata.path)
+        if "output" in self._tc_runs.get(key, {}):
+            return
+        try:
+            saved = saved_run(results_folder(metadata.path), metadata.path, metadata.num_frames)
+        except ValueError as exc:
+            self._notify(f"The last TC fit was not reopened: {exc}")
+            return
+        if saved is None:
+            return
+        reader = SavedFitReader(key, saved)
+        reader.done.connect(self._on_saved_tc_fit)
+        reader.start_kept()
+
+    def _on_saved_tc_fit(self, key: str, saved, output, error: str) -> None:
+        if self.metadata is None or str(self.metadata.path) != key:
+            return  # another recording is open now; the fit stays in its folder
+        run = self._tc_runs.setdefault(key, {})
+        if "output" in run:
+            return  # a fit run in this session meanwhile wins
+        run.setdefault("request", saved_request(saved, output.table if output is not None else None))
+        if output is None:
+            self._notify(f"The last TC fit ({saved.folder.name}) was not reopened: {error}. "
+                         "Fit Emissivity from TCs runs it again.")
+            return
+        run["output"] = output
+        run["out_dir"] = str(saved.folder)
+        self._notify(f"Reopened the last TC fit ({saved.folder.name}): logger time 0 = frame "
+                     f"{output.result.ignition_frame + 1:,}")
+
     def _set_tc_emissivity(self, eps: float) -> None:
         if self.current_packet is None or self._busy or not (self._object_params or {}).get("can_change", True):
             self._notify("The emissivity of this recording cannot be changed now")
@@ -1838,8 +1874,10 @@ class MainWindow(QMainWindow):
         self.inspector.set_saved_parameters(metadata.saved_parameters, metadata.saved_by)
         if metadata.saved_parameters is not None:
             who = "ResearchIR" if metadata.saved_by == "ResearchIR" else "software"
-            self._notify(f"Opened with the camera's object parameters. The file's saved {who} "
-                         f"override is not applied: Measurement → {saved_button_text(metadata.saved_by)}.")
+            self._notify(f"Opened with the camera's object parameters; the file's saved {who} values are not "
+                         f"applied. To use them, set Unit to a temperature, then Measurement → "
+                         f"{saved_button_text(metadata.saved_by)}.")
+        self._reopen_saved_tc_fit(metadata)
         self.transport.set_cadence(metadata.cadence)
         self.transport.set_video(metadata.num_frames, metadata.duration_seconds)
         self.inspector.set_median_size_cap(

@@ -247,12 +247,15 @@ def test_player_offers_the_saved_values(qapp) -> None:
         panel = window.inspector.params_panel
         assert panel.saved_button.isVisibleTo(panel)
         assert panel.saved_button.text() == "Use Saved ResearchIR Values"
-        assert "ResearchIR" in window.canvas.notice
+        assert "ResearchIR" in window.canvas.notice and "set Unit to a temperature" in window.canvas.notice
         assert window.transport is not None and window.metadata.frame_timed
+        hint = window.inspector.params_hint  # 0.7.1: in Counts the values are fixed, and the panel says why
+        assert hint.isVisibleTo(window.inspector) and not panel.isEnabled()
 
         window._change_unit("temperature_factory_c")
         assert wait_until(qapp, lambda: window.current_packet.unit.key == "temperature_factory_c"
                           and not window._busy)
+        assert not hint.isVisibleTo(window.inspector)
         camera_mean = window.current_packet.mean
         panel.saved_button.click()
         assert wait_until(qapp, lambda: not window._busy and window._object_params["emissivity"] == 1.0)

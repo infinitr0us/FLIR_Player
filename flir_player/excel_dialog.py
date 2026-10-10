@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -243,6 +245,8 @@ class ExcelExportDialog(FramelessDialog):
         panels.addWidget(frame)
         self._tc_pairing = self._pair_tcs()
         self.tc_check.setChecked(self._tc_pairing is not None and bool(self._tc_pairing.pairs))
+        if self.tc_check.isChecked() and not self._tc_usable():
+            self._time_from_fit()
         panels.addStretch(1)
         layout.addWidget(scroll, 1)
 
@@ -273,6 +277,7 @@ class ExcelExportDialog(FramelessDialog):
             widget.toggled.connect(self._update)
         self.means_combo.currentIndexChanged.connect(self._update)
         self.time_base_combo.currentIndexChanged.connect(self._update)
+        self.ignition_spin.valueChanged.connect(self._update)
         for widget in (self.start_spin, self.end_spin, self.step_spin):
             widget.valueChanged.connect(self._update)
         self.sampling_combo.currentIndexChanged.connect(self._update)
@@ -365,6 +370,33 @@ class ExcelExportDialog(FramelessDialog):
                   if ch.match.found and ch.match.pixel is not None}
         return pair_tcs(pixels, self.rois, self.metadata.height, self.metadata.width)
 
+    def _fit_origin(self) -> int:
+        """The frame (0-based) of the fit's logger time 0, as the workbook can use it (inside the recording)."""
+        from .tcmatch import workbook_origin
+
+        return workbook_origin(self.tc_run.result)[0]
+
+    def _time_from_fit(self) -> None:
+        """Time 0 = logger time 0 and From/To = the logger's first and last second, inside the recording.
+
+        Filling TC Compare from the fit works with any ignition frame (the logger offset follows), but
+        then the workbook's seconds are the TC file's seconds and the range is where TCs exist.
+        """
+        result, table = self.tc_run.result, self.tc_run.table
+        frame = self._fit_origin()
+        self.ignition_spin.setValue(frame + 1)
+        offset = float(result.lag_s - frame / result.fps)  # workbook time = logger time + offset
+        first, last = -frame / result.fps, (self.metadata.num_frames - 1 - frame) / result.fps
+        times = table.times[np.isfinite(table.times)]
+        if not times.size:
+            return
+        start = min(max(float(times[0]) + offset, first), last)
+        end = min(max(float(times[-1]) + offset, first), last)
+        self.start_check.setChecked(True)
+        self.start_spin.setValue(math.ceil(start * 10) / 10)  # the spins keep 0.1 s
+        self.end_check.setChecked(True)
+        self.end_spin.setValue(math.floor(end * 10) / 10)
+
     def _tc_usable(self) -> str:
         """Why the TC fit cannot fill TC Compare now ("" when it can)."""
         if self.tc_run is None:
@@ -423,9 +455,14 @@ class ExcelExportDialog(FramelessDialog):
         self.tc_check.setEnabled(not reason)
         if reason:
             self.tc_label.setText(reason)
+        elif self.tc_check.isChecked():
+            origin = self._fit_origin() + 1
+            ignition = self.ignition_spin.value()
+            time0 = (f" Time 0 is logger time 0 (frame {origin:,})." if ignition == origin else
+                     f" Time 0 is frame {ignition:,}; logger time 0 is frame {origin:,}.")
+            self.tc_label.setText("Pairs: " + self._tc_pairing.describe() + "." + time0)
         else:
-            self.tc_label.setText("Pairs: " + self._tc_pairing.describe() + "." if self.tc_check.isChecked()
-                                  else "Unticked: paste the logger data on TC Compare yourself.")
+            self.tc_label.setText("Unticked: paste the logger data on TC Compare yourself.")
         options = self.options()
         fps = self.metadata.nominal_fps or 30.0
         rate = self.metadata.rate

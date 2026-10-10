@@ -451,6 +451,21 @@ def test_the_whole_flow_through_the_player(qapp, tmp_path, monkeypatch) -> None:
         assert window.current_packet.unit.key == unit
     finally:
         window.close()
+    # 0.7.1: a new session reopens the fit from its results folder (here a chosen one: patched default)
+    monkeypatch.setattr(mw, "results_folder", lambda path: tmp_path / "results")
+    window = MainWindow()
+    try:
+        window.open_path(recording)
+        key = str(recording)
+        assert wait_until(qapp, lambda: "output" in window._tc_runs.get(key, {}), timeout=30)
+        run = window._tc_runs[key]
+        again = run["output"].result
+        assert again.lag_s == pytest.approx(result.lag_s) and again.channels[0].match.pixel == match.pixel
+        assert run["out_dir"] == str(tmp_path / "results") and "Reopened the last TC fit" in window.canvas.notice
+        assert run["request"]["options"].roi == (30, 236, 80, 276) and run["request"]["tc_file"] == str(tc.resolve())
+        assert [row[:2] for row in run["request"]["channel_rows"]] == [("Probe TC", True), ("Air (tree)", False)]
+    finally:
+        window.close()
 
 
 # --- Codex review 2026-10-07 (local/notes/2026-10-07-tc-dialog/codex/, run review-tc-dialog) -------
