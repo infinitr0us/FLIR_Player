@@ -47,7 +47,7 @@ from .export_dialogs import _path_row, confirm_replace
 from .models import RoiShape, VideoMetadata
 from .settings import app_settings
 from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES, TcTable, parse_windows, read_tc_table, sheet_names, suggest_sheet
-from .tcmatch import MEMORY_LIMIT, MatchOptions, RunOutput, SavedRun, load_saved_run, roi_shapes
+from .tcmatch import MEMORY_LIMIT, MatchOptions, RunOutput, SavedRun, load_saved_run, roi_shapes, saved_run
 from .widgets import ICON_MUTED, ChevronComboBox, FramelessDialog, MessageDialog, awesome_icon
 
 RESULT_FILES = ("result.json", "summary.txt", "overview.png")  # what a run writes besides the ROI set
@@ -105,21 +105,25 @@ class _TableReader(QThread):
 
 
 class SavedFitReader(QThread):
-    """Reopens a recording's last TC fit from its results folder off the UI thread (the TC file is read
-    again: seconds for a lab workbook). ``done`` carries (key, saved run, RunOutput or None, error)."""
+    """Reopens a recording's last TC fit from its results folder off the UI thread: reads the result,
+    checks it belongs to the recording (its content fingerprint: file reads, slow on a network drive) and
+    reads the TC file again (seconds for a lab workbook). ``done`` carries (key, SavedRun or None, RunOutput
+    or None, error): no run and no error when the folder's fit is another recording's."""
 
     done = Signal(str, object, object, str)
 
-    def __init__(self, key: str, saved: SavedRun) -> None:
+    def __init__(self, key: str, folder: Path, recording: Path, num_frames: int) -> None:
         super().__init__()
-        self.key, self.saved = key, saved
+        self.key, self.folder, self.recording, self.num_frames = key, Path(folder), Path(recording), num_frames
 
     def run(self) -> None:
+        saved = None
         try:
-            output = load_saved_run(self.saved)
-            self.done.emit(self.key, self.saved, output, "")
+            saved = saved_run(self.folder, self.recording, self.num_frames)
+            output = load_saved_run(saved) if saved is not None else None
+            self.done.emit(self.key, saved, output, "")
         except Exception as exc:  # reported as a notice; the fit can be run again
-            self.done.emit(self.key, self.saved, None, str(exc) or type(exc).__name__)
+            self.done.emit(self.key, saved, None, str(exc) or type(exc).__name__)
 
     def start_kept(self) -> None:
         _keep_until_done(self)

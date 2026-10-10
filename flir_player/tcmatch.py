@@ -1968,9 +1968,13 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     say(f"TC file: {len(table.names)} channel(s), {table.times.size} rows every {table.interval:g} s")
     _check(abort)
     t0 = time.time()
+    # the recording's identity for reopening the fit later: taken around the sampling, which must not change it
+    fingerprint = recording_fingerprint(recording) if Path(recording).is_file() else None
     samples = sample_recording(recording, options, step_s=step, im=im, progress=progress, abort=abort,
                                cache_dir=cache_dir, stage=stage)
     _check(abort)  # a cancelled calibration check leaves no calibration, which is no error
+    if fingerprint is not None and recording_fingerprint(recording) != fingerprint:
+        raise ValueError(f"{Path(recording).name} changed while it was read; run again")
     if parameters is not None:
         samples.params = MeasurementParameters.from_sdk(parameters)
     say(f"Read {samples.info['frames']} frames in {time.time() - t0:.0f} s; {samples.report.message}")
@@ -2001,7 +2005,7 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                         "parameters": dict(parameters) if parameters is not None else None,
                         "tc_sha256": tc_sha256,
                         "recording_size": Path(recording).stat().st_size if Path(recording).is_file() else None,
-                        "recording_fingerprint": recording_fingerprint(recording) if Path(recording).is_file() else None}
+                        "recording_fingerprint": fingerprint}
             staged["json"].write_text(json.dumps({**result.to_dict(), "run": run_info}, indent=1), encoding="utf-8")
             staged["summary"].write_text(summary_text(result), encoding="utf-8")
             width, height = samples.size

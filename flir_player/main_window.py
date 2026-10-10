@@ -46,7 +46,7 @@ from .excel_dialog import ExcelExportDialog
 from .excel_export import RoiSet, ZoneGroup, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
 from .tc_dialog import SavedFitReader, TcCalibrationDialog, TcResultsDialog, results_folder, saved_request
-from .tcmatch import roi_shapes, saved_run, workbook_origin
+from .tcmatch import roi_shapes, workbook_origin
 from .zone_dialog import ZoneSplitDialog
 from .zones import ZoneSpec, normalized_box
 from .geometry import roi_coordinates
@@ -1366,25 +1366,28 @@ class MainWindow(QMainWindow):
         """Reopen the recording's last TC fit from its results folder, as if it had just been run.
 
         Only the default folder (``<recording>_tcmatch``) is looked at, and only when this session has
-        no fit of the recording yet. The TC file is read again in the background.
+        no fit of the recording yet. Everything but a look for its result.json runs in the background.
         """
         key = str(metadata.path)
         if "output" in self._tc_runs.get(key, {}):
             return
+        folder = results_folder(metadata.path)
         try:
-            saved = saved_run(results_folder(metadata.path), metadata.path, metadata.num_frames)
-        except Exception as exc:  # a damaged results folder must never stop the recording from opening
-            self._notify(f"The last TC fit was not reopened: {exc}")
+            if not (folder / "result.json").is_file():
+                return
+        except OSError:  # an unreachable folder: nothing to reopen
             return
-        if saved is None:
-            return
-        reader = SavedFitReader(key, saved)
+        reader = SavedFitReader(key, folder, metadata.path, metadata.num_frames)
         reader.done.connect(self._on_saved_tc_fit)
         reader.start_kept()
 
     def _on_saved_tc_fit(self, key: str, saved, output, error: str) -> None:
         if self.metadata is None or str(self.metadata.path) != key:
             return  # another recording is open now; the fit stays in its folder
+        if saved is None:  # the folder's fit is another recording's, or the result could not be read
+            if error:
+                self._notify(f"The last TC fit was not reopened: {error}")
+            return
         run = self._tc_runs.setdefault(key, {})
         if "output" in run:
             return  # a fit run in this session meanwhile wins

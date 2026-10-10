@@ -257,20 +257,75 @@ def test_r3_a_damaged_result_is_reported_not_raised(tmp_path, monkeypatch, damag
         saved_run(out, recording)
 
 
-def test_r3_opening_a_recording_survives_any_error_from_its_results_folder(qapp, monkeypatch) -> None:
+def test_r3_opening_a_recording_survives_any_error_from_its_results_folder(qapp, tmp_path, monkeypatch) -> None:
+    from conftest import wait_until
     from flir_player import main_window as mw
+    from flir_player import tc_dialog
 
     def broken(*_args, **_kwargs):
         raise AttributeError("'list' object has no attribute 'get'")
 
-    monkeypatch.setattr(mw, "saved_run", broken)
+    monkeypatch.setattr(tc_dialog, "saved_run", broken)
+    recording = tmp_path / "scene.seq"
+    (tmp_path / "scene_tcmatch").mkdir()
+    (tmp_path / "scene_tcmatch" / "result.json").write_text("{}", encoding="utf-8")
     window = mw.MainWindow()
     try:
-        metadata = VideoMetadata(path=Path("C:/data/scene.seq"), width=48, height=40, num_frames=30, start_time=None,
+        metadata = VideoMetadata(path=recording, width=48, height=40, num_frames=30, start_time=None,
                                  end_time=None, duration_seconds=1.0, nominal_fps=30.0)
-        window._reopen_saved_tc_fit(metadata)
-        assert window.canvas.notice.startswith("The last TC fit was not reopened")
+        window.metadata = metadata
+        window._reopen_saved_tc_fit(metadata)  # returns at once: the reading runs in the background
+        assert wait_until(qapp, lambda: window.canvas.notice.startswith("The last TC fit was not reopened"), timeout=10)
+        assert "list" in window.canvas.notice
     finally:
+        window.metadata = None
+        window.close()
+
+
+def test_r9_a_recording_replaced_during_the_sampling_stops_the_run(tmp_path, monkeypatch) -> None:
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    recording = tmp_path / "synthetic.seq"
+    recording.write_bytes(bytes(1000))
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[0, 20.0]])
+
+    def replaced_while_sampling(path, options, *, step_s, im, progress, abort, cache_dir, stage):
+        recording.write_bytes(bytes([2]) * 1000)  # another recording of the same name and size
+        return samples
+
+    monkeypatch.setattr(tcmatch, "sample_recording", replaced_while_sampling)
+    with pytest.raises(ValueError, match="synthetic.seq changed while it was read"):
+        tcmatch.run_analysis(recording, tc, MatchOptions(spot=1), out_dir=tmp_path / "out")
+    assert not (tmp_path / "out" / "result.json").exists()
+
+
+def test_r10_the_reopen_reads_nothing_of_the_recording_on_the_gui_thread(qapp, tmp_path, monkeypatch) -> None:
+    import threading
+
+    from conftest import wait_until
+    from flir_player import main_window as mw
+
+    output, recording, tc, out = _saved(tmp_path, monkeypatch)
+    monkeypatch.setattr(mw, "results_folder", lambda path: out)
+    threads = []
+    real = tcmatch.recording_fingerprint
+
+    def watched(path):
+        threads.append(threading.current_thread() is threading.main_thread())
+        return real(path)
+
+    monkeypatch.setattr(tcmatch, "recording_fingerprint", watched)
+    window = mw.MainWindow()
+    try:
+        window.metadata = VideoMetadata(path=recording, width=48, height=40, num_frames=output.result.num_frames,
+                                        start_time=None, end_time=None, duration_seconds=1.0, nominal_fps=30.0)
+        window._reopen_saved_tc_fit(window.metadata)
+        assert threads == []  # nothing read yet when it returns
+        assert wait_until(qapp, lambda: "output" in window._tc_runs.get(str(recording), {}), timeout=10)
+        assert threads == [False]  # read once, off the GUI thread
+    finally:
+        window.metadata = None
         window.close()
 
 
