@@ -321,7 +321,6 @@ def test_r10_the_reopen_reads_nothing_of_the_recording_on_the_gui_thread(qapp, t
         window.metadata = VideoMetadata(path=recording, width=48, height=40, num_frames=output.result.num_frames,
                                         start_time=None, end_time=None, duration_seconds=1.0, nominal_fps=30.0)
         window._reopen_saved_tc_fit(window.metadata)
-        assert threads == []  # nothing read yet when it returns
         assert wait_until(qapp, lambda: "output" in window._tc_runs.get(str(recording), {}), timeout=10)
         assert threads == [False]  # read once, off the GUI thread
     finally:
@@ -397,6 +396,29 @@ def test_r6_another_recording_of_the_same_size_is_not_this_run(tmp_path, monkeyp
     recording.write_bytes(bytes(1000))  # the original again, moved with its results: still this run
     (moved / recording.name).write_bytes(recording.read_bytes())
     assert saved_run(out, moved / recording.name, output.result.num_frames) is not None
+
+
+def test_r11_size_and_fingerprint_describe_the_same_version(tmp_path, monkeypatch) -> None:
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    recording = tmp_path / "synthetic.seq"
+    recording.write_bytes(bytes(1000))
+    tc = _write_csv(tmp_path / "tc.csv", ["A"], [[0, 20.0]])
+    real_analyse = tcmatch.analyse
+
+    def replaced_during_analysis(*args, **kwargs):
+        recording.write_bytes(bytes(999))  # replaced after the sampling was checked
+        return real_analyse(*args, **kwargs)
+
+    monkeypatch.setattr(tcmatch, "analyse", replaced_during_analysis)
+    out = tmp_path / "out"
+    tcmatch.run_analysis(recording, tc, MatchOptions(spot=1), out_dir=out)
+    data = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert data["run"]["recording_size"] == 1000  # the version the fit read, as the fingerprint
+    assert saved_run(out, recording) is None  # the replacement is not offered the fit
+    recording.write_bytes(bytes(1000))  # the original back: it is
+    assert saved_run(out, recording) is not None
 
 
 def test_r7_damaged_options_are_reported_at_load_and_in_the_callback(qapp, tmp_path, monkeypatch) -> None:

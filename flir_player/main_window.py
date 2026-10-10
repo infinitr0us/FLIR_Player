@@ -1366,18 +1366,13 @@ class MainWindow(QMainWindow):
         """Reopen the recording's last TC fit from its results folder, as if it had just been run.
 
         Only the default folder (``<recording>_tcmatch``) is looked at, and only when this session has
-        no fit of the recording yet. Everything but a look for its result.json runs in the background.
+        no fit of the recording yet. All file access runs in the background (a network share can be slow
+        even to say a file is not there); no folder or another recording's fit is silent.
         """
         key = str(metadata.path)
         if "output" in self._tc_runs.get(key, {}):
             return
-        folder = results_folder(metadata.path)
-        try:
-            if not (folder / "result.json").is_file():
-                return
-        except OSError:  # an unreachable folder: nothing to reopen
-            return
-        reader = SavedFitReader(key, folder, metadata.path, metadata.num_frames)
+        reader = SavedFitReader(key, results_folder(metadata.path), metadata.path, metadata.num_frames)
         reader.done.connect(self._on_saved_tc_fit)
         reader.start_kept()
 

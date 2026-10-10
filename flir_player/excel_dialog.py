@@ -390,12 +390,14 @@ class ExcelExportDialog(FramelessDialog):
         times = table.times[np.isfinite(table.times)]
         if not times.size:
             return
-        start = min(max(float(times[0]) + offset, first), last)
-        end = min(max(float(times[-1]) + offset, first), last)
+        # the spins keep 0.1 s: the logger's seconds rounded (4805.996 is 4806.0), inside the recording
+        low, high = math.ceil(first * 10) / 10, math.floor(last * 10) / 10
+        start = min(max(round(float(times[0]) + offset, 1), low), high)
+        end = min(max(round(float(times[-1]) + offset, 1), low), high)
         self.start_check.setChecked(True)
-        self.start_spin.setValue(math.ceil(start * 10) / 10)  # the spins keep 0.1 s
+        self.start_spin.setValue(start)
         self.end_check.setChecked(True)
-        self.end_spin.setValue(math.floor(end * 10) / 10)
+        self.end_spin.setValue(end)
 
     def _tc_usable(self) -> str:
         """Why the TC fit cannot fill TC Compare now ("" when it can)."""
