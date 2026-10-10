@@ -1768,13 +1768,15 @@ class SavedRun:
 
     result: MatchResult
     folder: Path
-    tc_file: Path | None  # the logger file, when it can still be found
+    tc_file: Path | None  # where the logger file is expected: the recorded path, or one found by name
     tc_name: str  # its file name, as the result records it
     sheet: str | None
     time_column: int | str | None
     parameters: dict | None  # the object parameters the fit used instead of the recording's own (None: its own)
     options: MatchOptions
-    run_info: bool = True  # False: written before 0.7.1, without the TC file's path and the parameters
+    run_info: bool = True  # False: written before 0.7.1, without the TC file's path, hash and the parameters
+    tc_sha256: str | None = None  # the logger file's content when fitted (None: not recorded)
+    tc_candidates: tuple[Path, ...] = ()  # where else a moved logger file with that content may be
 
 
 def _source_parts(source: str) -> tuple[str, str | None]:
@@ -1785,12 +1787,23 @@ def _source_parts(source: str) -> tuple[str, str | None]:
     return source, None
 
 
+def file_sha256(path: str | Path) -> str:
+    """SHA-256 of a file's content (identifies a logger file wherever it is copied)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None = None) -> SavedRun | None:
     """The run saved in ``folder`` (its ``result.json``) for ``recording``; None when there is none or it
-    belongs to another recording (name or frame count). ValueError when the file cannot be read.
+    belongs to another recording (name, frame count, and from 0.7.1 the file size). ValueError when the
+    file cannot be read or is not a result.
 
-    Results written before 0.7.1 do not record the TC file's folder: it is looked for next to the
-    recording and next to the results folder.
+    The logger file is checked by content when it is read (``load_saved_run``). Results written before
+    0.7.1 record neither its folder nor its content: it is looked for by name next to the recording and
+    next to the results folder, and taken as it is.
     """
     folder = Path(folder)
     path = folder / "result.json"
@@ -1798,38 +1811,78 @@ def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None 
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise TypeError("not a result")
         result = MatchResult.from_dict(data)
         options = options_from_dict(result.options)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        run = data.get("run") or {}
+        if not isinstance(run, dict):
+            raise TypeError("its run section is not a mapping")
+        tc_path = run.get("tc_file")
+        sheet_saved = run.get("sheet")
+        time_column = run.get("time_column")
+        parameters = run.get("parameters")
+        recording_size = run.get("recording_size")
+        tc_sha256 = run.get("tc_sha256")
+        if not (tc_path is None or isinstance(tc_path, str)) or not (sheet_saved is None or isinstance(sheet_saved, str)) \
+                or not (time_column is None or isinstance(time_column, (int, str))) \
+                or not (parameters is None or isinstance(parameters, dict)) \
+                or not (recording_size is None or isinstance(recording_size, int)) \
+                or not (tc_sha256 is None or isinstance(tc_sha256, str)):
+            raise TypeError("its run section has values of the wrong type")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
         raise ValueError(f"{path.name} in {folder.name} cannot be read ({type(exc).__name__}: {exc})") from exc
     recording = Path(recording)
     if result.recording != recording.name or (num_frames is not None and result.num_frames != int(num_frames)):
         return None
-    run = data.get("run") or {}
+    if recording_size is not None and recording.is_file() and recording.stat().st_size != recording_size:
+        return None  # another recording of the same name and length
     name, sheet = _source_parts(result.tc_source)
-    sheet = run.get("sheet", sheet) or None
-    candidates = [Path(run["tc_file"])] if run.get("tc_file") else []
-    candidates += [recording.parent / name, folder.parent / name, folder / name]
-    tc_file = next((p for p in candidates if p.is_file()), None)
-    return SavedRun(result=result, folder=folder, tc_file=tc_file, tc_name=Path(run.get("tc_file") or name).name,
-                    sheet=sheet, time_column=run.get("time_column"), parameters=run.get("parameters"), options=options,
-                    run_info=bool(run))
+    sheet = sheet_saved if "sheet" in run else sheet
+    if tc_path:
+        name = Path(tc_path).name
+    by_name = tuple(dict.fromkeys(p for p in (recording.parent / name, folder.parent / name, folder / name)))
+    if tc_path:
+        recorded = Path(tc_path)
+        tc_file = recorded if recorded.is_file() or tc_sha256 else None
+        candidates = tuple(p for p in by_name if p != recorded) if tc_sha256 else ()
+    else:
+        tc_file = next((p for p in by_name if p.is_file()), None)
+        candidates = ()
+    return SavedRun(result=result, folder=folder, tc_file=tc_file, tc_name=Path(tc_path or name).name,
+                    sheet=sheet or None, time_column=time_column, parameters=parameters, options=options,
+                    run_info=bool(run), tc_sha256=tc_sha256, tc_candidates=candidates)
+
+
+def _locate_tc_file(saved: SavedRun) -> Path:
+    """The logger file the fit read: at its recorded path, or (same content) moved next to the recording or
+    the results folder. ValueError when it is gone or its content changed since the fit."""
+    if saved.tc_sha256 is None:
+        if saved.tc_file is None or not saved.tc_file.is_file():
+            raise ValueError(f"the TC file {saved.tc_name} was not found")
+        return saved.tc_file
+    if saved.tc_file is not None and saved.tc_file.is_file():
+        if file_sha256(saved.tc_file) == saved.tc_sha256:
+            return saved.tc_file
+        raise ValueError(f"the TC file {saved.tc_file.name} has changed since the fit")
+    for candidate in saved.tc_candidates:
+        if candidate.is_file() and file_sha256(candidate) == saved.tc_sha256:
+            return candidate
+    raise ValueError(f"the TC file {saved.tc_name} was not found where the fit read it")
 
 
 def load_saved_run(saved: SavedRun) -> RunOutput:
     """The ``RunOutput`` of a saved run: its result with the TC table read again (seconds for a lab
-    workbook). ValueError when the TC file is gone or no longer has the fit's TCs."""
-    if saved.tc_file is None:
-        raise ValueError(f"the TC file {saved.tc_name} was not found")
-    table = read_tc_table(saved.tc_file, sheet=saved.sheet, time_column=saved.time_column)
+    workbook). ValueError when the TC file is gone, changed, or no longer has the fit's TCs."""
+    tc_file = _locate_tc_file(saved)
+    table = read_tc_table(tc_file, sheet=saved.sheet, time_column=saved.time_column)
     missing = [ch.name for ch in saved.result.channels if ch.name not in table.names]
     if missing:
-        raise ValueError(f"{saved.tc_file.name} has no column {', '.join(missing)} any more")
+        raise ValueError(f"{tc_file.name} has no column {', '.join(missing)} any more")
     names = {"json": "result.json", "summary": "summary.txt", "rois": f"{saved.result.recording}.rois.json",
              "figure": "overview.png"}
     files = {key: saved.folder / name for key, name in names.items() if (saved.folder / name).is_file()}
-    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters,
-                     tc_file=saved.tc_file)
+    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters, tc_file=tc_file)
 
 
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
@@ -1904,7 +1957,9 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
             # "run": what reopening the fit needs besides the result (saved_run / load_saved_run)
             run_info = {"tc_file": str(Path(tc_file).resolve()), "sheet": table.sheet or None,
                         "time_column": time_column if isinstance(time_column, (int, str)) else None,
-                        "parameters": dict(parameters) if parameters is not None else None}
+                        "parameters": dict(parameters) if parameters is not None else None,
+                        "tc_sha256": file_sha256(tc_file) if Path(tc_file).is_file() else None,
+                        "recording_size": Path(recording).stat().st_size if Path(recording).is_file() else None}
             staged["json"].write_text(json.dumps({**result.to_dict(), "run": run_info}, indent=1), encoding="utf-8")
             staged["summary"].write_text(summary_text(result), encoding="utf-8")
             width, height = samples.size

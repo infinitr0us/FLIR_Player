@@ -126,8 +126,9 @@ class SavedFitReader(QThread):
         self.start()
 
 
-def saved_request(saved: SavedRun, table: TcTable | None) -> dict:
-    """The setup dialog's ``previous`` settings for a reopened fit: TC file, channels, region, options."""
+def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None = None) -> dict:
+    """The setup dialog's ``previous`` settings for a reopened fit: TC file (``tc_file``, where it was found,
+    else where the fit read it), channels, region, options."""
     options = saved.options
     names = table.names if table is not None else options.channels
     chosen = set(options.channels) if options.channels else None
@@ -138,7 +139,7 @@ def saved_request(saved: SavedRun, table: TcTable | None) -> dict:
         rows.append((name, checked, windows))
     return {
         "kind": "tc",
-        "tc_file": str(saved.tc_file) if saved.tc_file is not None else "",
+        "tc_file": str(tc_file or saved.tc_file or ""),
         "sheet": saved.sheet,
         "options": options,
         "out_dir": str(saved.folder),

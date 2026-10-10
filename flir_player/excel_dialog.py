@@ -456,10 +456,11 @@ class ExcelExportDialog(FramelessDialog):
         if reason:
             self.tc_label.setText(reason)
         elif self.tc_check.isChecked():
-            origin = self._fit_origin() + 1
+            result = self.tc_run.result
             ignition = self.ignition_spin.value()
-            time0 = (f" Time 0 is logger time 0 (frame {origin:,})." if ignition == origin else
-                     f" Time 0 is frame {ignition:,}; logger time 0 is frame {origin:,}.")
+            logger = (ignition - 1) / result.fps - result.lag_s  # logger time at the workbook's time 0
+            time0 = (f" Time 0 is logger time 0 (frame {ignition:,})." if abs(logger) < 0.5 / result.fps else
+                     f" Time 0 (frame {ignition:,}) is logger time {logger:,.1f} s.")
             self.tc_label.setText("Pairs: " + self._tc_pairing.describe() + "." + time0)
         else:
             self.tc_label.setText("Unticked: paste the logger data on TC Compare yourself.")

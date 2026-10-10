@@ -238,7 +238,6 @@ class EdgeResizeGrip(QWidget):
 
 class TitleBar(QWidget):
     open_requested = Signal()
-    export_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -283,7 +282,6 @@ class TitleBar(QWidget):
         self.export_button.setIcon(awesome_icon("fa6s.file-export", ICON_ACCENT))
         self.export_button.setIconSize(QSize(15, 15))
         self.export_button.setToolTip("Excel workbook, images, movies, ROI sets… (Ctrl+E saves the frame as a PNG)")
-        self.export_button.clicked.connect(self.export_requested)
         self.export_button.setEnabled(False)
         layout.addWidget(self.export_button)
 

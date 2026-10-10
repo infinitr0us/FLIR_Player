@@ -334,7 +334,6 @@ class MainWindow(QMainWindow):
 
     def _connect_ui(self) -> None:
         self.title_bar.open_requested.connect(self.open_dialog)
-        self.title_bar.export_requested.connect(lambda: self._export("png"))
         self.inspector.unit_changed.connect(self._change_unit)
         self.inspector.palette_changed.connect(self._change_palette)
         self.inspector.palette_invert_toggled.connect(self._change_palette_invert)
@@ -1374,7 +1373,7 @@ class MainWindow(QMainWindow):
             return
         try:
             saved = saved_run(results_folder(metadata.path), metadata.path, metadata.num_frames)
-        except ValueError as exc:
+        except Exception as exc:  # a damaged results folder must never stop the recording from opening
             self._notify(f"The last TC fit was not reopened: {exc}")
             return
         if saved is None:
@@ -1389,7 +1388,8 @@ class MainWindow(QMainWindow):
         run = self._tc_runs.setdefault(key, {})
         if "output" in run:
             return  # a fit run in this session meanwhile wins
-        run.setdefault("request", saved_request(saved, output.table if output is not None else None))
+        run.setdefault("request", saved_request(saved, output.table if output is not None else None,
+                                                output.tc_file if output is not None else None))
         if output is None:
             self._notify(f"The last TC fit ({saved.folder.name}) was not reopened: {error}. "
                          "Fit Emissivity from TCs runs it again.")
