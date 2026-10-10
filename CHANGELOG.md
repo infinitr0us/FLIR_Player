@@ -10,10 +10,11 @@ engineers' step-by-step guide.
 - The player reopens a recording's last TC fit from its results folder
   (`<recording>_tcmatch`) when the recording is opened again, so the workbook
   can be filled from the fit in a later session without running it again. The
-  TC file is read again in the background (it is looked for where the fit read
-  it, then next to the recording); a notice says when the fit is back, or why
-  not. `result.json` now records the TC file, its sheet and the object
-  parameters the fit used.
+  TC file is read again in the background, and only if its content is what the
+  fit read (a moved copy is found next to the recording; an edited one is
+  reported); a notice says when the fit is back, or why not. `result.json` now
+  records the TC file (path and content hash), its sheet, the object parameters
+  the fit used and the recording's size.
 - The setup dialog offers the last run's search region even when its box is
   gone, so a rerun still finds its saved frame statistics (they are kept per
   region) and takes about a minute.

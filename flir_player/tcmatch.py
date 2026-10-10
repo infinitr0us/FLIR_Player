@@ -1240,16 +1240,24 @@ class MatchResult:
 
 def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
     """The ``MatchOptions`` a result's ``options`` record (lists back to tuples; unknown keys ignored)."""
-    def pair(value):
-        return tuple(float(v) for v in value) if value is not None else None
+    def numbers(value, size: int, kind=float) -> tuple:
+        values = tuple(kind(v) for v in value)
+        if len(values) != size:
+            raise ValueError(f"expected {size} numbers, got {len(values)}")
+        return values
 
+    def pair(value):
+        return numbers(value, 2) if value is not None else None
+
+    if not isinstance(data, Mapping):
+        raise TypeError("options are not a mapping")
     known = {f.name for f in fields(MatchOptions)}
     values = {key: value for key, value in data.items() if key in known}
     if values.get("roi") is not None:
-        values["roi"] = tuple(int(v) for v in values["roi"])
-    values["channels"] = tuple(values.get("channels") or ())
+        values["roi"] = numbers(values["roi"], 4, int)
+    values["channels"] = tuple(str(name) for name in values.get("channels") or ())
     values["valid"] = {str(name): tuple(pair(w) for w in windows) for name, windows in (values.get("valid") or {}).items()}
-    values["pixels"] = {str(name): tuple(int(v) for v in pixel) for name, pixel in (values.get("pixels") or {}).items()}
+    values["pixels"] = {str(name): numbers(pixel, 2, int) for name, pixel in (values.get("pixels") or {}).items()}
     for key in ("scope", "lag_range"):
         values[key] = pair(values.get(key))
     return MatchOptions(**values)
@@ -1796,10 +1804,27 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+FINGERPRINT_BLOCK = 1 << 20
+
+
+def recording_fingerprint(path: str | Path) -> str:
+    """SHA-256 of a recording's size and three 1 MiB samples (start, middle, end): tells recordings of the
+    same name, length and size apart (their headers and frames differ) in milliseconds, wherever the file
+    is moved."""
+    path = Path(path)
+    size = path.stat().st_size
+    digest = hashlib.sha256(str(size).encode())
+    with open(path, "rb") as handle:
+        for offset in sorted({0, max(0, size // 2 - FINGERPRINT_BLOCK // 2), max(0, size - FINGERPRINT_BLOCK)}):
+            handle.seek(offset)
+            digest.update(handle.read(FINGERPRINT_BLOCK))
+    return digest.hexdigest()
+
+
 def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None = None) -> SavedRun | None:
     """The run saved in ``folder`` (its ``result.json``) for ``recording``; None when there is none or it
-    belongs to another recording (name, frame count, and from 0.7.1 the file size). ValueError when the
-    file cannot be read or is not a result.
+    belongs to another recording (name, frame count, and from 0.7.1 size and content fingerprint).
+    ValueError when the file cannot be read or is not a result.
 
     The logger file is checked by content when it is read (``load_saved_run``). Results written before
     0.7.1 record neither its folder nor its content: it is looked for by name next to the recording and
@@ -1823,11 +1848,13 @@ def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None 
         time_column = run.get("time_column")
         parameters = run.get("parameters")
         recording_size = run.get("recording_size")
+        fingerprint = run.get("recording_fingerprint")
         tc_sha256 = run.get("tc_sha256")
         if not (tc_path is None or isinstance(tc_path, str)) or not (sheet_saved is None or isinstance(sheet_saved, str)) \
                 or not (time_column is None or isinstance(time_column, (int, str))) \
                 or not (parameters is None or isinstance(parameters, dict)) \
                 or not (recording_size is None or isinstance(recording_size, int)) \
+                or not (fingerprint is None or isinstance(fingerprint, str)) \
                 or not (tc_sha256 is None or isinstance(tc_sha256, str)):
             raise TypeError("its run section has values of the wrong type")
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
@@ -1835,8 +1862,13 @@ def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None 
     recording = Path(recording)
     if result.recording != recording.name or (num_frames is not None and result.num_frames != int(num_frames)):
         return None
-    if recording_size is not None and recording.is_file() and recording.stat().st_size != recording_size:
-        return None  # another recording of the same name and length
+    try:
+        if recording_size is not None and recording.is_file() and recording.stat().st_size != recording_size:
+            return None  # another recording of the same name and length
+        if fingerprint is not None and recording.is_file() and recording_fingerprint(recording) != fingerprint:
+            return None  # another recording of the same name, length and size
+    except OSError as exc:
+        raise ValueError(f"{recording.name} cannot be checked against {folder.name} ({exc})") from exc
     name, sheet = _source_parts(result.tc_source)
     sheet = sheet_saved if "sheet" in run else sheet
     if tc_path:
@@ -1865,10 +1897,15 @@ def _locate_tc_file(saved: SavedRun) -> Path:
         if file_sha256(saved.tc_file) == saved.tc_sha256:
             return saved.tc_file
         raise ValueError(f"the TC file {saved.tc_file.name} has changed since the fit")
+    unreadable = []
     for candidate in saved.tc_candidates:
-        if candidate.is_file() and file_sha256(candidate) == saved.tc_sha256:
-            return candidate
-    raise ValueError(f"the TC file {saved.tc_name} was not found where the fit read it")
+        try:
+            if candidate.is_file() and file_sha256(candidate) == saved.tc_sha256:
+                return candidate
+        except OSError as exc:  # look on: a later candidate may be the copy
+            unreadable.append(f"{candidate.name} ({type(exc).__name__})")
+    note = f"; could not read {', '.join(unreadable)}" if unreadable else ""
+    raise ValueError(f"the TC file {saved.tc_name} was not found where the fit read it{note}")
 
 
 def load_saved_run(saved: SavedRun) -> RunOutput:
@@ -1922,7 +1959,11 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     say = log or (lambda text: None)
     stage = stage or (lambda text: None)
     stage("Reading the TC file")
+    # the hash describes the bytes parsed: taken around the read, which must not change them
+    tc_sha256 = file_sha256(tc_file) if Path(tc_file).is_file() else None
     table = read_tc_table(tc_file, sheet=sheet, time_column=time_column)
+    if tc_sha256 is not None and file_sha256(tc_file) != tc_sha256:
+        raise ValueError(f"{Path(tc_file).name} changed while it was read; run again")
     step = options.step_s or table.interval
     say(f"TC file: {len(table.names)} channel(s), {table.times.size} rows every {table.interval:g} s")
     _check(abort)
@@ -1958,8 +1999,9 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
             run_info = {"tc_file": str(Path(tc_file).resolve()), "sheet": table.sheet or None,
                         "time_column": time_column if isinstance(time_column, (int, str)) else None,
                         "parameters": dict(parameters) if parameters is not None else None,
-                        "tc_sha256": file_sha256(tc_file) if Path(tc_file).is_file() else None,
-                        "recording_size": Path(recording).stat().st_size if Path(recording).is_file() else None}
+                        "tc_sha256": tc_sha256,
+                        "recording_size": Path(recording).stat().st_size if Path(recording).is_file() else None,
+                        "recording_fingerprint": recording_fingerprint(recording) if Path(recording).is_file() else None}
             staged["json"].write_text(json.dumps({**result.to_dict(), "run": run_info}, indent=1), encoding="utf-8")
             staged["summary"].write_text(summary_text(result), encoding="utf-8")
             width, height = samples.size

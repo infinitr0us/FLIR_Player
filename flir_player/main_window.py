@@ -1388,8 +1388,13 @@ class MainWindow(QMainWindow):
         run = self._tc_runs.setdefault(key, {})
         if "output" in run:
             return  # a fit run in this session meanwhile wins
-        run.setdefault("request", saved_request(saved, output.table if output is not None else None,
-                                                output.tc_file if output is not None else None))
+        try:
+            request = saved_request(saved, output.table if output is not None else None,
+                                    output.tc_file if output is not None else None)
+        except Exception as exc:  # damaged saved settings: say so, keep the session as it is
+            self._notify(f"The last TC fit ({saved.folder.name}) was not reopened: {exc}")
+            return
+        run.setdefault("request", request)
         if output is None:
             self._notify(f"The last TC fit ({saved.folder.name}) was not reopened: {error}. "
                          "Fit Emissivity from TCs runs it again.")

@@ -289,3 +289,105 @@ def test_r4_the_label_gives_the_logger_time_when_logger_zero_is_outside_the_reco
     assert "Time 0 (frame 1) is logger time 100.0 s" in dialog.tc_label.text()
     assert dialog.start_spin.value() == 0.0  # the logger range clipped to the recording
     assert dialog.options().tc_prefill.offset_s == pytest.approx(-100.0)
+
+
+# --- Codex review, second pass (run review-v071-cont) --------------------------------------------------
+
+
+def test_r5_the_saved_hash_is_the_content_the_fit_parsed(tmp_path, monkeypatch) -> None:
+    samples, table = make_scene()
+    samples.info["frames"] = int(samples.counts.sum())
+    _fake_run(monkeypatch, samples, table)
+    data = tmp_path / "data"
+    data.mkdir()
+    recording = data / "synthetic.seq"
+    recording.write_bytes(bytes(1000))
+    tc = _write_csv(data / "tc.csv", ["A"], [[0, 20.0]])
+    parsed = tcmatch.file_sha256(tc)
+
+    def edited_while_sampling(path, options, *, step_s, im, progress, abort, cache_dir, stage):
+        tc.write_text("Time (s),A\n0,99\n", encoding="utf-8")  # someone edits the logger file meanwhile
+        return samples
+
+    monkeypatch.setattr(tcmatch, "sample_recording", edited_while_sampling)
+    out = data / "synthetic_tcmatch"
+    tcmatch.run_analysis(recording, tc, MatchOptions(spot=1), out_dir=out)
+    saved = saved_run(out, recording)
+    assert saved.tc_sha256 == parsed  # not the edited file's
+    with pytest.raises(ValueError, match="changed since the fit"):
+        load_saved_run(saved)
+    # an edit during the read itself stops the run
+    _fake_run(monkeypatch, samples, table)
+    real_read = tcmatch.read_tc_table
+
+    def read_and_edit(path, sheet=None, time_column=None):
+        tc.write_text("Time (s),A\n0,98\n", encoding="utf-8")
+        return real_read(path, sheet=sheet, time_column=time_column)
+
+    monkeypatch.setattr(tcmatch, "read_tc_table", read_and_edit)
+    with pytest.raises(ValueError, match="changed while it was read"):
+        tcmatch.run_analysis(recording, tc, MatchOptions(spot=1))
+
+
+def test_r6_another_recording_of_the_same_size_is_not_this_run(tmp_path, monkeypatch) -> None:
+    output, recording, tc, out = _saved(tmp_path, monkeypatch)
+    saved = saved_run(out, recording, output.result.num_frames)
+    assert saved is not None
+    data = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert data["run"]["recording_fingerprint"] == tcmatch.recording_fingerprint(recording)
+    recording.write_bytes(bytes([1]) * 1000)  # same name, length and size, other content
+    assert saved_run(out, recording, output.result.num_frames) is None
+    moved = tmp_path / "elsewhere"
+    moved.mkdir()
+    recording.write_bytes(bytes(1000))  # the original again, moved with its results: still this run
+    (moved / recording.name).write_bytes(recording.read_bytes())
+    assert saved_run(out, moved / recording.name, output.result.num_frames) is not None
+
+
+def test_r7_damaged_options_are_reported_at_load_and_in_the_callback(qapp, tmp_path, monkeypatch) -> None:
+    from flir_player import main_window as mw
+
+    output, recording, tc, out = _saved(tmp_path, monkeypatch)
+    data = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    for damage in ({"valid": {"TC A": [[1.0]]}}, {"roi": [1, 2, 3]}, {"pixels": {"TC A": [1]}}, {"scope": [5.0]}):
+        broken = {**data, "options": {**data["options"], **damage}}
+        (out / "result.json").write_text(json.dumps(broken), encoding="utf-8")
+        with pytest.raises(ValueError, match="cannot be read"):
+            saved_run(out, recording)
+    (out / "result.json").write_text(json.dumps(data), encoding="utf-8")
+    saved = saved_run(out, recording)
+
+    def broken_request(*_args, **_kwargs):
+        raise ValueError("not enough values to unpack")
+
+    monkeypatch.setattr(mw, "saved_request", broken_request)
+    window = mw.MainWindow()
+    try:
+        window.metadata = VideoMetadata(path=recording, width=48, height=40, num_frames=output.result.num_frames,
+                                        start_time=None, end_time=None, duration_seconds=1.0, nominal_fps=30.0)
+        window._on_saved_tc_fit(str(recording), saved, load_saved_run(saved), "")
+        assert window.canvas.notice.startswith("The last TC fit") and "output" not in window._tc_runs[str(recording)]
+    finally:
+        window.metadata = None
+        window.close()
+
+
+def test_r8_an_unreadable_candidate_does_not_end_the_search(tmp_path, monkeypatch) -> None:
+    output, recording, tc, out = _saved(tmp_path, monkeypatch, tc_dir=tmp_path / "logger")
+    first = recording.parent / "tc.csv"  # the first place looked at: cannot be read
+    first.write_bytes(tc.read_bytes())
+    second = out / "tc.csv"  # a later one: the copy
+    second.write_bytes(tc.read_bytes())
+    tc.unlink()
+    real_hash = tcmatch.file_sha256
+
+    def guarded(path):
+        if Path(path) == first:
+            raise PermissionError(13, "Access is denied")
+        return real_hash(path)
+
+    monkeypatch.setattr(tcmatch, "file_sha256", guarded)
+    assert load_saved_run(saved_run(out, recording)).tc_file == second
+    second.unlink()
+    with pytest.raises(ValueError, match="could not read tc.csv"):
+        load_saved_run(saved_run(out, recording))
