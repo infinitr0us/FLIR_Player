@@ -120,7 +120,7 @@ def _header_map(ws) -> dict[tuple[str, str], int]:
 
 def test_sheets_names_and_hidden_pixels(workbook) -> None:
     book = openpyxl.load_workbook(workbook[0])
-    assert book.sheetnames == ["Start Here", "Settings", "Data", "Charts", "TC Compare", "Summary",
+    assert book.sheetnames == ["Start Here", "Settings", "Data", "Charts", "TC Compare", "Emissivity Match", "Summary",
                                "ROI Map", "Validation", "Counts", "Pixels", "Source"]
     assert book["Pixels"].sheet_state == "hidden"
     names = set(book.defined_names.keys())
@@ -137,7 +137,8 @@ def test_data_formulas_reference_counts_and_carry_model_values(workbook) -> None
     mean_pixels = heads[("Camera A · TC2", "Mean (°C)")]
     mean_bins = heads[("Camera A · Box", "Mean (°C)")]
     assert formulas.cell(6, spot).value.startswith("=IF(ISNUMBER('Counts'!")
-    assert "SUMPRODUCT(SRC_1_B/LN(" in formulas.cell(6, mean_pixels).value
+    assert "SUMPRODUCT('Settings'!$" in formulas.cell(6, mean_pixels).value  # B, cited by cell (see _direct)
+    assert "/LN(" in formulas.cell(6, mean_pixels).value
     assert "SUMPRODUCT('Pixels'!" in formulas.cell(6, mean_bins).value
     data = workbook[1]
     params = data.sources[0].initial

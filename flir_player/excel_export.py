@@ -50,6 +50,7 @@ from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, count_status
 from .fff import saved_object_parameters
 from .sdktime import TimestampRepair, recording_rate
+from .zones import ENDS as ZONE_ENDS, ZoneSpec
 
 ROI_SET_FORMAT = "flir-player-roi-set"
 EXCEL_COLUMNS = 16_384
@@ -62,11 +63,22 @@ ROI_KINDS = ("cursor", "rect", "ellipse", "line")
 
 
 @dataclass(frozen=True, slots=True)
+class ZoneGroup:
+    """Zones split from one box (``zones.split_box``): their positions in the ROI set, how they
+    were split, and the box's name, so the player can re-split them or join them back."""
+
+    rois: tuple[int, ...]
+    spec: ZoneSpec
+    name: str = "Box"
+
+
+@dataclass(frozen=True, slots=True)
 class RoiSet:
     rois: tuple[RoiShape, ...]
     ignition_frame: int | None = None
     recording: str = ""
     size: tuple[int, int] | None = None  # (width, height)
+    zone_groups: tuple[ZoneGroup, ...] = ()
 
 
 def roi_set_path(recording: str | Path) -> Path:
@@ -86,6 +98,11 @@ def save_roi_set(path: str | Path, roi_set: RoiSet) -> None:
                   "points": [[float(x), float(y)] for x, y in shape.points]}
                  for shape in roi_set.rois],
     }
+    if roi_set.zone_groups:
+        payload["zone_groups"] = [{"rois": list(group.rois), "name": group.name,
+                                   "box": [list(corner) for corner in group.spec.box], "count": group.spec.count,
+                                   "start": group.spec.start, "gap": group.spec.gap, "prefix": group.spec.prefix}
+                                  for group in roi_set.zone_groups]
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -112,12 +129,30 @@ def load_roi_set(path: str | Path) -> RoiSet:
         # names are shown on one line (readout badge, workbook headers)
         label = " ".join(part.strip() for part in label.splitlines() if part.strip()) or f"ROI {number}"
         rois.append(RoiShape(id=number, kind=kind, points=points, name=label))
+    groups = []
+    items = payload.get("zone_groups") or []
+    if not isinstance(items, list):
+        raise ValueError(f"{name}: the zone groups are not valid")
+    for number, item in enumerate(items, start=1):
+        try:
+            members = tuple(int(i) for i in item["rois"])
+            (x0, y0), (x1, y1) = ((float(x), float(y)) for x, y in item["box"])
+            spec = ZoneSpec(box=((x0, y0), (x1, y1)), count=int(item["count"]), start=str(item["start"]),
+                            gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")))
+            label = str(item.get("name") or "Box")
+        except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
+            raise ValueError(f"Zone group {number} in {name} is not valid") from exc
+        if (not members or len(set(members)) != len(members) or not all(0 <= i < len(rois) for i in members)
+                or spec.start not in ZONE_ENDS or spec.count < 1 or spec.gap < 0
+                or not all(math.isfinite(v) for v in (x0, y0, x1, y1))):
+            raise ValueError(f"Zone group {number} in {name} is not valid")
+        groups.append(ZoneGroup(rois=members, spec=spec, name=label))
     try:
         ignition = payload.get("ignition_frame")
         size = payload.get("size")
         return RoiSet(rois=tuple(rois), ignition_frame=None if ignition is None else int(ignition),
                       recording=str(payload.get("recording", "")),
-                      size=tuple(int(v) for v in size) if size else None)
+                      size=tuple(int(v) for v in size) if size else None, zone_groups=tuple(groups))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name}: the ignition frame or image size is not valid") from exc
 
@@ -144,7 +179,10 @@ class TcPrefill:
     ``offset_s``, the sheet's logger time offset; ``columns`` hold one TC each
     (°C, NaN = blank). ``roi_tc`` pre-selects a TC column for ROIs by name,
     ``roi_eps`` fills ROIs' emissivity overrides (e.g. fitted to their TC) and
-    ``window`` sets the Summary's TC comparison window.
+    ``window`` sets the Summary's TC comparison window. ``roi_use`` fills an
+    ROI's Use column: 1 on rows inside its (start, end) times (workbook axis),
+    0 elsewhere; ROIs it does not list use every row. ``match_exclude`` lists
+    ROIs that start excluded from the common emissivity (Emissivity Match).
     """
 
     times: tuple[float, ...]
@@ -154,6 +192,8 @@ class TcPrefill:
     window: tuple[float, float] | None = None
     offset_s: float = 0.0
     roi_eps: tuple[tuple[str, float], ...] = ()
+    roi_use: tuple[tuple[str, tuple[tuple[float, float], ...]], ...] = ()
+    match_exclude: tuple[str, ...] = ()
 
     def check(self, capacity: int, width: int) -> None:
         if len(self.names) != len(self.columns) or not 0 < len(self.names) <= width:
@@ -167,6 +207,20 @@ class TcPrefill:
             raise ValueError(f"No TC column named {', '.join(sorted(unknown))}")
         if any(not (math.isfinite(eps) and 0.0 < eps <= 1.0) for _roi, eps in self.roi_eps):
             raise ValueError("An ROI emissivity must lie in (0, 1]")
+        if any(not (math.isfinite(a) and math.isfinite(b) and a <= b) for _roi, runs in self.roi_use
+               for a, b in runs):
+            raise ValueError("A Use time range must run from an earlier to a later time")
+
+    def use_flags(self, roi: str, times) -> np.ndarray | None:
+        """1/0 per workbook time for ``roi``'s Use column, or None when every row is used."""
+        runs = dict(self.roi_use).get(roi)
+        if runs is None:
+            return None
+        times = np.asarray(times, dtype=np.float64)
+        flags = np.zeros(times.size, dtype=np.int8)
+        for a, b in runs:
+            flags[(times >= a - 1e-9) & (times <= b + 1e-9)] = 1
+        return flags
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +234,10 @@ class ExportOptions:
     every_frame: bool = False
     time_base: str = "frames"  # "frames": index / frame rate; "clock": camera timestamps
     extra_stats: tuple[str, ...] = ()
+    extremes: bool = True  # max and min temperature columns for areas (their counts are always read)
+    # "pixels": an area's mean temperature from every pixel's count (exact; up to ``pixel_limit``
+    # pixels, else bins); "signal": the temperature of its mean count, no per-pixel columns
+    area_means: str = "pixels"
     pixel_limit: int = 400
     bins: int = 128
     validation_rows: int = 24
@@ -195,7 +253,7 @@ class ExportOptions:
 class RoiData:
     shape: RoiShape
     pixels: int
-    mode: str  # "spot" | "pixels" | "bins"
+    mode: str  # "spot" | "pixels" | "bins" | "mean" (area mean from the mean count, no block)
     counts: dict[str, np.ndarray]  # stat → counts per row (NaN where no frame)
     block: np.ndarray | None  # rows × pixels, or rows × (2 · bins): counts then mean counts
     status: np.ndarray  # int8 per row (radiometry.STATUS_LABELS; -1 = no frame)
@@ -261,17 +319,28 @@ def frames_for(times: np.ndarray, ignition: int, fps: float, num_frames: int) ->
 
 def estimate(rows: int, rois: list[tuple[str, int]], options: ExportOptions) -> dict[str, float]:
     """Rough size of a workbook: rows and (pixels per ROI) → cells and MB."""
-    stats = len(AREA_STATS) + len(options.extra_stats)
+    stats = (len(AREA_STATS) if options.extremes else 1) + len(options.extra_stats)
     cells = 0
     for kind, pixels in rois:
         if kind == "cursor":
             cells += rows * 3  # counts, temperature, status
         else:
-            block = pixels if pixels <= options.pixel_limit else 2 * options.bins
+            _mode, block = area_mode(pixels, options)
             cells += rows * (2 * stats + 1 + block)
     if "tc" in options.sheets:
-        cells += rows * 7 * len(rois)
+        prefill = options.tc_prefill  # filled from the TC fit: only the ROIs with a TC are compared
+        compared = len({roi for roi, _tc in prefill.roi_tc}) if prefill is not None and prefill.roi_tc else len(rois)
+        cells += rows * 9 * compared  # the comparison block, Use and Fit row
     return {"rows": rows, "cells": cells, "megabytes": cells * 14 / 1e6}
+
+
+def area_mode(pixels: int, options: ExportOptions) -> tuple[str, int]:
+    """(RoiData mode, Pixels-sheet columns) of an area ROI with ``pixels`` pixels."""
+    if options.area_means == "signal":
+        return "mean", 0
+    if pixels <= options.pixel_limit:
+        return "pixels", pixels
+    return "bins", 2 * options.bins
 
 
 def fit_pixel_limit(pixel_counts: list[int], options: ExportOptions) -> int:
@@ -367,7 +436,10 @@ def _region(values: np.ndarray, roi: RoiShape, options: ExportOptions, apparent=
         stats["median"] = float(np.percentile(values, 50, method="lower"))
     if "p95" in options.extra_stats:
         stats["p95"] = float(np.percentile(values, 95, method="lower"))
-    if values.size <= options.pixel_limit:
+    mode, _width = area_mode(values.size, options)
+    if mode == "mean":
+        return stats, None
+    if mode == "pixels":
         return stats, values
     return stats, bin_counts(values, options.bins, apparent)
 
@@ -442,12 +514,9 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         data = []
         for shape, (ys, _xs) in zip(rois, coordinates):
             names = ("value",) if shape.kind == "cursor" else AREA_STATS + tuple(options.extra_stats)
-            block_width = (0 if shape.kind == "cursor" else
-                           ys.size if ys.size <= options.pixel_limit else 2 * options.bins)
+            mode, block_width = ("spot", 0) if shape.kind == "cursor" else area_mode(int(ys.size), options)
             data.append(RoiData(
-                shape=shape, pixels=int(ys.size),
-                mode="spot" if shape.kind == "cursor" else (
-                    "pixels" if ys.size <= options.pixel_limit else "bins"),
+                shape=shape, pixels=int(ys.size), mode=mode,
                 counts={name: np.full(rows, np.nan) for name in names},
                 block=np.full((rows, block_width), np.nan) if block_width else None,
                 status=np.full(rows, -1, dtype=np.int8)))
@@ -561,6 +630,17 @@ def _validate(im, data, coordinates, frames, rows, options) -> None:
                 roi.validation["p95"][k] = np.percentile(values, 95, method="lower")
 
 
+def map_scale(rois, width: int, narrowest: float = 24.0, max_width: int = 2000) -> int:
+    """Whole-number enlargement of the ROI map so the narrowest box is ``narrowest`` px wide
+    (room for a zone number), at most 3× and ``max_width`` px."""
+    widths = [abs(shape.points[1][0] - shape.points[0][0]) for shape in rois
+              if shape.kind in ("rect", "ellipse") and len(shape.points) == 2]
+    widths = [w for w in widths if w > 0]
+    if not widths or min(widths) >= narrowest:
+        return 1
+    return int(max(1, min(3, math.ceil(narrowest / min(widths)), max_width // max(1, width))))
+
+
 def _roi_map(im, rois, spec: SourceSpec, frames: np.ndarray) -> bytes | None:
     """PNG of the ignition frame (apparent counts, Iron) with ROIs and names."""
     import io
@@ -579,6 +659,11 @@ def _roi_map(im, rois, spec: SourceSpec, frames: np.ndarray) -> bytes | None:
         lut = palette_lut("Iron")
         index = np.clip((values - low) / (high - low) * (len(lut) - 1), 0, len(lut) - 1).astype(np.intp)
         rgb = np.ascontiguousarray(lut[index][..., :3]).astype(np.uint8)
+        scale = map_scale(rois, rgb.shape[1])
+        if scale > 1:  # narrow zones: enlarge so each can carry its number
+            rgb = np.ascontiguousarray(np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1))
+            rois = [dataclass_replace(shape, points=tuple((x * scale, y * scale) for x, y in shape.points))
+                    for shape in rois]
         composed = compose_frame(rgb, ComposeOptions(color_bar=False, rois=True, roi_names=True),
                                  palette="Iron", rois=tuple(rois))
         buffer = io.BytesIO()
@@ -683,7 +768,8 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
             height, width = int(im.height), int(im.width)
             pixel_counts += [int(roi_coordinates(shape, height, width)[0].size) for shape in spec.rois
                              if shape.kind != "cursor"]
-        pixel_limit = fit_pixel_limit([count for count in pixel_counts if count], options)
+        pixel_limit = (options.pixel_limit if options.area_means == "signal" else
+                       fit_pixel_limit([count for count in pixel_counts if count], options))
         if pixel_limit != options.pixel_limit:
             options = dataclass_replace(options, pixel_limit=pixel_limit)
         times = timeline(spans, options, rates[0])

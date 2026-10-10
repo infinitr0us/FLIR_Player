@@ -50,8 +50,9 @@ def test_temperature_formulas_guard_the_curve_domain(tmp_path) -> None:
     data = openpyxl.load_workbook(path)["Data"]
     spot = data.cell(6, 3).value
     mean = data.cell(6, 5).value
-    assert "_SMAX" in spot and "MEDIAN(ROI_01_CLO," in spot and ">0" in spot
-    assert "_SMAX" in mean and "MIN('Pixels'!" in mean and "MAX('Pixels'!" in mean
+    # the names are cited by their cells (workbook._direct): SMAX and the clamp counts live on Settings
+    assert "<'Settings'!$" in spot and "MEDIAN('Settings'!$" in spot and ">0" in spot
+    assert "<'Settings'!$" in mean and "MIN('Pixels'!" in mean and "MAX('Pixels'!" in mean
 
 
 def test_tc_helpers_need_an_ir_sample_and_charts_use_the_display_unit(tmp_path) -> None:
@@ -64,7 +65,7 @@ def test_tc_helpers_need_an_ir_sample_and_charts_use_the_display_unit(tmp_path) 
     assert "Matching ε (mean radiance)" in headers  # area ROI label
     assert "TC (display unit)" in headers
     tc_formula = tc.cell(10, headers["TC (°C)"]).value
-    assert "INDEX('TC Compare'!$A$10" in tc_formula and "-TC_OFFSET," in tc_formula
+    assert "INDEX('TC Compare'!$A$10" in tc_formula and "-'TC Compare'!$B$6," in tc_formula  # TC_OFFSET
 
 
 def test_summary_windows_round_inwards_and_carry_real_results(tmp_path) -> None:

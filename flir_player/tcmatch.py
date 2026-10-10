@@ -1107,6 +1107,7 @@ class EventResult:
     pixel_n: int = 0  # candidate pixels fitted (the best-correlated, up to MAX_CANDIDATES)
     physical: bool = True  # False: the data want ε > PHYSICAL_EPS_MAX, or mostly no ε matches; not pooled
     used: bool = True  # pooled: physical, and its TC's events are mostly physical
+    fitted: tuple[tuple[float, float], ...] = ()  # runs of logger seconds the fit used (first, last bin)
 
     @property
     def label(self) -> str:
@@ -1239,7 +1240,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
                              excluded_bound=int(event.excluded_bound.size),
                              tc_min_c=float(np.nanmin(ch.values[every])), tc_max_c=float(np.nanmax(ch.values[every])),
                              fit=fit, pixel_eps=_spread3(per_pixel), pixel_eps_ls=_spread3(per_pixel_ls),
-                             pixel_n=len(per_pixel), physical=physical)
+                             pixel_n=len(per_pixel), physical=physical,
+                             fitted=_grid_runs(grid, rows) if rows.size >= 3 else ())
             res.events.append(er)
             if er.physical and share > 0.2:
                 warnings.append(f"{er.label}: in {share:.0%} of the seconds no emissivity from 0 to 1 explains "
@@ -1354,6 +1356,11 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
 def _check(abort: Abort | None) -> None:
     if abort is not None and abort():
         raise JobCancelled("Cancelled")
+
+
+def _grid_runs(grid: np.ndarray, rows: np.ndarray) -> tuple[tuple[float, float], ...]:
+    """Runs of consecutive logger bins among ``rows``, as (first, last) logger times."""
+    return tuple((float(grid[a]), float(grid[b])) for a, b in _runs(np.isin(np.arange(grid.size), rows), 0))
 
 
 def _spread3(values: list[float]) -> tuple[float, float, float]:
@@ -1473,30 +1480,63 @@ def workbook_origin(result: MatchResult) -> tuple[int, float]:
     return frame, float(result.lag_s - at)
 
 
-def tc_prefill(result: MatchResult, table: TcTable):
-    """TC Compare sheet contents for the workbook: the logger data, each ROI's TC (the sheet's first
-    ten) and fitted emissivity (its override on Settings, for every TC), the best event window."""
-    from .excel_export import TcPrefill
+def tc_prefill(result: MatchResult, table: TcTable, *, rois: Sequence[RoiShape] | None = None,
+               frame: int | None = None, size: tuple[int, int] | None = None):
+    """TC Compare sheet contents for the workbook: the logger data (the sheet's first ten TCs), each
+    ROI's TC, the rows each TC's fit used (the sheet's Use column), the best event window.
 
-    _frame, offset = workbook_origin(result)
+    Without ``rois`` the ROIs are the spot and box at each TC pixel (``tc_rois``): every TC's ROIs
+    start at its fitted emissivity, and the spots start excluded from the common emissivity so
+    each TC counts once. With ``rois`` (the player's, e.g. cell zones; ``size`` = image width and
+    height) each TC pairs with the smallest ROI containing its pixel (``zones.pair_tcs``) and no
+    emissivity is overridden: one emissivity drives every zone. ``frame`` is the workbook's
+    ignition frame (default ``workbook_origin``); the logger offset follows from it.
+    """
+    from .excel_export import TcPrefill
+    from .zones import pair_tcs
+
+    if frame is None:
+        _frame, offset = workbook_origin(result)
+    else:
+        if result.preset is not None:
+            raise ValueError("The Excel export cannot separate the presets of a superframing recording yet")
+        offset = float(result.lag_s - int(frame) / result.fps)
     names = tuple(ch.name for ch in result.channels)[:10]
     columns = tuple(tuple(float(v) for v in table.values[:, table.index(name) if name in table.names else k])
                     for k, name in enumerate(names))
     eps = {ch.name: ch.eps[1] for ch in result.channels
            if ch.eps is not None and math.isfinite(ch.eps[1]) and ch.eps[1] > 0}
-    roi_tc, roi_eps = [], []
-    for shape, channel in tc_rois(result):
-        if channel in names:
-            roi_tc.append((shape.name, channel))
-        if channel in eps:
-            roi_eps.append((shape.name, round(min(1.0, eps[channel]), 3)))
+    roi_tc, roi_eps, exclude = [], [], []
+    if rois is None:
+        for shape, channel in tc_rois(result):
+            if channel in names:
+                roi_tc.append((shape.name, channel))
+                if shape.kind == "cursor":
+                    exclude.append(shape.name)
+            if channel in eps:
+                roi_eps.append((shape.name, round(min(1.0, eps[channel]), 3)))
+    else:
+        if size is None:
+            raise ValueError("Pairing TCs with ROIs needs the image size")
+        width, height = size
+        pixels = {ch.name: ch.match.pixel for ch in result.channels
+                  if ch.name in names and ch.match.found and ch.match.pixel is not None}
+        roi_tc = [(roi, channel) for channel, roi in pair_tcs(pixels, rois, height, width).pairs.items()]
+    half = result.step / 2
+    channels = {ch.name: ch for ch in result.channels}
+    roi_use = []
+    for roi, channel in roi_tc:
+        runs = tuple((a - half + offset, b + half + offset)  # on the workbook's axis, whole bins
+                     for e in channels[channel].events if e.used for a, b in e.fitted)
+        roi_use.append((roi, runs))
     events = [e for ch in result.channels for e in ch.events if e.used]
     window = None
     if events:
         best = max(events, key=lambda e: e.fit.n)
         window = (best.start_s + offset, best.end_s + offset)  # on the workbook's axis
     return TcPrefill(times=tuple(float(t) for t in table.times), columns=columns, names=names,
-                     roi_tc=tuple(roi_tc), window=window, offset_s=offset, roi_eps=tuple(roi_eps))
+                     roi_tc=tuple(roi_tc), window=window, offset_s=offset, roi_eps=tuple(roi_eps),
+                     roi_use=tuple(roi_use), match_exclude=tuple(exclude))
 
 
 def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult, table: TcTable, *,

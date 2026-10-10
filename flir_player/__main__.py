@@ -86,19 +86,23 @@ def main(argv: list[str] | None = None) -> int:
 
             from .excel_export import ExportOptions
             from .models import RoiShape
+            from .zones import ZoneSpec, split_box
 
             metadata = window.metadata
             dest = Path(tempfile.gettempdir()) / "flir-smoke-export.xlsx"
             dest.unlink(missing_ok=True)
-            spot = RoiShape(1, "cursor", ((metadata.width / 2, metadata.height / 2),), "Smoke")
+            x, y = metadata.width // 2, metadata.height // 2
+            spot = RoiShape(1, "cursor", ((x + 0.5, y + 0.5),), "Smoke")
+            zones = [RoiShape(k + 2, "rect", points, name) for k, (name, points) in enumerate(
+                split_box(ZoneSpec(box=((x - 12, y - 4), (x + 12, y + 4)), count=3), metadata.width, metadata.height))]
             window.decoder.export_finished.connect(
                 lambda ok, _message: exercise_tc() if ok and dest.is_file() else finish(6))
             window.decoder.request_export_excel({
                 "kind": "excel", "dest": str(dest), "replace": [], "parameters_from": "file",
-                "sources": [{"path": str(metadata.path), "label": "smoke", "rois": (spot,),
+                "sources": [{"path": str(metadata.path), "label": "smoke", "rois": (spot, *zones),
                              "ignition_frame": 0, "current": True}],
-                "options": ExportOptions(start_s=0.0, end_s=2.0, step_s=1.0,
-                                         sheets=frozenset({"validation"})),
+                "options": ExportOptions(start_s=0.0, end_s=2.0, step_s=1.0, area_means="signal",
+                                         sheets=frozenset({"validation", "tc"})),
             })
 
         def exercise_tc() -> None:

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.7.0 — 2026-10-10
+
+Cell zones and one emissivity. The fire-safety engineers want the temperature of
+every cell of a battery module seen from the side, and one emissivity (by their
+practice between 0.90 and 0.98) that best matches the thermocouples on cells 3,
+6 and 9. The player can now split a box over the module into one zone per cell,
+and the workbook finds that emissivity.
+
+### Cell zones
+
+- A new toolbar button splits the selected box into equal zones: the number of
+  zones (18), where zone 1 is (right, left, top or bottom end; the heater end on
+  the fire tests), the gap between zones in whole pixels (1 leaves out the mixed
+  pixels where two cells meet), the names ("Cell 1", "Cell 2", …) and the box
+  edges in pixels. The zones preview on the image while the dialog is open, and
+  after a TC fit the dialog says which zone each TC pixel falls in.
+- Selecting a zone and pressing the button again re-splits the whole group or
+  joins it back into the box. ROI sets keep the groups.
+- Labels of narrow numbered boxes shrink to their number ("Cell 7" → "7"), or
+  wait for a closer zoom; the selected ROI keeps its name. Exported images and
+  the workbook's ROI map do the same (the map is enlarged for narrow zones).
+
+### Excel workbook
+
+- **Emissivity Match** sheet: for every candidate emissivity between two limits
+  (0.90 to 0.98 in steps of 0.01 to start), the error between each ROI and its
+  TC and over all TCs, the best value, a chart of error against emissivity, each
+  TC's own best value, and plain notes when the best value sits at a limit or
+  the TCs want clearly different values.
+- TC Compare gets a *Use* column (1 or 0) per ROI, picking the rows the match
+  counts, and a *Fit row* column showing them.
+- *Fill TC Compare from the last TC fit* in the export dialog: the logger data at
+  the fitted offset, each TC paired with the smallest ROI holding its pixel (its
+  zone), no per-ROI emissivity, and Use = 1 on the seconds the fit used. Only the
+  paired ROIs are compared, which keeps the workbook quick to open.
+- *Area means from the mean signal* (no per-pixel columns) and an optional *Max
+  and min*: both start this way above 8 areas.
+- Workbooks open much faster: the row-by-row formulas of Data and TC Compare
+  now cite Settings cells instead of defined names, which Excel resolves slowly
+  when it opens a file (the names stay defined). An 18-zone workbook of a whole
+  test (4,807 rows) opened in about 3 minutes; filled from the TC fit it now
+  opens in about 11 seconds.
+- With more than 8 ROIs, the "All ROIs" chart colours them in order along one
+  blue ramp, and only ROIs with a TC get their own chart.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.6.0...v0.7.0)
+
 ## 0.6.0 — 2026-10-07
 
 Emissivity from thermocouples. Fire tests film battery cells that carry

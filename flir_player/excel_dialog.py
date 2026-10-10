@@ -56,11 +56,12 @@ class ExcelExportDialog(FramelessDialog):
     """Choose recordings, time range, sampling and workbook contents."""
 
     def __init__(self, metadata: VideoMetadata, rois: tuple[RoiShape, ...], current_frame: int,
-                 ignition_frame: int | None = None, parent=None) -> None:
+                 ignition_frame: int | None = None, tc_run=None, parent=None) -> None:
         super().__init__("Export Excel Workbook", parent)
         self.setMinimumWidth(640)
         self.metadata = metadata
         self.rois = tuple(rois)
+        self.tc_run = tc_run  # this session's TC fit of the recording (tcmatch.RunOutput), or None
         self._others: list[dict] = []  # added recordings: path, label, rois, ignition
         self._replace: list[str] = []
         self._confirmed: list[str] = []
@@ -175,9 +176,15 @@ class ExcelExportDialog(FramelessDialog):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
         stats_row = QHBoxLayout()
+        self.extremes_check = QCheckBox("Max and min")
+        self.extremes_check.setToolTip("Hottest and coldest pixel of each area. Every column is a formula Excel "
+                                       "reads when it opens the workbook: leave them out for many ROIs.")
+        areas = sum(1 for roi in self.rois if roi.kind in ("rect", "ellipse"))
+        self.extremes_check.setChecked(areas <= 8)
         self.median_check = QCheckBox("Median")
         self.p95_check = QCheckBox("95th percentile")
-        stats_row.addWidget(QLabel("Mean, max, min, plus"))
+        stats_row.addWidget(QLabel("Mean, plus"))
+        stats_row.addWidget(self.extremes_check)
         stats_row.addWidget(self.median_check)
         stats_row.addWidget(self.p95_check)
         stats_row.addStretch(1)
@@ -196,6 +203,16 @@ class ExcelExportDialog(FramelessDialog):
         options_row.addWidget(self.params_combo, 1)
         grid.addWidget(QLabel("Unit, start values"), 1, 0)
         grid.addLayout(options_row, 1, 1)
+        self.means_combo = ChevronComboBox()
+        self.means_combo.addItem("From every pixel (exact; larger file)", "pixels")
+        self.means_combo.addItem("From the mean signal (smaller file)", "signal")
+        self.means_combo.setToolTip(
+            "Every pixel: the mean of the pixels' temperatures, recomputed for any emissivity (each pixel is stored). "
+            "Mean signal: the temperature of the area's mean counts; the same for an even area, and what the TC "
+            "comparison matches. For many ROIs (cell zones) it keeps the workbook small.")
+        self.means_combo.setCurrentIndex(1 if areas > 8 else 0)
+        grid.addWidget(QLabel("Area means"), 2, 0)
+        grid.addWidget(self.means_combo, 2, 1)
         grid.setColumnStretch(1, 1)
         box.addLayout(grid)
         sheets = QGridLayout()
@@ -210,6 +227,22 @@ class ExcelExportDialog(FramelessDialog):
         self.sidecar_check.setChecked(True)
         box.addWidget(self.sidecar_check)
         panels.addWidget(frame)
+
+        # thermocouples from this session's TC fit
+        frame, box = _panel("Thermocouples")
+        self.tc_check = QCheckBox("Fill TC Compare from the last TC fit")
+        self.tc_check.setToolTip(
+            "The logger data on TC Compare at the fitted time offset, each TC paired with the smallest ROI holding "
+            "its pixel (e.g. its cell zone), and Use = 1 on the seconds the fit used (no flames on the TC, IR in "
+            "range). One emissivity then drives every ROI (no per-ROI values).")
+        self.tc_label = QLabel()
+        self.tc_label.setObjectName("FieldLabel")
+        self.tc_label.setWordWrap(True)
+        box.addWidget(self.tc_check)
+        box.addWidget(self.tc_label)
+        panels.addWidget(frame)
+        self._tc_pairing = self._pair_tcs()
+        self.tc_check.setChecked(self._tc_pairing is not None and bool(self._tc_pairing.pairs))
         panels.addStretch(1)
         layout.addWidget(scroll, 1)
 
@@ -235,8 +268,11 @@ class ExcelExportDialog(FramelessDialog):
         layout.addWidget(self.button_box)
         self._add_size_grip()
 
-        for widget in (self.start_check, self.end_check, self.median_check, self.p95_check):
+        for widget in (self.start_check, self.end_check, self.extremes_check, self.median_check, self.p95_check,
+                       self.tc_check):
             widget.toggled.connect(self._update)
+        self.means_combo.currentIndexChanged.connect(self._update)
+        self.time_base_combo.currentIndexChanged.connect(self._update)
         for widget in (self.start_spin, self.end_spin, self.step_spin):
             widget.valueChanged.connect(self._update)
         self.sampling_combo.currentIndexChanged.connect(self._update)
@@ -318,6 +354,40 @@ class ExcelExportDialog(FramelessDialog):
 
     # --- options -------------------------------------------------------------------------
 
+    def _pair_tcs(self):
+        """Which ROI each TC pixel of the last fit lies in (``zones.Pairing``), or None without a fit."""
+        if self.tc_run is None:
+            return None
+        from .zones import pair_tcs
+
+        result = self.tc_run.result
+        pixels = {ch.name: tuple(ch.match.pixel) for ch in result.channels[:10]
+                  if ch.match.found and ch.match.pixel is not None}
+        return pair_tcs(pixels, self.rois, self.metadata.height, self.metadata.width)
+
+    def _tc_usable(self) -> str:
+        """Why the TC fit cannot fill TC Compare now ("" when it can)."""
+        if self.tc_run is None:
+            return "No TC fit of this recording in this session (Measurement → Fit Emissivity from TCs…)."
+        if self.tc_run.result.preset is not None:
+            return "The TC fit used one preset of a superframing recording, which the workbook cannot separate yet."
+        if not self.sheet_checks["tc"].isChecked():
+            return "Tick the TC Compare sheet to fill it."
+        if self.time_base_combo.currentData() != "frames":
+            return "The TC fit's time offset is on the frame-number time base; choose that time base."
+        if not self._tc_pairing.pairs:
+            return "No TC pixel of the last fit lies in an ROI."
+        return ""
+
+    def tc_prefill(self):
+        """The TC Compare contents from the last fit for the open recording's ROIs, or None."""
+        if not self.tc_check.isChecked() or self._tc_usable():
+            return None
+        from .tcmatch import tc_prefill
+
+        return tc_prefill(self.tc_run.result, self.tc_run.table, rois=self.rois,
+                          frame=self.ignition_spin.value() - 1, size=(self.metadata.width, self.metadata.height))
+
     def options(self) -> ExportOptions:
         extra = tuple(name for name, check in (("median", self.median_check), ("p95", self.p95_check))
                       if check.isChecked())
@@ -328,14 +398,24 @@ class ExcelExportDialog(FramelessDialog):
             every_frame=self.sampling_combo.currentData() == "frame",
             time_base=str(self.time_base_combo.currentData()),
             extra_stats=extra,
+            extremes=self.extremes_check.isChecked(),
+            area_means=str(self.means_combo.currentData()),
             sheets=frozenset(key for key, check in self.sheet_checks.items() if check.isChecked()),
             unit=str(self.unit_combo.currentData()),
+            tc_prefill=self.tc_prefill(),
         )
 
     def _update(self) -> None:
         self.start_spin.setEnabled(self.start_check.isChecked())
         self.end_spin.setEnabled(self.end_check.isChecked())
         self.step_spin.setEnabled(self.sampling_combo.currentData() == "seconds")
+        reason = self._tc_usable()
+        self.tc_check.setEnabled(not reason)
+        if reason:
+            self.tc_label.setText(reason)
+        else:
+            self.tc_label.setText("Pairs: " + self._tc_pairing.describe() + "." if self.tc_check.isChecked()
+                                  else "Unticked: paste the logger data on TC Compare yourself.")
         options = self.options()
         fps = self.metadata.nominal_fps or 30.0
         rate = self.metadata.rate

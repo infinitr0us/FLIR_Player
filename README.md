@@ -91,6 +91,11 @@ all decoding work off the GUI thread.
   finds each thermocouple's pixel and the logger's time offset, fits the
   emissivity per TC where IR and TC can be compared, and hands the result to
   the player (ROIs, ignition frame, emissivity) or to an Excel workbook.
+- Cell zones: split a box drawn over a battery module into equal zones, one per
+  cell (18 by default, numbered from the heater end), and find one emissivity
+  for all of them in the workbook: an Emissivity Match sheet gives the error
+  between the zones and their thermocouples for every emissivity between two
+  limits (0.90 to 0.98 to start).
 - Dynamic per-frame scaling or a user-defined fixed range.
 - Live cursor coordinates and radiometric value inspection in every ROI tool,
   plus the pixel extent of the ROI being drawn, edited or hovered (box and
@@ -204,6 +209,7 @@ outside your permitted users or organization.
 | Draw ROI | left toolbar: box, ellipse, line, or spot; drag on the image (click for spot) |
 | Edit ROI | select tool: drag body to move, drag handles to resize |
 | Delete selected ROI | `Del` or the toolbar trash button |
+| Split a box into cell zones | select the box, then the toolbar columns button (select a zone and press it again to re-split or join the zones back) |
 | Show / hide analysis panel | toolbar table button (Statistics, Temporal, Profile, Histogram, Metadata, Source tabs) |
 | Zoom in / out | `+` / `-`, mouse wheel, or the toolbar magnifier buttons |
 | Fit to window / 100 % | `0` / `1` |
@@ -352,7 +358,18 @@ those counts, so they follow the Settings sheet:
 - **TC Compare:** paste logger data; each ROI can be mapped to a thermocouple
   column. It gives IR − TC and the emissivity that would make them agree. A
   value above 1 means no emissivity can: the camera sees flames, hot gas or a
-  hotter area than the thermocouple.
+  hotter area than the thermocouple. Each ROI's *Use* column (1 or 0) picks the
+  rows the Emissivity Match counts.
+- **Emissivity Match:** one emissivity for every ROI with a TC. For each
+  candidate between two limits (0.90 to 0.98 in steps of 0.01 to start) it
+  gives the root mean square of IR − TC per ROI and over all TCs (every TC
+  counts the same), marks the best value, and charts the error against the
+  emissivity. It also shows each TC's own best value without limits, and says
+  so when the best value sits at a limit or when the TCs want clearly different
+  values (one value cannot fit them all). Rows count where Use = 1, IR and TC
+  are both present, the ROI's mean signal is inside the camera's calibrated
+  range, and the time is inside the sheet's window. Type the result as the
+  emissivity on Settings and every zone follows.
 - **Summary, Charts, ROI Map, Validation, Source:** peaks, times to
   thresholds and TC statistics; charts grouped by ROI name across recordings;
   where the ROIs are; formulas against the File SDK; calibration provenance.
@@ -365,7 +382,43 @@ parameters before live formulas are written (typically to 5 × 10⁻⁵ K).
 Recordings without a factory calibration, such as ResearchIR user
 calibrations, are exported as counts only. *Export → Save ROI set…* stores the
 ROIs and the ignition frame next to the recording (`<file>.rois.json`) for
-reuse and for multi-camera workbooks.
+reuse and for multi-camera workbooks; it also keeps which ROIs were split from
+one box, so cell zones can be re-split after loading.
+
+Options for many ROIs (they start this way above 8 areas, such as cell zones):
+*Area means from the mean signal* stores no per-pixel columns (an area's mean
+is then the temperature of its mean counts, the same for an even area), and
+*Max and min* can be left out. Excel reads every formula when it opens a
+workbook, so fewer columns, a shorter time range or a longer interval open
+faster.
+
+## Cell zones and one emissivity
+
+For a battery module seen from the side:
+
+1. *Measurement → Fit Emissivity from TCs…* with the test's logger file (see
+   below). This puts the logger and the recording on one clock and finds each
+   thermocouple's pixel.
+2. Draw a box over the row of cells (for the fire tests, the top slice above
+   the metal plate), select it and press the toolbar's columns button. Choose
+   the number of zones (18), where zone 1 is (the heater end), the gap between
+   zones (1 px leaves out the mixed pixels where two cells meet) and the box
+   edges in pixels. The zones preview on the image, and the dialog says which
+   zone each TC pixel falls in: TCs on cells 3, 6 and 9 should land in zones 3,
+   6 and 9.
+3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
+   ticked: each TC is paired with its zone, the logger data sit at the fitted
+   time offset, and Use = 1 marks the seconds the fit used (no flames on the TC,
+   IR in range). Only the zones with a TC are compared, which keeps the workbook
+   quick to open.
+4. In the workbook, the Emissivity Match sheet gives the best emissivity within
+   the limits; set it on Settings.
+
+Without a TC fit, paste the logger data on TC Compare and pick each zone's TC
+on Settings; the ignition frame must then be logger time 0. Equal zone widths
+assume the camera faces the side square on. TCs on the top face can read the
+jet flames and run hotter than the surface the camera sees, which pulls the
+best value toward the lower limit; the sheet says so.
 
 ## Emissivity from thermocouples
 

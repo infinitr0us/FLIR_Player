@@ -43,10 +43,12 @@ from .export_dialogs import (
     confirm_replace,
 )
 from .excel_dialog import ExcelExportDialog
-from .excel_export import RoiSet, load_roi_set, roi_set_path, save_roi_set
+from .excel_export import RoiSet, ZoneGroup, load_roi_set, roi_set_path, save_roi_set
 from .extract import ExtractDialog
 from .tc_dialog import TcCalibrationDialog, TcResultsDialog
 from .tcmatch import roi_shapes, workbook_origin
+from .zone_dialog import ZoneSplitDialog
+from .zones import ZoneSpec, normalized_box
 from .geometry import roi_coordinates
 from .settings import app_settings
 from .models import (
@@ -153,6 +155,8 @@ class MainWindow(QMainWindow):
         self._roi_next_id = 1
         self._roi_name_counts: dict[str, int] = {}
         self._selected_roi_id: int | None = None
+        self._zone_groups: list[dict] = []  # zones split from one box: ids, ZoneSpec, the box's name
+        self._zone_defaults = ZoneSpec(box=((0.0, 0.0), (1.0, 1.0)))  # count, end, gap, names last used
         self._extract_progress: ProgressDialog | None = None
         self._export_progress: ProgressDialog | None = None
         self.show_clipping = True
@@ -358,6 +362,7 @@ class MainWindow(QMainWindow):
         self.color_scale.isotherm_dragged.connect(self._isotherm_dragged)
         self.analysis_toolbar.tool_changed.connect(self.canvas.set_roi_tool)
         self.analysis_toolbar.delete_requested.connect(self._delete_selected_roi)
+        self.analysis_toolbar.split_requested.connect(self._split_zones)
         self.analysis_toolbar.stats_toggled.connect(self._toggle_statistics)
         self.analysis_toolbar.zoom_in_requested.connect(lambda: self.canvas.zoom_step(1))
         self.analysis_toolbar.zoom_out_requested.connect(lambda: self.canvas.zoom_step(-1))
@@ -759,10 +764,89 @@ class MainWindow(QMainWindow):
     def _clear_rois(self) -> None:
         self._rois = []
         self._tc_roi_ids: set[int] = set()  # ROIs from "Fit Emissivity from TCs" (ids restart)
+        self._zone_groups = []
         self._roi_next_id = 1
         self._roi_name_counts = {}
         self._selected_roi_id = None
         self.canvas.set_rois([], None)
+
+    # --- cell zones ----------------------------------------------------------------
+
+    def _zone_group_of(self, roi_id: int | None) -> dict | None:
+        """The split this ROI came from, if any of its zones still exist."""
+        present = {shape.id for shape in self._rois}
+        self._zone_groups = [g for g in self._zone_groups if present & set(g["ids"])]
+        return next((g for g in self._zone_groups if roi_id in g["ids"]), None)
+
+    def _tc_pixels(self) -> dict[str, tuple[int, int]]:
+        """TC → (row, col) from this session's TC fit of the open recording."""
+        if self.metadata is None:
+            return {}
+        output = self._tc_runs.get(str(self.metadata.path), {}).get("output")
+        if output is None:
+            return {}
+        return {ch.name: tuple(ch.match.pixel) for ch in output.result.channels
+                if ch.match.found and ch.match.pixel is not None}
+
+    def _split_zones(self) -> None:
+        """Split the selected box into equal zones, or re-split / join the zones of an earlier split."""
+        if self.metadata is None or self.current_packet is None or self._busy:
+            return
+        selected = next((shape for shape in self._rois if shape.id == self._selected_roi_id), None)
+        group = self._zone_group_of(self._selected_roi_id)
+        if group is not None:
+            spec, replaced, box_name = group["spec"], set(group["ids"]), group["name"]
+        elif selected is not None and selected.kind == "rect":
+            d = self._zone_defaults
+            spec = ZoneSpec(box=normalized_box(selected.points), count=d.count, start=d.start, gap=d.gap,
+                            prefix=d.prefix)
+            replaced, box_name = {selected.id}, selected.name
+        else:
+            self._notify("Select a box ROI to split into zones (or a zone to re-split)")
+            return
+        self.pause_playback(invalidate=True)
+        width, height = self.metadata.width, self.metadata.height
+        others = [shape for shape in self._rois if shape.id not in replaced]
+        base = max([shape.id for shape in self._rois] + [self._roi_next_id]) + 1
+
+        def preview(zones) -> None:
+            shapes = [RoiShape(base + k, "rect", points, name) for k, (name, points) in enumerate(zones)]
+            self.canvas.set_rois(others + shapes, None)
+
+        dialog = ZoneSplitDialog(spec, width, height, tc_pixels=self._tc_pixels(), regroup=group is not None,
+                                 parent=self)
+        dialog.preview.connect(preview)
+        code = dialog.exec()
+        if code == ZoneSplitDialog.DialogCode.Accepted and dialog.zones():
+            new_spec = dialog.spec()
+            self._zone_defaults = new_spec
+            zones = [RoiShape(self._roi_next_id + k, "rect", points, name)
+                     for k, (name, points) in enumerate(dialog.zones())]
+            self._roi_next_id += len(zones)
+            self._replace_with(replaced, zones)
+            if group is not None:
+                self._zone_groups.remove(group)
+            self._zone_groups.append({"ids": [z.id for z in zones], "spec": new_spec, "name": box_name})
+            self._notify(f"Split into {len(zones)} zones: {zones[0].name} to {zones[-1].name}")
+        elif code == ZoneSplitDialog.JOIN and group is not None:
+            box = RoiShape(self._roi_next_id, "rect", tuple(group["spec"].box), box_name)
+            self._roi_next_id += 1
+            self._replace_with(replaced, [box])
+            self._zone_groups.remove(group)
+            self._selected_roi_id = box.id
+            self._notify(f"Joined the zones back into {box_name}")
+        self._push_rois()  # also restores the canvas after a cancel
+
+    def _replace_with(self, ids: set[int], shapes: list[RoiShape]) -> None:
+        """Put ``shapes`` where the first of ``ids`` was in the ROI list and drop the others."""
+        position = next((k for k, shape in enumerate(self._rois) if shape.id in ids), len(self._rois))
+        kept = [shape for shape in self._rois if shape.id not in ids]
+        before = sum(1 for shape in self._rois[:position] if shape.id not in ids)
+        self._rois = kept[:before] + list(shapes) + kept[before:]
+        if self._selected_roi_id in ids:
+            self._selected_roi_id = None
+        if not self.bottom_panel.isVisible():
+            self._toggle_statistics(True)
 
     # --- statistics panel ------------------------------------------------------
 
@@ -1082,15 +1166,20 @@ class MainWindow(QMainWindow):
 
     def _roi_set(self) -> RoiSet:
         metadata = self.metadata
+        self._zone_group_of(None)  # forget splits whose zones are all gone
+        position = {shape.id: k for k, shape in enumerate(self._rois)}
+        groups = tuple(ZoneGroup(rois=tuple(position[i] for i in g["ids"] if i in position), spec=g["spec"],
+                                 name=g["name"]) for g in self._zone_groups)
         return RoiSet(rois=tuple(self._rois), ignition_frame=self._ignition_frame(),
-                      recording=metadata.path.name, size=(metadata.width, metadata.height))
+                      recording=metadata.path.name, size=(metadata.width, metadata.height), zone_groups=groups)
 
     def _open_excel_dialog(self) -> None:
         if self.metadata is None or self.current_packet is None or self._busy:
             return
         self.pause_playback(invalidate=True)
         dialog = ExcelExportDialog(self.metadata, tuple(self._rois), self.current_packet.index,
-                                   ignition_frame=self._ignition_frame(), parent=self)
+                                   ignition_frame=self._ignition_frame(),
+                                   tc_run=self._tc_runs.get(str(self.metadata.path), {}).get("output"), parent=self)
         if dialog.exec() != ExcelExportDialog.DialogCode.Accepted:
             return
         params = dialog.parameters()
@@ -1135,13 +1224,21 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as exc:
             self._show_error("Load ROI set", f"{type(exc).__name__}: {exc}")
             return
-        kept = [shape for shape in roi_set.rois if self._covers_pixels(shape.kind, shape.points)]
         self._clear_rois()
-        for shape in kept:
+        ids: dict[int, int] = {}  # position in the set → new id
+        for k, shape in enumerate(roi_set.rois):
+            if not self._covers_pixels(shape.kind, shape.points):
+                continue
             self._rois.append(RoiShape(id=self._roi_next_id, kind=shape.kind, points=shape.points,
                                        name=shape.name))
+            ids[k] = self._roi_next_id
             self._roi_next_id += 1
             self._roi_name_counts[shape.kind] = self._roi_name_counts.get(shape.kind, 0) + 1
+        kept = list(self._rois)
+        for group in roi_set.zone_groups:
+            members = [ids[k] for k in group.rois if k in ids]
+            if members:
+                self._zone_groups.append({"ids": members, "spec": group.spec, "name": group.name})
         if roi_set.ignition_frame is not None and roi_set.recording == self.metadata.path.name                 and 0 <= roi_set.ignition_frame < self.metadata.num_frames:
             self._ignition_frames[str(self.metadata.path)] = roi_set.ignition_frame
         skipped = len(roi_set.rois) - len(kept)

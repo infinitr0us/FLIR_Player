@@ -19,6 +19,7 @@ from matplotlib import font_manager
 
 from .models import ROI_COLORS, RoiShape, RoiStats
 from .render import format_tick, legend_colors
+from .zones import short_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +131,27 @@ def _draw_rois(
         else:
             continue
         if with_names:
-            _draw_label(draw, shape.name, anchor, anchor="ls", size=12, outline=color)
+            text = _fitting_label(draw, shape, first, second) if shape.kind in ("rect", "ellipse") else shape.name
+            if text is not None:
+                _draw_label(draw, text, anchor, anchor="ls", size=12, outline=color)
+
+
+def _fitting_label(draw: ImageDraw.ImageDraw, shape: RoiShape, first, second) -> str | None:
+    """As on the canvas: a box narrower than its name shows only the name's trailing number, or
+    no label; names without a trailing number are kept."""
+    short = short_label(shape.name)
+    if short is None:
+        return shape.name
+    width = abs(second[0] - first[0])
+    font = _font(12)
+
+    def size(text: str) -> float:
+        left, _top, right, _bottom = draw.textbbox((0, 0), text, font=font)
+        return right - left + 8
+
+    if size(shape.name) <= width:
+        return shape.name
+    return short if size(short) <= width + 2 else None
 
 
 def _draw_markers(

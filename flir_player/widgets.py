@@ -65,6 +65,7 @@ from .settings import app_settings
 from .fff import describe_parameters
 from .geometry import area_extent, pixel_index
 from .models import ROI_COLORS, ROI_KIND_LABELS, CadenceInfo, UnitOption, VideoMetadata
+from .zones import short_label
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
 from .render import (
     format_spread,
@@ -368,6 +369,7 @@ class AnalysisToolbar(QFrame):
 
     tool_changed = Signal(str)
     delete_requested = Signal()
+    split_requested = Signal()
     stats_toggled = Signal(bool)
     zoom_in_requested = Signal()
     zoom_out_requested = Signal()
@@ -418,6 +420,14 @@ class AnalysisToolbar(QFrame):
         self.delete_button.clicked.connect(self.delete_requested)
         layout.addWidget(self.delete_button)
 
+        self.split_button = QToolButton()
+        self.split_button.setObjectName("AnalysisButton")
+        self.split_button.setIcon(awesome_icon("fa6s.table-columns", ICON_SECONDARY))
+        self.split_button.setIconSize(QSize(16, 16))
+        self.split_button.setToolTip("Split the selected box into cell zones (or re-split zones)…")
+        self.split_button.clicked.connect(self.split_requested)
+        layout.addWidget(self.split_button)
+
         layout.addSpacing(4)
         layout.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(4)
@@ -457,6 +467,7 @@ class AnalysisToolbar(QFrame):
             button.setEnabled(enabled)
         self.stats_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
+        self.split_button.setEnabled(enabled)
         self.zoom_in_button.setEnabled(enabled)
         self.zoom_out_button.setEnabled(enabled)
         self.zoom_fit_button.setEnabled(enabled)
@@ -1242,7 +1253,7 @@ class ThermalCanvas(QWidget):
         painter.setPen(QPen(color, 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         self._draw_roi_geometry(painter, shape.kind, shape.points)
-        self._paint_roi_label(painter, shape, color)
+        self._paint_roi_label(painter, shape, color, selected)
         if selected:
             for _, handle_pos in self._handles_for(shape):
                 painter.setPen(QPen(QColor("#07090A"), 1))
@@ -1274,13 +1285,16 @@ class ThermalCanvas(QWidget):
         elif kind == "ellipse":
             painter.drawEllipse(QRectF(first, second).normalized())
 
-    def _paint_roi_label(self, painter: QPainter, shape, color: QColor) -> None:
+    def _paint_roi_label(self, painter: QPainter, shape, color: QColor, selected: bool = False) -> None:
         anchor = self._label_anchor(shape)
         if anchor is None:
             return
         painter.setFont(QFont("Segoe UI", 10))
         metrics = painter.fontMetrics()
-        text_rect = metrics.boundingRect(shape.name).adjusted(-6, -3, 6, 3)
+        text = self._fitting_label(shape, metrics, selected)
+        if text is None:
+            return
+        text_rect = metrics.boundingRect(text).adjusted(-6, -3, 6, 3)
         text_rect.moveBottomLeft(
             QPoint(int(anchor.x()), int(anchor.y()) - 6)
         )
@@ -1289,7 +1303,21 @@ class ThermalCanvas(QWidget):
         painter.fillPath(path, QColor(9, 13, 15, 200))
         painter.strokePath(path, QPen(color, 1))
         painter.setPen(QColor("#F4F6F7"))
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, shape.name)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _fitting_label(self, shape, metrics, selected: bool) -> str | None:
+        """The label for a box or ellipse narrower than its name: only the name's trailing number
+        ("Cell 7" → "7", so cell zones stay readable), or none until zoomed in. Other names and
+        the selected ROI keep their full label."""
+        short = short_label(shape.name)
+        if selected or short is None or shape.kind not in ("rect", "ellipse") or len(shape.points) != 2:
+            return shape.name
+        first = self._image_to_widget(*shape.points[0])
+        second = self._image_to_widget(*shape.points[1])
+        width = abs(second.x() - first.x())
+        if metrics.horizontalAdvance(shape.name) + 12 <= width:
+            return shape.name
+        return short if metrics.horizontalAdvance(short) + 12 <= width + 2 else None
 
     def _label_anchor(self, shape) -> QPointF | None:
         if shape.kind == "cursor" and len(shape.points) == 1:
