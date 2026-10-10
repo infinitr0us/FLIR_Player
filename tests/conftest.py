@@ -123,6 +123,31 @@ def qapp():
     return app
 
 
+@pytest.fixture(scope="session", autouse=True)
+def qt_session_teardown():
+    """Delete every remaining widget while the QApplication still exists.
+
+    PySide6 6.12 can crash during interpreter shutdown when parentless dialogs
+    created by tests are destroyed after the application object (all tests
+    passed, but the process exit code was not 0 on CI).
+    """
+    yield
+    import gc
+
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    gc.collect()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 @pytest.fixture(autouse=True)
 def guard_gui_lifecycle(monkeypatch):
     from flir_player.main_window import MainWindow
