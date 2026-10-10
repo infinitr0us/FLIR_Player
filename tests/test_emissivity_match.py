@@ -42,16 +42,18 @@ def _zone_temps(rows: int, zones: int) -> dict[str, np.ndarray]:
     return {f"Cell {k + 1}": 20.0 + 500.0 * np.clip((t - 5 * k) / 40.0, 0.0, 1.0) for k in range(zones)}
 
 
-def _counts(temp_c, eps):
-    k1, k2 = coefficients(T650, PARAMS.with_(emissivity=eps))
+def _counts(temp_c, eps, params=PARAMS):
+    k1, k2 = coefficients(T650, params.with_(emissivity=eps))
     return (T650.planck.signal(np.asarray(temp_c) + KELVIN) + k2) / k1
 
 
-def _zone_source(rows: int = 60, zones: int = 6, eps: dict[str, float] | None = None) -> tuple[SourceData, dict]:
-    temps = _zone_temps(rows, zones)
+def _zone_source(rows: int = 60, zones: int = 6, eps: dict[str, float] | None = None, params=None,
+                 temps: dict[str, np.ndarray] | None = None, label: str = "T650sc") -> tuple[SourceData, dict]:
+    params = params or PARAMS
+    temps = temps or _zone_temps(rows, zones)
     rois = []
     for k, (name, temp) in enumerate(temps.items()):
-        mean = _counts(temp, (eps or {}).get(name, TRUE_EPS))
+        mean = _counts(temp, (eps or {}).get(name, TRUE_EPS), params)
         counts = {"mean": mean, "max": mean + 15.0, "min": mean - 15.0}
         status = count_status(T650, counts["min"], counts["max"]).astype(np.int8)
         shape = RoiShape(k + 1, "rect", ((10.0 + 5 * k, 10.0), (14.0 + 5 * k, 14.0)), name)
@@ -62,10 +64,10 @@ def _zone_source(rows: int = 60, zones: int = 6, eps: dict[str, float] | None = 
             "frames": rows * 30, "fps": 30.0, "start": start, "end": start + timedelta(seconds=rows),
             "ignition_frame": 0, "calibration": "test calibration", "saturation_threshold": None}
     report = CalibrationReport(T650, "verified", "test calibration")
-    source = SourceData(spec=SourceSpec(Path(info["file"]), tuple(r.shape for r in rois)), label="T650sc", info=info,
+    source = SourceData(spec=SourceSpec(Path(info["file"]), tuple(r.shape for r in rois)), label=label, info=info,
                         fps=30.0, num_frames=rows * 30, frames=np.arange(rows) * 30,
                         clock=[start + timedelta(seconds=float(i)) for i in range(rows)], rois=rois, report=report,
-                        initial=PARAMS, file_parameters=PARAMS, validation_rows=np.empty(0, int))
+                        initial=params, file_parameters=params, validation_rows=np.empty(0, int))
     return source, temps
 
 
@@ -135,10 +137,10 @@ def test_hot_reading_tcs_pin_the_best_value_at_the_lowest_limit(tmp_path) -> Non
     source, temps = _zone_source()
     match = _Match(_write(tmp_path, source, _prefill(temps, offset_k=40.0)), 2)
     assert match.best == pytest.approx(0.90)
-    assert match.note.startswith("At the lowest emissivity allowed")
+    assert match.note.startswith("The best value is the lowest emissivity allowed") and "read colder" in match.note
     cold = _Match(_write(tmp_path, source, _prefill(temps, offset_k=-40.0), name="b.xlsx"), 2)
     assert cold.best == pytest.approx(0.98)
-    assert cold.note.startswith("At the highest emissivity allowed")
+    assert cold.note.startswith("The best value is the highest emissivity allowed") and "read hotter" in cold.note
 
 
 def test_tcs_on_differently_painted_zones_are_called_out(tmp_path) -> None:
@@ -476,8 +478,10 @@ def test_z6_direct_references_leave_string_literals_alone() -> None:
 @pytest.mark.parametrize("eps, note", [
     (0.904, "Inside the limits: the best match lies between the lowest candidates"),
     (0.976, "Inside the limits: the best match lies between the highest candidates"),
-    (0.85, "At the lowest emissivity allowed"),
-    (1.0, "At the highest emissivity allowed"),
+    (0.85, "The best value is the lowest emissivity allowed; the best match may lie below it. There the zones "
+           "read colder"),  # cold surroundings: at 0.90 a surface of 0.85 reads cold
+    (1.0, "The best value is the highest emissivity allowed; the best match may lie above it. There the zones "
+          "read hotter"),
 ])
 def test_z7_a_limit_note_needs_the_error_to_keep_falling_beyond_it(tmp_path, eps, note) -> None:
     match = _Match(_match_with(tmp_path, f"edge_{eps}.xlsx", eps={"Cell 3": eps, "Cell 6": eps}), 2)
@@ -496,7 +500,9 @@ def test_z7_each_roi_keeps_its_own_probe_and_own_value(tmp_path) -> None:
     plus = [ws.cell(h0 + 2, 14 + k).value for k in range(2)]
     assert minus[0] != pytest.approx(minus[1]) and plus[0] != pytest.approx(plus[1])
     assert plus[0] > minus[0] and plus[1] > minus[1]  # both want less than 0.90
-    assert ws.cell(h0 + 3, 12).value == pytest.approx(0.05) and ws.cell(h0 + 2 + 96, 12).value == pytest.approx(1.0)
+    assert ws.cell(h0 + 4, 12).value == pytest.approx(0.05) and ws.cell(h0 + 3 + 96, 12).value == pytest.approx(1.0)
+    bias = [ws.cell(h0 + 3, 14 + k).value for k in range(2)]
+    assert bias[0] < 0 and bias[1] < 0  # both truly below 0.90: at 0.90 they read cold (20 °C surroundings)
     formulas = openpyxl.load_workbook(path)[MATCH]
     assert formulas.row_dimensions[h0 + 1].hidden and formulas.row_dimensions[h0 + 50].hidden
 
@@ -515,3 +521,30 @@ def test_z8_repeated_mapped_names_are_refused_in_every_recording(tmp_path) -> No
                       created=datetime(2026, 10, 10), versions={"tool": "test", "sdk": ""})
     with pytest.raises(ValueError, match="Camera B: more than one ROI is named Cell 3"):
         write(tmp_path / "twice.xlsx", data)
+
+
+def test_r1_hot_surroundings_reverse_the_direction_and_the_note_follows_the_residuals(tmp_path) -> None:
+    """Reflected 500 °C above zones at ~200 °C: a higher emissivity makes the IR hotter, not colder."""
+    hot = PARAMS.with_(reflected_k=773.15)
+    temps = {f"Cell {k + 1}": 190.0 + 20.0 * np.linspace(0, 1, 60) for k in range(6)}
+    source, temps = _zone_source(eps={"Cell 3": 0.85, "Cell 6": 0.85}, params=hot, temps=temps)
+    match = _Match(_write(tmp_path, source, _prefill(temps)), 2)
+    assert match.best == pytest.approx(0.90)
+    assert match.note.startswith("The best value is the lowest emissivity allowed") and "read hotter" in match.note
+    assert match.pairs["Cell 3"][6] > 0  # bias at Settings' 0.95: hotter too
+
+
+def test_r2_hidden_helper_rows_never_cover_the_pairs_table_or_the_chart(tmp_path) -> None:
+    from flir_player.workbook import CHART_ROWS
+
+    sources = [_zone_source(zones=18, label=f"Camera {k}")[0] for k in (1, 2, 3)]
+    data = ExportData(times=np.arange(60, dtype=float), sources=sources, options=ExportOptions(area_means="signal"),
+                      created=datetime(2026, 10, 10), versions={"tool": "test", "sdk": ""})
+    write_workbook(tmp_path / "many.xlsx", data)
+    ws = openpyxl.load_workbook(tmp_path / "many.xlsx")[MATCH]
+    p0, n = 13, 54
+    assert [ws.cell(p0 + k, 1).value for k in (0, n - 1)] == ["Cell 1", "Cell 18"]
+    visible = range(1, p0 + n + 1 + CHART_ROWS)
+    assert not any(ws.row_dimensions[r].hidden for r in visible)
+    hidden = [r for r in range(1, ws.max_row + 1) if ws.row_dimensions[r].hidden]
+    assert hidden and min(hidden) > p0 + n + CHART_ROWS and len(hidden) == 4 + 96

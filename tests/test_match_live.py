@@ -114,7 +114,8 @@ def test_excel_reproduces_the_python_match(excel, tmp_path) -> None:
         book.Close(False)
 
 
-@pytest.mark.parametrize("offset_k, text", [(40.0, "At the lowest"), (-40.0, "At the highest")])
+@pytest.mark.parametrize("offset_k, text", [(40.0, "The best value is the lowest"),
+                                             (-40.0, "The best value is the highest")])
 def test_excel_notes_for_values_at_a_limit(excel, tmp_path, offset_k, text) -> None:
     source, temps = _zone_source()
     path = _write(tmp_path, source, _prefill(temps, offset_k=offset_k))
@@ -171,7 +172,22 @@ def test_excel_limit_notes_follow_the_error_beyond_the_limit(excel, tmp_path, ep
         h0 = 13 + MATCH_CANDIDATES + 1
         _compare_sheet(book, path, (9,), (4,))  # the note
         _compare_sheet(book, path, range(13, 15), range(2, 11))  # pairs, own values from the grid
-        _compare_sheet(book, path, range(h0 + 1, h0 + 3), range(12, 16), rel=1e-6)  # best ± 0.001
-        _compare_sheet(book, path, range(h0 + 3, h0 + 3 + 96, 7), range(12, 16), rel=1e-6)  # the grid, sampled
+        _compare_sheet(book, path, range(h0 + 1, h0 + 4), range(12, 16), rel=1e-6)  # best ± 0.001, bias there
+        _compare_sheet(book, path, range(h0 + 4, h0 + 4 + 96, 7), range(12, 16), rel=1e-6)  # the grid, sampled
+    finally:
+        book.Close(False)
+
+
+def test_excel_notes_follow_the_residuals_with_hot_surroundings(excel, tmp_path) -> None:
+    from test_emissivity_match import PARAMS, _prefill, _write, _zone_source
+
+    hot = PARAMS.with_(reflected_k=773.15)
+    temps = {f"Cell {k + 1}": 190.0 + 20.0 * np.linspace(0, 1, 60) for k in range(6)}
+    source, temps = _zone_source(eps={"Cell 3": 0.85, "Cell 6": 0.85}, params=hot, temps=temps)
+    path = _write(tmp_path, source, _prefill(temps))
+    book = _open(excel, path)
+    try:
+        _compare_sheet(book, path, (9,), (4,))
+        assert "read hotter" in book.Worksheets("Emissivity Match").Range("D9").Value
     finally:
         book.Close(False)

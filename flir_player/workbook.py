@@ -60,6 +60,16 @@ MATCH_DEFAULTS = (0.90, 0.98, 0.01)  # lowest, highest emissivity and step: the 
 MATCH_CANDIDATES = 41  # rows of the candidate table (step 0.002 still spans 0.90-0.98)
 OWN_GRID = tuple(round(0.05 + 0.01 * k, 2) for k in range(96))  # each TC's own value: best of 0.05 … 1.00
 PROBE = 0.001  # the error just inside a limit tells whether the best match lies beyond it
+CHART_ROWS = 21  # rows the Match chart covers below the pairs table
+NOTE_LOW = "The best value is the lowest emissivity allowed; the best match may lie below it."
+NOTE_HIGH = "The best value is the highest emissivity allowed; the best match may lie above it."
+# what the zones read at the best value, from the signs of the ROIs' mean IR − TC there (with a hot surrounding
+# the IR responds to emissivity the other way, so the side of the limit says nothing about the sign)
+NOTE_COLD = (" There the zones read colder than their TCs: the TCs may read flames or hot gas (TCs on the top face "
+             "run hotter than the side the camera sees), or the zones emit less (unpainted).")
+NOTE_HOT = (" There the zones read hotter than their TCs: flames or hot gas in front of the zones, reflections, or "
+            "TCs reading low (loose contact).")
+NOTE_MIXED = " There some zones read hotter and others colder than their TCs."
 TC_BLOCK = 10  # TC Compare columns per ROI
 # Chart colours. Up to 8 ROIs keep the workbook's own palette; more (cell zones) take one blue
 # ramp in ROI order, so neighbouring cells read as neighbours (the reference sequential steps
@@ -1141,6 +1151,10 @@ class _Writer:
         own = [rows[l.number]["own"] for l in layouts
                if rows[l.number]["include"] and math.isfinite(rows[l.number]["own"])]
         probes = [math.nan, math.nan]  # the error over all TCs at the best value − PROBE and + PROBE
+        for layout in layouts:
+            entry = rows[layout.number]
+            entry["bias_best"] = (entry["stats"](eps[best])[1] if best is not None and entry["include"]
+                                  and entry["rows"] else math.nan)
         if best is not None:
             for side, delta in enumerate((-PROBE, PROBE)):
                 errs = []
@@ -1193,8 +1207,11 @@ class _Writer:
         p0 = 12  # first ROI row of the pairs table (columns A-J)
         c0, cc = p0, 11  # first candidate row and column (L): the candidate table sits to the right
         last_c = c0 + MATCH_CANDIDATES - 1
-        h0 = last_c + 2  # hidden helper rows: the best value ± PROBE, then the own-value grid
-        g0, g1 = h0 + 3, h0 + 2 + len(OWN_GRID)
+        chart_row = p0 + max(n, 1) + 1  # the chart sits under the pairs table
+        # hidden helper rows (the best value ± PROBE, each ROI's bias there, the own-value grid) start below the
+        # pairs table, the candidate table and the chart, so hiding them hides nothing else
+        h0 = max(last_c + 2, chart_row + CHART_ROWS + 1)
+        g0, g1 = h0 + 4, h0 + 3 + len(OWN_GRID)
         grid_eps = _range(M, g0, cc, g1, cc)
         eps_range = _range(M, c0, cc, last_c, cc)
         all_range = _range(M, c0, cc + 1, last_c, cc + 1)
@@ -1220,11 +1237,6 @@ class _Writer:
                                f'{{=IFERROR(SQRT(SUM(IF(({include}="Yes")*ISNUMBER({now}),{now}^2))/'
                                f'SUM(({include}="Yes")*ISNUMBER({now}))),"–")}}', self.f_k,
                                ref["now"] if math.isfinite(ref["now"]) else "–")
-        low_text = ("At the lowest emissivity allowed: even there the zones read colder than their TCs. The TCs may "
-                    "read flames or hot gas (TCs on the top face run hotter than the side the camera sees), or the "
-                    "zones emit less (unpainted).")
-        high_text = ("At the highest emissivity allowed: even there the zones read hotter than their TCs: flames or "
-                     "hot gas in front of the zones, reflections, or TCs reading low (loose contact).")
         none_text = ("No ROI has rows to compare yet: pick each zone's TC on Settings, and check Use (TC Compare) "
                      "and the window.")
         one_text = "Only one emissivity is tried: the lowest and highest emissivity are the same."
@@ -1232,14 +1244,16 @@ class _Writer:
                     "it).")
         near_high = ("Inside the limits: the best match lies between the highest candidates (a finer step shows "
                      "it).")
-        # at a limit, the error just inside it says whether the best match lies beyond the limit
+        # at a limit, the error just inside it says whether the best match may lie beyond the limit; the signs
+        # of the ROIs' mean IR − TC there say whether the zones read hotter or colder
+        side = (f'IF(COUNTIF(MATCH_BIASROW,">0")=0,"{NOTE_COLD}",IF(COUNTIF(MATCH_BIASROW,"<0")=0,"{NOTE_HOT}",'
+                f'"{NOTE_MIXED}"))')
         ws.write_formula(8, 3, f'=IF(NOT(ISNUMBER(MATCH_BEST)),"{none_text}",IF(MATCH_HI-MATCH_LO<1E-9,"{one_text}",'
                                f'IF(MATCH_BEST<=MATCH_LO+1E-9,IF(IFERROR(MATCH_PLUS<MATCH_ERRBEST,FALSE),'
-                               f'"{near_low}","{low_text}"),IF(MATCH_BEST>=MATCH_HI-1E-9,'
-                               f'IF(IFERROR(MATCH_MINUS<MATCH_ERRBEST,FALSE),"{near_high}","{high_text}"),'
+                               f'"{near_low}","{NOTE_LOW}"&{side}),IF(MATCH_BEST>=MATCH_HI-1E-9,'
+                               f'IF(IFERROR(MATCH_MINUS<MATCH_ERRBEST,FALSE),"{near_high}","{NOTE_HIGH}"&{side}),'
                                f'"Inside the limits."))))', self.f_note,
-                         self._limit_note(ref, eps, lo, hi, none_text, one_text, low_text, high_text, near_low,
-                                          near_high))
+                         self._limit_note(ref, eps, lo, hi, none_text, one_text, near_low, near_high, layouts))
         own = _range(M, p0, 8, p0 + max(n, 1) - 1, 8)
         mask = f'({include}="Yes")*ISNUMBER({own})'
         spread_cached = ""
@@ -1355,7 +1369,7 @@ class _Writer:
                               "line": {"width": 1.5, "color": color},
                               "marker": {"type": "circle", "size": 5, "fill": {"color": color},
                                          "border": {"color": color}}})
-        ws.insert_chart(p0 + max(n, 1) + 1, 0, chart)
+        ws.insert_chart(chart_row, 0, chart)
         ws.set_column(0, 0, 22)
         ws.set_column(1, 2, 16)
         ws.set_column(3, 3, 9)
@@ -1366,7 +1380,7 @@ class _Writer:
         for k, has in enumerate(paired):  # ROIs without a TC at export are hidden, unless none has one yet
             ws.set_column(cc + 2 + k, cc + 2 + k, 14, None, {"hidden": True} if any(paired) and not has else {})
 
-    def _limit_note(self, ref, eps, lo, hi, none_text, one_text, low_text, high_text, near_low, near_high) -> str:
+    def _limit_note(self, ref, eps, lo, hi, none_text, one_text, near_low, near_high, layouts) -> str:
         """The cached result of the limit note."""
         best = ref["best"]
         if best is None:
@@ -1375,10 +1389,14 @@ class _Writer:
             return one_text
         error = ref["combined"][best]
         minus, plus = ref["probes"]
+        biases = [ref["rows"][layout.number]["bias_best"] for layout in layouts]
+        biases = [b for b in biases if math.isfinite(b)]
+        side = (NOTE_COLD if not any(b > 0 for b in biases) else NOTE_HOT if not any(b < 0 for b in biases)
+                else NOTE_MIXED)
         if eps[best] <= lo + 1e-9:
-            return near_low if math.isfinite(plus) and plus < error else low_text
+            return near_low if math.isfinite(plus) and plus < error else NOTE_LOW + side
         if eps[best] >= hi - 1e-9:
-            return near_high if math.isfinite(minus) and minus < error else high_text
+            return near_high if math.isfinite(minus) and minus < error else NOTE_HIGH + side
         return "Inside the limits."
 
     def _match_helpers(self, ws, layouts, ref, eps, p0, cc, h0, g0) -> None:
@@ -1387,8 +1405,22 @@ class _Writer:
         M = MATCH
         n = len(layouts)
         ws.set_row(h0, None, None, {"hidden": True})
-        ws.write(h0, cc, "Helper rows: the best value ± 0.001, then each ROI's own-value search", self.f_note)
+        ws.write(h0, cc, "Helper rows: the best value ± 0.001, each ROI's mean IR − TC there, then each ROI's "
+                         "own-value search", self.f_note)
         best = ref["best"]
+        r = h0 + 3
+        ws.set_row(r, None, None, {"hidden": True})
+        ws.write_formula(r, cc, "=MATCH_BEST", self.f_eps, eps[best] if best is not None else "–")
+        bias_cells = _range(M, r, cc + 2, r, cc + 1 + max(n, 1))
+        self.wb.define_name("MATCH_BIASROW", "=" + bias_cells)
+        for k, layout in enumerate(layouts):
+            pr = p0 + k + 1
+            value = ref["rows"][layout.number]["bias_best"]
+            ws.write_array_formula(
+                r, cc + 2 + k, r, cc + 2 + k,
+                f'{{=IF(OR(NOT(ISNUMBER(MATCH_BEST)),$D${pr}<>"Yes",N($E${pr})=0),NA(),'
+                f'IFERROR({self._bias(layout, "MATCH_BEST")},NA()))}}', self.f_k,
+                value if math.isfinite(value) else "#N/A")
         for side, delta in enumerate((-PROBE, PROBE)):
             r = h0 + 1 + side
             ws.set_row(r, None, None, {"hidden": True})
