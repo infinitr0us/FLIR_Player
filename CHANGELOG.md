@@ -27,8 +27,9 @@ and the workbook finds that emissivity.
 - **Emissivity Match** sheet: for every candidate emissivity between two limits
   (0.90 to 0.98 in steps of 0.01 to start), the error between each ROI and its
   TC and over all TCs, the best value, a chart of error against emissivity, each
-  TC's own best value, and plain notes when the best value sits at a limit or
-  the TCs want clearly different values.
+  TC's own best value (the lowest error between 0.05 and 1.00), and plain notes
+  when the best match lies beyond a limit or the TCs want clearly different
+  values. A step too fine for the table's 41 rows is widened.
 - TC Compare gets a *Use* column (1 or 0) per ROI, picking the rows the match
   counts, and a *Fit row* column showing them.
 - *Fill TC Compare from the last TC fit* in the export dialog: the logger data at
@@ -41,9 +42,30 @@ and the workbook finds that emissivity.
   now cite Settings cells instead of defined names, which Excel resolves slowly
   when it opens a file (the names stay defined). An 18-zone workbook of a whole
   test (4,807 rows) opened in about 3 minutes; filled from the TC fit it now
-  opens in about 11 seconds.
+  opens in about 13 seconds.
 - With more than 8 ROIs, the "All ROIs" chart colours them in order along one
-  blue ramp, and only ROIs with a TC get their own chart.
+  blue ramp, and (when the TC fit paired some) only ROIs with a TC get their own
+  chart.
+- ROIs and TCs are paired by name, so repeated names are refused: the zone
+  dialog will not reuse names other ROIs carry, and the export says which
+  recording has two ROIs of one name.
+
+### Under the hood
+
+- `zones` (Qt-free) splits boxes and pairs TC pixels with ROIs;
+  `tcmatch.tc_prefill` takes the player's ROIs and ignition frame; events keep
+  the seconds their fit used.
+- The Emissivity Match formulas are array formulas over named ranges, written
+  with Python-computed results for viewers that do not recalculate; opt-in tests
+  check that Microsoft Excel computes the same.
+- 64 new tests, plus 10 opt-in tests that evaluate the Emissivity Match sheet
+  in Microsoft Excel. Four review passes found nine issues (TCs paired by name
+  across ROIs or added recordings that share a name, a fine step cutting the
+  candidate table short, limit notes misreading a best value between
+  candidates, a single candidate, or surroundings hotter than the zones,
+  per-ROI emissivities stopping the common value, hand-paired zone workbooks
+  missing their charts, hidden helper rows covering ROIs of large workbooks);
+  all are fixed.
 
 [Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.6.0...v0.7.0)
 

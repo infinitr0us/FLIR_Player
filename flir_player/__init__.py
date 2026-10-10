@@ -65,4 +65,4 @@ _preload_file_sdk()
 from .models import FramePacket, UnitOption, VideoMetadata  # noqa: E402
 
 __all__ = ["FramePacket", "UnitOption", "VideoMetadata"]
-__version__ = "0.6.0"
+__version__ = "0.7.0"

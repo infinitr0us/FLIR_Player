@@ -364,9 +364,11 @@ those counts, so they follow the Settings sheet:
   candidate between two limits (0.90 to 0.98 in steps of 0.01 to start) it
   gives the root mean square of IR − TC per ROI and over all TCs (every TC
   counts the same), marks the best value, and charts the error against the
-  emissivity. It also shows each TC's own best value without limits, and says
-  so when the best value sits at a limit or when the TCs want clearly different
-  values (one value cannot fit them all). Rows count where Use = 1, IR and TC
+  emissivity. It also shows each TC's own best value (the lowest error between
+  0.05 and 1.00), and says so when the best match lies beyond a limit or when
+  the TCs want clearly different values (one value cannot fit them all). A step
+  too fine for the table's 41 rows is widened so the table always reaches the
+  highest limit. Rows count where Use = 1, IR and TC
   are both present, the ROI's mean signal is inside the camera's calibrated
   range, and the time is inside the sheet's window. Type the result as the
   emissivity on Settings and every zone follows.
@@ -413,6 +415,14 @@ For a battery module seen from the side:
    quick to open.
 4. In the workbook, the Emissivity Match sheet gives the best emissivity within
    the limits; set it on Settings.
+
+A zone averages a whole cell, which reads colder than the spot under a TC
+wherever the cell heats unevenly: on the 0903 test the side TC of cell 9 wants
+0.58 at its own 3 × 3 pixels but 0.44 against its whole zone (cell 6: 0.84 and
+0.80). To match at the
+TC itself, press *Add TC ROIs to Player* in the TC results before exporting:
+each TC then pairs with its small box (the smallest ROI holding the pixel), and
+the zones report every cell at the matched emissivity.
 
 Without a TC fit, paste the logger data on TC Compare and pick each zone's TC
 on Settings; the ignition frame must then be logger time 0. Equal zone widths
