@@ -248,3 +248,26 @@ def test_z1_the_excel_dialog_explains_repeated_names(qapp) -> None:
     dialog = ExcelExportDialog(metadata, rois, current_frame=0, tc_run=RunOutput(result=result, table=table))
     assert not dialog.tc_check.isEnabled() and "More than one ROI is named Cell" in dialog.tc_label.text()
     assert dialog.options().tc_prefill is None
+
+
+def test_z8_the_excel_dialog_checks_added_recordings_for_repeated_names(qapp) -> None:
+    from test_tcmatch import SPOT_A, SPOT_B, make_scene
+
+    from flir_player import tcmatch
+    from flir_player.excel_dialog import ExcelExportDialog
+    from flir_player.models import VideoMetadata
+    from flir_player.tcmatch import MatchOptions, RunOutput
+
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=3))
+    metadata = VideoMetadata(path=Path("C:/data/scene.seq"), width=48, height=40, num_frames=30_000,
+                             start_time=None, end_time=None, duration_seconds=1000.0, nominal_fps=30.0)
+    rois = (RoiShape(1, "rect", ((SPOT_A[1] - 1.0, SPOT_A[0] - 1.0), (SPOT_A[1] + 2.0, SPOT_A[0] + 2.0)), "Cell 3"),
+            RoiShape(2, "rect", ((SPOT_B[1] - 1.0, SPOT_B[0] - 1.0), (SPOT_B[1] + 2.0, SPOT_B[0] + 2.0)), "Cell 6"))
+    dialog = ExcelExportDialog(metadata, rois, current_frame=0, tc_run=RunOutput(result=result, table=table))
+    assert dialog.tc_check.isEnabled()
+    other = (RoiShape(1, "rect", ((1.0, 1.0), (4.0, 4.0)), "Cell 3"), RoiShape(2, "rect", ((6.0, 1.0), (9.0, 4.0)), "Cell 3"))
+    dialog._others.append({"path": Path("C:/data/b.csq"), "rois": other, "ignition": 0})
+    dialog._update()
+    assert not dialog.tc_check.isEnabled() and "b.csq has more than one ROI named Cell 3" in dialog.tc_label.text()
+    assert dialog.options().tc_prefill is None

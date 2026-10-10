@@ -471,3 +471,47 @@ def test_z6_direct_references_leave_string_literals_alone() -> None:
     out = writer._direct('=IF(ROI_01_K1>0,"ROI_01_K1 UNIT_A",UNIT_A*ROI_01_K1)')
     assert out == "=IF('Settings'!$S$27>0,\"ROI_01_K1 UNIT_A\",'Settings'!$T$4*'Settings'!$S$27)"
     assert writer._direct("=ROI_01_TCR+ROI_01_K10") == "=ROI_01_TCR+ROI_01_K10"  # unknown names stay
+
+
+@pytest.mark.parametrize("eps, note", [
+    (0.904, "Inside the limits: the best match lies between the lowest candidates"),
+    (0.976, "Inside the limits: the best match lies between the highest candidates"),
+    (0.85, "At the lowest emissivity allowed"),
+    (1.0, "At the highest emissivity allowed"),
+])
+def test_z7_a_limit_note_needs_the_error_to_keep_falling_beyond_it(tmp_path, eps, note) -> None:
+    match = _Match(_match_with(tmp_path, f"edge_{eps}.xlsx", eps={"Cell 3": eps, "Cell 6": eps}), 2)
+    assert match.best == pytest.approx(min(max(round(eps, 2), 0.90), 0.98))
+    assert match.note.startswith(note)
+
+
+def test_z7_each_roi_keeps_its_own_probe_and_own_value(tmp_path) -> None:
+    """The per-ROI error functions outlive their loop: each must keep its own ROI's data."""
+    path = _match_with(tmp_path, "two.xlsx", eps={"Cell 3": 0.86, "Cell 6": 0.70})
+    match = _Match(path, 2)
+    assert match.pairs["Cell 3"][7] == pytest.approx(0.86) and match.pairs["Cell 6"][7] == pytest.approx(0.70)
+    ws = openpyxl.load_workbook(path, data_only=True)[MATCH]
+    h0 = 13 + MATCH_CANDIDATES + 1  # Excel row of the helper label
+    minus = [ws.cell(h0 + 1, 14 + k).value for k in range(2)]
+    plus = [ws.cell(h0 + 2, 14 + k).value for k in range(2)]
+    assert minus[0] != pytest.approx(minus[1]) and plus[0] != pytest.approx(plus[1])
+    assert plus[0] > minus[0] and plus[1] > minus[1]  # both want less than 0.90
+    assert ws.cell(h0 + 3, 12).value == pytest.approx(0.05) and ws.cell(h0 + 2 + 96, 12).value == pytest.approx(1.0)
+    formulas = openpyxl.load_workbook(path)[MATCH]
+    assert formulas.row_dimensions[h0 + 1].hidden and formulas.row_dimensions[h0 + 50].hidden
+
+
+def test_z8_repeated_mapped_names_are_refused_in_every_recording(tmp_path) -> None:
+    import dataclasses
+
+    from flir_player.workbook import write_workbook as write
+
+    source, temps = _zone_source()
+    shapes = list(source.rois)
+    shapes[1] = dataclasses.replace(shapes[1], shape=dataclasses.replace(shapes[1].shape, name="Cell 3"))
+    twice = dataclasses.replace(source, rois=shapes, label="Camera B")
+    data = ExportData(times=np.arange(60, dtype=float), sources=[twice],
+                      options=ExportOptions(area_means="signal", tc_prefill=_prefill(temps)),
+                      created=datetime(2026, 10, 10), versions={"tool": "test", "sdk": ""})
+    with pytest.raises(ValueError, match="Camera B: more than one ROI is named Cell 3"):
+        write(tmp_path / "twice.xlsx", data)

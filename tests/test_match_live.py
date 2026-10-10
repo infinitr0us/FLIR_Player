@@ -60,13 +60,13 @@ def _same(excel_value, cached, rel=1e-7):
         assert excel_value == cached
 
 
-def _compare_sheet(book, path, rows, cols):
+def _compare_sheet(book, path, rows, cols, rel=1e-7):
     """Every Match cell in rows × cols: Excel's value against the cached (Python) one."""
     cached = openpyxl.load_workbook(path, data_only=True)["Emissivity Match"]
     sheet = book.Worksheets("Emissivity Match")
     for r in rows:
         for c in cols:
-            _same(sheet.Cells(r, c).Value, cached.cell(r, c).value)
+            _same(sheet.Cells(r, c).Value, cached.cell(r, c).value, rel=rel)
 
 
 def test_excel_reproduces_the_python_match(excel, tmp_path) -> None:
@@ -156,5 +156,22 @@ def test_excel_candidate_grid_reaches_the_highest_limit(excel, tmp_path, step, e
         _compare_sheet(book, path, (9,), (4,))
         sheet = book.Worksheets("Emissivity Match")
         assert sheet.Range("C8").Value == pytest.approx(max(step, 0.08 / 40))
+    finally:
+        book.Close(False)
+
+
+@pytest.mark.parametrize("eps", [0.904, 0.976, 0.85])
+def test_excel_limit_notes_follow_the_error_beyond_the_limit(excel, tmp_path, eps) -> None:
+    from test_emissivity_match import _match_with
+    from flir_player.workbook import MATCH_CANDIDATES
+
+    path = _match_with(tmp_path, f"edge_{eps}.xlsx", eps={"Cell 3": eps, "Cell 6": eps * 0.98})
+    book = _open(excel, path)
+    try:
+        h0 = 13 + MATCH_CANDIDATES + 1
+        _compare_sheet(book, path, (9,), (4,))  # the note
+        _compare_sheet(book, path, range(13, 15), range(2, 11))  # pairs, own values from the grid
+        _compare_sheet(book, path, range(h0 + 1, h0 + 3), range(12, 16), rel=1e-6)  # best ± 0.001
+        _compare_sheet(book, path, range(h0 + 3, h0 + 3 + 96, 7), range(12, 16), rel=1e-6)  # the grid, sampled
     finally:
         book.Close(False)

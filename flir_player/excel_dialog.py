@@ -380,6 +380,13 @@ class ExcelExportDialog(FramelessDialog):
         if self._tc_pairing.duplicates:
             return (f"More than one ROI is named {', '.join(self._tc_pairing.duplicates)}: the workbook pairs ROIs "
                     "and TCs by name, so give them different names (e.g. split again with other names).")
+        paired = set(self._tc_pairing.pairs.values())
+        for other in self._others:  # the pairing applies by name to added recordings too
+            names = [roi.name for roi in other["rois"]]
+            repeated = sorted(name for name in paired if names.count(name) > 1)
+            if repeated:
+                return (f"{other['path'].name} has more than one ROI named {', '.join(repeated)}: the workbook pairs "
+                        "ROIs and TCs by name.")
         return ""
 
     def tc_prefill(self):

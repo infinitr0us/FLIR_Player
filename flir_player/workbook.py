@@ -58,6 +58,8 @@ INTERNAL = 18  # first column of Settings' collapsed constants
 MATCH = "Emissivity Match"
 MATCH_DEFAULTS = (0.90, 0.98, 0.01)  # lowest, highest emissivity and step: the engineers' range
 MATCH_CANDIDATES = 41  # rows of the candidate table (step 0.002 still spans 0.90-0.98)
+OWN_GRID = tuple(round(0.05 + 0.01 * k, 2) for k in range(96))  # each TC's own value: best of 0.05 … 1.00
+PROBE = 0.001  # the error just inside a limit tells whether the best match lies beyond it
 TC_BLOCK = 10  # TC Compare columns per ROI
 # Chart colours. Up to 8 ROIs keep the workbook's own palette; more (cell zones) take one blue
 # ramp in ROI order, so neighbouring cells read as neighbours (the reference sequential steps
@@ -203,6 +205,12 @@ class _Writer:
             prefill.check(TC_CAPACITY, TC_COLUMNS)
         self._tc_names: list[str] = list(prefill.names) if prefill is not None else []
         self._roi_tc: dict[str, str] = dict(prefill.roi_tc) if prefill is not None else {}
+        for source in data.sources:  # TCs are mapped by ROI name: two ROIs of one recording cannot share one
+            names = [roi.shape.name for roi in source.rois]
+            repeated = sorted({name for name in self._roi_tc if names.count(name) > 1})
+            if repeated:
+                raise ValueError(f"{source.label}: more than one ROI is named {', '.join(repeated)}; the workbook "
+                                 "pairs ROIs and TCs by name, so give them different names")
         self._roi_eps: dict[str, float] = dict(prefill.roi_eps) if prefill is not None else {}
         # A workbook filled from the TC fit compares only the ROIs paired with a TC (cell zones: a few of
         # many; every comparison column is a formula Excel parses on opening); otherwise every ROI.
@@ -1103,10 +1111,12 @@ class _Writer:
             entry = {"rows": int(fit.sum()), "include": layout.roi.shape.name not in exclude,
                      "eps_now": p.emissivity, "err": [math.nan] * len(eps)}
             entry["err_now"] = entry["bias_now"] = entry["own"] = math.nan
+            entry["grid"] = [math.nan] * len(OWN_GRID)
+            entry["probe"] = (math.nan, math.nan)
             if entry["rows"]:
                 c, t = inputs["cnt"][fit], inputs["tc"][fit]
 
-                def stats(e: float) -> tuple[float, float]:
+                def stats(e: float, cal=cal, p=p, c=c, t=t) -> tuple[float, float]:  # bound: kept past the loop
                     d = object_temperature(cal, p.with_(emissivity=e), c) - KELVIN - t
                     d = d[np.isfinite(d)]
                     return (float(np.sqrt(np.mean(d ** 2))), float(np.mean(d))) if d.size else (math.nan, math.nan)
@@ -1114,12 +1124,11 @@ class _Writer:
                 entry["err_now"], entry["bias_now"] = stats(p.emissivity)
                 if entry["include"]:
                     entry["err"] = [stats(e)[0] for e in eps]
-                a, cc = compensated_signal(cal, p, None)
-                s_r = float(cal.planck.signal(p.reflected_k))
-                x = cal.planck.signal(t + KELVIN) - s_r
-                y = a * c - cc - s_r
-                ok = np.isfinite(x * y)
-                entry["own"] = float(np.sum(x[ok] * y[ok]) / np.sum(x[ok] ** 2)) if np.sum(x[ok] ** 2) > 0 else math.nan
+                entry["grid"] = [stats(e)[0] for e in OWN_GRID]
+                finite = [k for k, v in enumerate(entry["grid"]) if math.isfinite(v)]
+                if finite:
+                    entry["own"] = OWN_GRID[min(finite, key=lambda k: entry["grid"][k])]
+                entry["stats"] = stats
             rows[layout.number] = entry
         combined = []
         for k in range(len(eps)):
@@ -1131,8 +1140,21 @@ class _Writer:
                if rows[l.number]["include"] and math.isfinite(rows[l.number]["err_now"])]
         own = [rows[l.number]["own"] for l in layouts
                if rows[l.number]["include"] and math.isfinite(rows[l.number]["own"])]
+        probes = [math.nan, math.nan]  # the error over all TCs at the best value − PROBE and + PROBE
+        if best is not None:
+            for side, delta in enumerate((-PROBE, PROBE)):
+                errs = []
+                for layout in layouts:
+                    entry = rows[layout.number]
+                    if entry["include"] and entry["rows"]:
+                        value = entry["stats"](eps[best] + delta)[0]
+                        entry["probe"] = tuple(value if k == side else entry["probe"][k] for k in range(2))
+                        if math.isfinite(value):
+                            errs.append(value)
+                probes[side] = float(np.sqrt(np.mean(np.square(errs)))) if errs else math.nan
         return {"rows": rows, "combined": combined, "best": best,
-                "now": float(np.sqrt(np.mean(np.square(now)))) if now else math.nan, "own": own}
+                "now": float(np.sqrt(np.mean(np.square(now)))) if now else math.nan, "own": own,
+                "probes": probes}
 
     def _match(self) -> None:
         ws = self.sheets[MATCH]
@@ -1171,6 +1193,9 @@ class _Writer:
         p0 = 12  # first ROI row of the pairs table (columns A-J)
         c0, cc = p0, 11  # first candidate row and column (L): the candidate table sits to the right
         last_c = c0 + MATCH_CANDIDATES - 1
+        h0 = last_c + 2  # hidden helper rows: the best value ± PROBE, then the own-value grid
+        g0, g1 = h0 + 3, h0 + 2 + len(OWN_GRID)
+        grid_eps = _range(M, g0, cc, g1, cc)
         eps_range = _range(M, c0, cc, last_c, cc)
         all_range = _range(M, c0, cc + 1, last_c, cc + 1)
         self.wb.define_name("MATCH_EPS", "=" + eps_range)
@@ -1185,6 +1210,7 @@ class _Writer:
         ws.write_formula(5, 6, "=IFERROR(INDEX(MATCH_EPS,MATCH(_xlfn.AGGREGATE(5,6,MATCH_ALL),MATCH_ALL,0)),\"–\")",
                          self.f_best, best_eps)
         ws.merge_range(6, 3, 6, 5, "Error there, all TCs (K)", self.f_left)
+        self._name("MATCH_ERRBEST", M, 6, 6)
         ws.write_formula(6, 6, '=IFERROR(_xlfn.AGGREGATE(5,6,MATCH_ALL),"–")', self.f_k,
                          ref["combined"][best] if best is not None else "–")
         ws.merge_range(7, 3, 7, 5, "Error with the emissivity on Settings (K)", self.f_left)
@@ -1202,12 +1228,18 @@ class _Writer:
         none_text = ("No ROI has rows to compare yet: pick each zone's TC on Settings, and check Use (TC Compare) "
                      "and the window.")
         one_text = "Only one emissivity is tried: the lowest and highest emissivity are the same."
+        near_low = ("Inside the limits: the best match lies between the lowest candidates (a finer step shows "
+                    "it).")
+        near_high = ("Inside the limits: the best match lies between the highest candidates (a finer step shows "
+                     "it).")
+        # at a limit, the error just inside it says whether the best match lies beyond the limit
         ws.write_formula(8, 3, f'=IF(NOT(ISNUMBER(MATCH_BEST)),"{none_text}",IF(MATCH_HI-MATCH_LO<1E-9,"{one_text}",'
-                               f'IF(MATCH_BEST<=MATCH_LO+1E-9,"{low_text}",IF(MATCH_BEST>=MATCH_HI-1E-9,'
-                               f'"{high_text}","Inside the limits."))))', self.f_note,
-                         none_text if best is None else one_text if hi - lo < 1e-9 else
-                         low_text if eps[best] <= lo + 1e-9 else high_text if eps[best] >= hi - 1e-9
-                         else "Inside the limits.")
+                               f'IF(MATCH_BEST<=MATCH_LO+1E-9,IF(IFERROR(MATCH_PLUS<MATCH_ERRBEST,FALSE),'
+                               f'"{near_low}","{low_text}"),IF(MATCH_BEST>=MATCH_HI-1E-9,'
+                               f'IF(IFERROR(MATCH_MINUS<MATCH_ERRBEST,FALSE),"{near_high}","{high_text}"),'
+                               f'"Inside the limits."))))', self.f_note,
+                         self._limit_note(ref, eps, lo, hi, none_text, one_text, low_text, high_text, near_low,
+                                          near_high))
         own = _range(M, p0, 8, p0 + max(n, 1) - 1, 8)
         mask = f'({include}="Yes")*ISNUMBER({own})'
         spread_cached = ""
@@ -1224,7 +1256,7 @@ class _Writer:
 
         # pairs table
         head = ["ROI", "Recording", "TC (Settings)", "Include", "Rows used", "Emissivity now", "Error now (K)",
-                "Bias now (K, IR − TC)", "Own best value (no limits)", "Error at the best value (K)"]
+                "Bias now (K, IR − TC)", "Own best value (0.05 to 1.00)", "Error at the best value (K)"]
         ws.write(p0 - 2, 0, "ROIs and their TCs", self.f_h2)
         for c, text in enumerate(head):
             ws.write(p0 - 1, c, text, self.f_head)
@@ -1244,8 +1276,9 @@ class _Writer:
                                    self.f_k, e["err_now"] if math.isfinite(e["err_now"]) else "–")
             ws.write_array_formula(r, 7, r, 7, f'{{=IF(N(E{R})=0,"–",IFERROR({self._bias(layout, f"{nm}_EPS")},"–"))}}',
                                    self.f_k, e["bias_now"] if math.isfinite(e["bias_now"]) else "–")
-            ws.write_formula(r, 8, f'=IF(N(E{R})=0,"–",IFERROR(SUMPRODUCT({nm}_FITR,{nm}_XYR)/'
-                                   f'SUMPRODUCT({nm}_FITR,{nm}_X2R),"–"))', self.f_eps,
+            grid_col = _range(M, g0, cc + 2 + k, g1, cc + 2 + k)
+            ws.write_formula(r, 8, f'=IF(N(E{R})=0,"–",IFERROR(INDEX({grid_eps},MATCH(_xlfn.AGGREGATE(5,6,'
+                                   f'{grid_col}),{grid_col},0)),"–"))', self.f_eps,
                              e["own"] if math.isfinite(e["own"]) else "–")
             col = _range(M, c0, cc + 2 + k, last_c, cc + 2 + k)
             at_best = e["err"][best] if best is not None and math.isfinite(e["err"][best]) else "–"
@@ -1287,6 +1320,7 @@ class _Writer:
         area = (c0, cc, last_c, cc + 1 + max(n, 1))
         ws.conditional_format(*area, {"type": "formula", "criteria": f"=ISNA({letter}{c0 + 1})",
                                       "format": self.f_hide})
+        self._match_helpers(ws, layouts, ref, eps, p0, cc, h0, g0)
         best_col = xl_col_to_name(cc + 1)
         ws.conditional_format(c0, cc + 1, last_c, cc + 1, {
             "type": "formula", "criteria": f"=AND(ISNUMBER({best_col}{c0 + 1}),{best_col}{c0 + 1}=MATCH_ALL_MIN)",
@@ -1331,6 +1365,62 @@ class _Writer:
         paired = [bool(self._roi_tc.get(layout.roi.shape.name)) for layout in layouts]
         for k, has in enumerate(paired):  # ROIs without a TC at export are hidden, unless none has one yet
             ws.set_column(cc + 2 + k, cc + 2 + k, 14, None, {"hidden": True} if any(paired) and not has else {})
+
+    def _limit_note(self, ref, eps, lo, hi, none_text, one_text, low_text, high_text, near_low, near_high) -> str:
+        """The cached result of the limit note."""
+        best = ref["best"]
+        if best is None:
+            return none_text
+        if hi - lo < 1e-9:
+            return one_text
+        error = ref["combined"][best]
+        minus, plus = ref["probes"]
+        if eps[best] <= lo + 1e-9:
+            return near_low if math.isfinite(plus) and plus < error else low_text
+        if eps[best] >= hi - 1e-9:
+            return near_high if math.isfinite(minus) and minus < error else high_text
+        return "Inside the limits."
+
+    def _match_helpers(self, ws, layouts, ref, eps, p0, cc, h0, g0) -> None:
+        """Hidden rows under the candidate table: the error at the best value ± PROBE (which side of a limit the
+        best match lies), and every ROI's error on OWN_GRID (its own value)."""
+        M = MATCH
+        n = len(layouts)
+        ws.set_row(h0, None, None, {"hidden": True})
+        ws.write(h0, cc, "Helper rows: the best value ± 0.001, then each ROI's own-value search", self.f_note)
+        best = ref["best"]
+        for side, delta in enumerate((-PROBE, PROBE)):
+            r = h0 + 1 + side
+            ws.set_row(r, None, None, {"hidden": True})
+            sign = "-" if delta < 0 else "+"
+            ws.write_formula(r, cc, f"=IF(ISNUMBER(MATCH_BEST),MATCH_BEST{sign}{PROBE},NA())", self.f_eps,
+                             eps[best] + delta if best is not None else "#N/A")
+            row_cells = _range(M, r, cc + 2, r, cc + 1 + max(n, 1))
+            value = ref["probes"][side]
+            ws.write_array_formula(r, cc + 1, r, cc + 1,
+                                   f"{{=IFERROR(SQRT(SUM(IFERROR({row_cells}^2,0))/COUNT({row_cells})),NA())}}",
+                                   self.f_k, value if math.isfinite(value) else "#N/A")
+            self._name("MATCH_MINUS" if side == 0 else "MATCH_PLUS", M, r, cc + 1)
+            e_cell = f"${xl_col_to_name(cc)}{r + 1}"
+            for k, layout in enumerate(layouts):
+                pr = p0 + k + 1
+                err = ref["rows"][layout.number]["probe"][side]
+                ws.write_array_formula(
+                    r, cc + 2 + k, r, cc + 2 + k,
+                    f'{{=IF(OR(NOT(ISNUMBER({e_cell})),$D${pr}<>"Yes",N($E${pr})=0),NA(),'
+                    f'IFERROR({self._rms(layout, e_cell)},NA()))}}', self.f_k, err if math.isfinite(err) else "#N/A")
+        for j, value in enumerate(OWN_GRID):
+            r = g0 + j
+            ws.set_row(r, None, None, {"hidden": True})
+            ws.write_number(r, cc, value, self.f_eps)
+            e_cell = f"${xl_col_to_name(cc)}{r + 1}"
+            for k, layout in enumerate(layouts):
+                pr = p0 + k + 1
+                err = ref["rows"][layout.number]["grid"][j]
+                ws.write_array_formula(
+                    r, cc + 2 + k, r, cc + 2 + k,
+                    f'{{=IF(N($E${pr})=0,NA(),IFERROR({self._rms(layout, e_cell)},NA()))}}', self.f_k,
+                    err if math.isfinite(err) else "#N/A")
 
     def _t_expr(self, layout: _RoiLayout, eps: str) -> str:
         """Array of the ROI's IR temperatures (°C) at emissivity ``eps``: (A·c − C − S_r)/ε + S_r is the
