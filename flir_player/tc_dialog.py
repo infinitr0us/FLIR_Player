@@ -686,7 +686,12 @@ class TcCalibrationDialog(FramelessDialog):
                     self.preset_combo.setCurrentIndex(index)
             if options.lag_frame is not None:
                 self.time_combo.setCurrentIndex(self.time_combo.findData("frame"))
-                self.frame_spin.setValue(options.lag_frame + 1)
+                shown = options.lag_frame + 1
+                if not self.frame_spin.minimum() <= shown <= self.frame_spin.maximum():
+                    # a given offset outside the recording (the logger started before the camera) stays as given
+                    self.frame_spin.setRange(min(shown, self.frame_spin.minimum()),
+                                             max(shown, self.frame_spin.maximum()))
+                self.frame_spin.setValue(shown)
             else:
                 self.time_combo.setCurrentIndex(self.time_combo.findData(
                     "clock" if options.clock_window_s is not None else "auto"))

@@ -70,8 +70,10 @@ class TcTable:
     time_label: str = ""
     notes: tuple[str, ...] = ()
     sheet: str = ""  # the workbook sheet read ("" for a text table)
-    # (first row, last row, column), 1-based, of the time cells read, and the time unit in s (for the logger clock)
-    time_cells: tuple[int, int, int] | None = None
+    # the sheet rows (1-based, one per row of ``times``) and column of the time cells, and the time unit in s
+    # (for the logger clock)
+    time_rows: tuple[int, ...] = ()
+    time_col: int = 0
     time_unit_s: float = 1.0
     clock_zero: datetime | None = None  # the logger's wall clock at logger time 0 (a lab workbook's LogFile sheet)
     clock_note: str = ""  # where clock_zero comes from, or why there is none
@@ -181,7 +183,7 @@ def logger_clock(path: str | Path, sheet: str, table: TcTable) -> tuple[datetime
     the difference its formula names, so a half-edited sheet, another column or a stale value gives no
     clock rather than a wrong one. Never raises.
     """
-    if table.time_cells is None:
+    if not table.time_rows or table.time_col < 1:
         return None, "the TC times do not come from a sheet"
     try:
         return _logger_clock(Path(path), sheet, table)
@@ -196,7 +198,8 @@ def _logger_clock(path: Path, sheet: str, table: TcTable) -> tuple[datetime | No
     import openpyxl
     from openpyxl.utils import column_index_from_string
 
-    first, last, col = table.time_cells
+    kept = set(table.time_rows)  # rows the reader dropped (no readable time, a repeated time) are not checked
+    first, last, col = min(kept), max(kept), table.time_col
     book = openpyxl.load_workbook(path, read_only=True, data_only=False)
     try:
         formulas = _column(book[sheet], col, first, last)
@@ -205,8 +208,8 @@ def _logger_clock(path: Path, sheet: str, table: TcTable) -> tuple[datetime | No
         book.close()
     refs: dict[int, tuple[str, str, int, int]] = {}  # sheet row → (source sheet, column, its row, row of time 0)
     for row, formula in zip(range(first, last + 1), formulas):
-        if formula is None:
-            continue  # a row without a time (the reader skipped it)
+        if row not in kept:
+            continue
         match = _DIFFERENCE.match(formula.strip()) if isinstance(formula, str) else None
         if match is None:
             return None, _NOT_FORMULAS
@@ -446,6 +449,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     if len(block) < 3:
         raise ValueError("no block of at least three data rows")
     times = _seconds([row[tcol] for row in block]) * scale
+    sheet_rows = np.arange(first + 1, first + 1 + len(block))  # 1-based, kept with ``times`` below
     values = np.array([[_number(row[c]) if _number(row[c]) is not None else np.nan for c in channels]
                        for row in block], dtype=np.float64)
     keep = np.isfinite(times)
@@ -457,15 +461,15 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
                      "time formulas not filled down after the shift row changed, or rows past the end of the log)")
     if not keep.all():
         notes.append(f"{int((~keep).sum())} row(s) without a readable time were skipped")
-    times, values = times[keep], values[keep]
+    times, values, sheet_rows = times[keep], values[keep], sheet_rows[keep]
     order = np.argsort(times, kind="stable")
     if np.any(np.diff(order) < 0):
         notes.append("rows were sorted by time")
-    times, values = times[order], values[order]
+    times, values, sheet_rows = times[order], values[order], sheet_rows[order]
     duplicate = np.concatenate([[False], np.diff(times) <= 0])
     if duplicate.any():
         notes.append(f"{int(duplicate.sum())} row(s) repeating an earlier time were dropped")
-        times, values = times[~duplicate], values[~duplicate]
+        times, values, sheet_rows = times[~duplicate], values[~duplicate], sheet_rows[~duplicate]
     # header rows name the channels; other text above the data is reported, not used
     titled = [row for row in headers if any(isinstance(row[c], str) and row[c].strip() for c in channels)]
     names = _names([row for row in titled if not _uniform(row, channels)] or titled, channels)
@@ -487,7 +491,8 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     if trailing > 0:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
-                   notes=tuple(notes), time_cells=(first + 1, last + 1, tcol + 1), time_unit_s=scale)
+                   notes=tuple(notes), time_rows=tuple(int(r) for r in sheet_rows), time_col=tcol + 1,
+                   time_unit_s=scale)
 
 
 def _counter(cells: list[Any]) -> bool:

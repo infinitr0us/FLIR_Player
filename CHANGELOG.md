@@ -16,10 +16,12 @@ the logger 33 minutes off.
   between the clocks are set aside, because cameras keep UTC or a time zone
   without daylight saving while the logger PC keeps local time; of the offsets
   whole hours apart, the one nearest the recording's start that puts most of
-  the log inside the recording is taken. A time cell that does not hold the
-  difference its formula names (a sheet not recalculated) gives no clock rather
-  than a wrong one. Without a clock the whole recording is searched, with a
-  warning.
+  the log inside the recording is taken. The clock is taken only when every
+  time cell read subtracts the same Log row of an elapsed-time column that
+  starts at 0 and holds the difference its formula names, so a half-edited
+  sheet, another column or a sheet not recalculated gives no clock rather than
+  a wrong one. Without a clock, or when no offset near it leaves the logger and
+  the recording overlapping, the whole recording is searched, with a warning.
 - Why: where a fire spreads cell by cell, every cell's curve resembles the next
   one's some minutes later, so a TC correlates almost equally well at many
   offsets (0.95 from -300 to 3,000 s for T2 of the 1006 A700), and the best
@@ -27,9 +29,14 @@ the logger 33 minutes off.
 - Whatever the mode, a match more than 2 minutes from the clocks is a warning
   (*Anywhere in the recording*), and so are a match at the edge of the window
   near the clocks and a given frame far from them. The summary, the results
-  headline and the figure show where the clocks put logger time 0; the setup
-  dialog shows it before the run, and `result.json` keeps it.
-- A fit reopened from before 0.7.3 offers the new default.
+  headline and the figure show where the clocks put logger time 0 (on
+  superframing files the dialog gives it in seconds, as their frames are timed
+  by the clock); the setup dialog shows it before the run, and `result.json`
+  keeps it.
+- A fit reopened from before 0.7.3 offers the new default. A given frame is
+  kept as given: reopened, the fit offers that frame again (fits before 0.7.3
+  recorded it in seconds and reopened as an automatic match).
+- An empty `--lag-range` is a clear error instead of a crash.
 - "Cell Temp" and "TRIM temp" (lab workbook columns) start unticked, like the
   TC tree: the engineers do not compare them with the IR. Ticked, their long
   cool-down matched the 1006 A700 at the wrong offset.

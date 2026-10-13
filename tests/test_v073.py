@@ -108,7 +108,7 @@ def test_cell_and_trim_temps_start_unticked_like_the_tc_tree(qapp, tmp_path) -> 
 
 def test_a_lab_workbook_gives_the_logger_clock_at_time_0(tmp_path) -> None:
     table = read_tc_table(_lab_workbook(tmp_path / "lab.xlsx"))
-    assert table.sheet == "TC" and table.times[0] == 0.0 and table.time_cells == (5, 904, 2)
+    assert table.sheet == "TC" and table.times[0] == 0.0 and table.time_rows == tuple(range(5, 905)) and table.time_col == 2
     assert table.clock_zero == START + timedelta(seconds=358)  # Log row 360 = elapsed 358 s
     assert table.clock_note == ("logging started 2026-10-06 10:46:36 by sheet 'LogFile_2026-10-06-10-46-36 (ro' "
                                 "(its Date/Time cell); logger time 0 is Log!E360, 358 s later")
@@ -118,7 +118,7 @@ def test_a_lab_workbook_gives_the_logger_clock_at_time_0(tmp_path) -> None:
 
 def test_a_half_edited_sheet_takes_the_clock_of_the_rows_read(tmp_path) -> None:
     table = read_tc_table(_lab_workbook(tmp_path / "lab.xlsx", half_edited=True))
-    assert table.time_cells == (7, 904, 2) and any("left out" in n for n in table.notes)
+    assert table.time_rows[0] == 7 and table.time_col == 2 and any("left out" in n for n in table.notes)
     assert table.clock_zero == START + timedelta(seconds=358)  # rows 7+ subtract Log row 360, not 217
 
 
@@ -301,7 +301,7 @@ def test_r1_every_time_cell_must_subtract_the_same_log_row_and_hold_its_differen
     # row 5 subtracts Log row 360, the rest Log row 960: still rising, so the reader keeps every row
     mixed = read_tc_table(_lab_workbook(tmp_path / "mixed.xlsx",
                                         refs=lambda i: (360, 360) if i == 0 else (960 + i, 960)))
-    assert mixed.time_cells == (5, 904, 2) and not any("left out" in n for n in mixed.notes)
+    assert len(mixed.time_rows) == 900 and not any("left out" in n for n in mixed.notes)
     assert mixed.clock_zero is None and "subtract different logger times (Log!E360, Log!E960)" in mixed.clock_note
     stale = read_tc_table(_lab_workbook(tmp_path / "stale.xlsx", stale_from=40))  # later rows not recalculated
     assert stale.clock_zero is None and "row 45 does not hold the difference" in stale.clock_note
@@ -318,8 +318,8 @@ def test_r3_a_window_without_offsets_searches_everything_and_an_empty_range_is_a
     samples, table = _clocked(137 + 30.25)  # no whole second within 0.1 s of 167.25 s
     result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=0.1))
     assert result.lag_s == 137.0 and not result.near_clocks
-    assert any("within 0.1 s of the clocks' 167 s the logger and the recording's frames do not overlap" in w
-               for w in result.warnings)
+    assert any("within 0.1 s of the clocks' 167 s there is no offset at which the logger and the recording's "
+               "frames overlap" in w for w in result.warnings)
     with pytest.raises(ValueError, match="No time offset from 5000 to 6000 s"):
         tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_range=(5000.0, 6000.0)))
 
@@ -370,4 +370,47 @@ def test_r6_a_given_frame_is_kept_as_given_and_older_given_offsets_reopen_as_fra
     assert previous["options"].lag_frame == 137 * 30 and previous["options"].clock_window_s is None
     dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0, previous={"options": previous["options"]})
     assert dialog.time_combo.currentData() == "frame" and dialog.frame_spin.value() == 137 * 30 + 1
+    dialog.deleteLater()
+
+
+def test_r7_rows_the_reader_dropped_do_not_cost_the_clock(tmp_path) -> None:
+    path = _lab_workbook(tmp_path / "lab.xlsx", rows=60)
+    book = openpyxl.load_workbook(path)
+    tc = book["TC"]
+    tc["B20"] = "#VALUE!"  # a broken time: the reader skips the row
+    tc["B30"] = "=Log!E999-Log!E$5"  # a repeated time with another origin: the reader drops it
+    book.save(path)
+    with zipfile.ZipFile(path) as z:  # openpyxl dropped the cached values: put them back (B30 repeats B29)
+        parts = {n: z.read(n) for n in z.namelist()}
+    name = f"xl/worksheets/sheet{book.sheetnames.index('TC') + 1}.xml"
+    xml = parts[name].decode("utf-8")
+    xml = re.sub(r'<c r="([AB])(\d+)"([^>]*)><f>([^<]*)</f><v\s*/>',
+                 lambda m: (f'<c r="{m[1]}{m[2]}"{m[3]}><f>{m[4]}</f><v>'
+                            f'{(int(m[2]) - 5 - (m[2] == "30")) / (60 if m[1] == "A" else 1)}</v>'), xml)
+    parts[name] = xml.encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, blob in parts.items():
+            z.writestr(n, blob)
+    table = read_tc_table(path, sheet="TC")
+    assert 20 not in table.time_rows and 30 not in table.time_rows and len(table.time_rows) == 58
+    assert any("without a readable time" in n for n in table.notes) and any("repeating" in n for n in table.notes)
+    assert table.clock_zero == START + timedelta(seconds=358), table.clock_note
+
+
+def test_r8_the_window_needs_real_overlap_not_just_an_end_offset() -> None:
+    samples, table = _clocked(880.0, n_ir=760)  # the recording goes on (2,000 s) after the statistics end
+    samples.info["frames"] = 2000 * 30
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=CLOCK_WINDOW_S))
+    assert not result.near_clocks and result.lag_s == 137.0
+    assert any("there is no offset at which the logger and the recording's frames overlap" in w
+               for w in result.warnings)
+
+
+def test_r9_a_given_offset_before_the_recording_reopens_as_given(qapp, tmp_path) -> None:
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    previous = {"options": MatchOptions(lag_frame=-3000)}  # logger time 0 100 s before the first frame
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0, previous=previous)
+    assert dialog.time_combo.currentData() == "frame" and dialog.frame_spin.value() == -2999
+    assert dialog.options().lag_frame == -3000
     dialog.deleteLater()
