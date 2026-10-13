@@ -75,9 +75,14 @@ def test_zone_ends_are_named_as_shown():
 
 def test_render_turns_and_flips_after_the_overlays():
     data = np.linspace(0.0, 1.0, W * H).reshape(H, W)
-    plain, *_ = render_frame_rgb(data, DisplayState())
+    clip = np.zeros((H, W), bool)
+    clip[0, :3] = clip[-1, -2:] = True
+    overlays = dict(segmentation=(True, 0.1, 0.9), isotherm=("above", 0.6, 1.0), clipping=True)
+    plain, *_ = render_frame_rgb(data, DisplayState(**overlays), clip)
+    assert len({tuple(c) for c in plain.reshape(-1, 3)}) > 3  # the overlays really paint
     for o in ALL:
-        turned, *_ = render_frame_rgb(data, DisplayState(flip_h=o.flip_h, flip_v=o.flip_v, rotation=o.turns))
+        state = DisplayState(flip_h=o.flip_h, flip_v=o.flip_v, rotation=o.turns, **overlays)
+        turned, *_ = render_frame_rgb(data, state, clip)
         assert np.array_equal(turned, o.apply(plain)) and turned.flags.c_contiguous
 
 
@@ -156,6 +161,30 @@ def test_turned_canvas_probes_spots_and_boxes_measure_the_drawn_pixels(qapp, o, 
         ys, xs = roi_coordinates(RoiShape(2, *emitted[-1], "Box"), H, W)
         inside = {pixel for pixel, (cx, cy) in centre.items() if 13 < cx < 47 and 22 < cy < 68}
         assert set(zip(xs.tolist(), ys.tolist())) == inside
+    finally:
+        canvas.close()
+
+
+@pytest.mark.parametrize("scale", [10.0, 7.5])
+@pytest.mark.parametrize("o", [o for o in ALL if o.turns or o.flip_h or o.flip_v], ids=_name)
+def test_a_dragged_line_endpoint_lands_on_the_drawn_pixel(qapp, o, scale):
+    canvas, _raw, drawn = _encoded_canvas(qapp, o, scale)
+    try:
+        line = RoiShape(1, "line", ((2.5, 2.5), (8.5, 6.5)), "Line 1")
+        canvas.set_rois([line], line.id)
+        moved = []
+        canvas.roi_moved.connect(moved.append)
+        handle = canvas._image_to_widget(8.5, 6.5)
+        for target in [QPoint(30, 40), QPoint(int(3 * scale), int(5 * scale)), QPoint(51, 22)]:
+            canvas.set_rois([line], line.id)
+            QTest.mousePress(canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, handle.toPoint())
+            canvas.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, QPointF(target), QPointF(target),
+                                              Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                                              Qt.KeyboardModifier.NoModifier))
+            QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, target)
+            px, py = drawn[(target.x(), target.y())]
+            assert moved[-1].points[1] == (px + 0.5, py + 0.5), target
+            assert moved[-1].points[0] == (2.5, 2.5)
     finally:
         canvas.close()
 
@@ -246,6 +275,19 @@ def test_zone_one_follows_the_end_shown_on_screen(qapp, window, monkeypatch):
     dialog.close()
 
 
+def test_joined_zones_do_not_repeat_a_name_taken_meanwhile(qapp, window, monkeypatch):
+    window._add_roi("rect", ((40.0, 200.0), (220.0, 212.0)))
+    monkeypatch.setattr(ZoneSplitDialog, "exec", lambda self: (self.show(), QDialog.DialogCode.Accepted)[1])
+    window._split_zones()
+    window._add_roi("rect", ((300.0, 200.0), (320.0, 212.0)))  # Box 1 is free again: the new box takes it
+    assert window._rois[-1].name == "Box 1"
+    window._select_roi(window._rois[0].id)
+    monkeypatch.setattr(ZoneSplitDialog, "exec", lambda self: ZoneSplitDialog.JOIN)
+    window._split_zones()
+    names = [roi.name for roi in window._rois]
+    assert sorted(names) == ["Box 1", "Box 2"] and window._zone_groups == []
+
+
 def test_box_names_reuse_the_lowest_free_number(qapp, window):
     for k in range(3):
         window._add_roi("rect", ((40.0 + 30 * k, 200.0), (60.0 + 30 * k, 212.0)))
@@ -258,3 +300,50 @@ def test_box_names_reuse_the_lowest_free_number(qapp, window):
     window._clear_rois()
     window._add_roi("rect", ((40.0, 200.0), (60.0, 212.0)))
     assert window._rois[0].name == "Box 1"
+
+
+# --- TC sheets whose time column stops rising (the engineers' 20261006b.xlsx) ----------------------
+
+
+def _lab_rows(shift_row_glitch: bool = True, tail: int = 40) -> list[tuple]:
+    """A lab-workbook TC sheet: time from ignition (min, s), TCs; a shift row edited in only the first
+    data rows leaves a stray second row, and formulas past the end of the log run negative with zeros."""
+    rows = [("Time", "ELAPSED TIME", "T1", "T2"), ("From Ignition", "[sec]", None, None),
+            (None, 217, None, None), ("[mim]", "shft time", None, None), (0.0, 0, 11.0, 11.2)]
+    if shift_row_glitch:
+        rows.append((2.4, 144, 18.5, 19.0))
+    rows += [(k / 60, k, 20.0 + k, 21.0 + 0.5 * k) for k in range(2, 120)]
+    rows += [(-358 / 60, -358, 0, 0)] * tail
+    return rows
+
+
+def test_tc_rows_where_the_time_stops_rising_are_left_out_and_reported():
+    from flir_player.tcdata import parse_rows
+
+    table = parse_rows(_lab_rows())
+    np.testing.assert_allclose(table.times, np.arange(2, 120))
+    assert table.names == ("T1", "T2") and table.values[0, 0] == 22.0
+    note = next(n for n in table.notes if "stops rising" in n)
+    assert "rows 5-6" in note and "rows 125-164" in note
+    assert not any("row 5 (" in n or "row 6 (" in n for n in table.notes)  # cut data rows are not "headers"
+    assert not any("after the data block" in n for n in table.notes)  # said once, in the note above
+    only_tail = parse_rows(_lab_rows(shift_row_glitch=False))
+    np.testing.assert_allclose(only_tail.times, np.concatenate([[0], np.arange(2, 120)]))
+    assert any("rows 124-163" in n for n in only_tail.notes)
+
+
+def test_a_time_column_rising_over_less_than_half_the_rows_is_still_refused():
+    from flir_player.tcdata import parse_rows
+
+    rows = [("Time [s]", "T1")] + [(k % 5, 20.0 + (7 * k) % 11) for k in range(30)]  # a restarting counter
+    with pytest.raises(ValueError, match="no increasing time column"):
+        parse_rows(rows)
+
+
+@pytest.mark.skipif(not (SAMPLES / "1006" / "20261006b.xlsx").exists(), reason="needs local/data/1006/20261006b.xlsx")
+def test_the_engineers_1006b_workbook_reads():
+    from flir_player.tcdata import read_tc_table
+
+    table = read_tc_table(SAMPLES / "1006" / "20261006b.xlsx", sheet="TC")
+    assert table.names[:3] == ("T1", "T2", "T3") and (table.times[0], table.times[-1]) == (2.0, 2458.0)
+    assert any("rows 5-6 and rows 2464-2862 were left out" in n for n in table.notes)

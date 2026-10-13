@@ -266,7 +266,25 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
         raise ValueError("no block of at least three data rows")
     block = rows[first:last + 1]
     headers = rows[:first]
-    tcol, scale = _time_column(block, headers, width, time_column)
+    dropped = range(0)  # data rows cut at the top: not reported as headers
+    cut = []  # rows left out where the time column stops rising (notes)
+    try:
+        tcol, scale = _time_column(block, headers, width, time_column)
+    except ValueError as exc:
+        if "no increasing time column" not in str(exc):
+            raise
+        # A lab workbook whose time formulas were not filled down after its shift row changed, or
+        # that runs past the end of its log, rises only between such rows: use that stretch.
+        tcol, a, z = _rising_run(block, headers, width, time_column)
+        if a > 0:
+            cut.append(f"rows {first + 1}-{first + a}" if a > 1 else f"row {first + 1}")
+        if z < len(block) - 1:
+            cut.append(f"rows {first + z + 2}-{last + 1}" if z < len(block) - 2 else f"row {last + 1}")
+        block = block[a:z + 1]
+        dropped = range(first, first + a)
+        first, last = first + a, first + z
+        headers = rows[:first]
+        scale = _time_column(block, headers, width, tcol)[1]
     timed = [_time_like(row[tcol]) for row in block]  # rows at the edges without a time are not data
     lead = timed.index(True) if True in timed else 0
     trail = len(timed) - 1 - timed[::-1].index(True) if True in timed else len(timed) - 1
@@ -301,6 +319,9 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     notes = []
     if scale != 1.0:
         notes.append(f"the time column is in {'minutes' if scale == 60.0 else 'hours'}; converted to seconds")
+    if cut:
+        notes.append(f"the time column stops rising, so {' and '.join(cut)} were left out (in a lab workbook: "
+                     "time formulas not filled down after the shift row changed, or rows past the end of the log)")
     if not keep.all():
         notes.append(f"{int((~keep).sum())} row(s) without a readable time were skipped")
     times, values = times[keep], values[keep]
@@ -318,6 +339,8 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     time_label = " ".join(reversed(_texts(titled, tcol))) or "Time"
     ignored = []
     for i, row in enumerate(headers):
+        if i in dropped:
+            continue
         texts = [str(v) for v in row if v is not None and str(v).strip()]
         if texts and not any(row is t for t in titled):
             ignored.append(f"row {i + 1} ({', '.join(texts)[:40]})")
@@ -330,7 +353,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     for c in copies:
         label = " ".join(reversed(_texts(titled, c))) or f"column {c + 1}"
         notes.append(f"column {label!r} is the time again in other units, so it is not used as a TC")
-    if trailing > 0:
+    if trailing > 0 and not cut:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
                    notes=tuple(notes))
@@ -468,6 +491,45 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
         raise ValueError("no increasing time column")
     c = min(candidates)[2]
     return c, scale_of(c)
+
+
+def _rising_run(block: list[tuple], headers: list[tuple], width: int, requested) -> tuple[int, int, int]:
+    """(column, first, last) of the longest stretch of rows over which a time column rises.
+
+    For a block in which no column rises throughout. The stretch must hold at least half of the
+    block's rows. A column headed as time wins over a longer one that is not (a TC heating steadily),
+    then the longer stretch, then a column in seconds.
+    """
+    if isinstance(requested, int):
+        columns = [requested]
+    elif requested is not None:
+        columns = [_time_column(block, headers, width, requested)[0]]
+    else:
+        columns = range(width)
+    best = None
+    for c in columns:
+        seconds = _seconds([row[c] for row in block])
+        if np.isfinite(seconds).sum() < 3:
+            continue
+        rising = np.concatenate([[False], np.isfinite(seconds[1:]) & np.isfinite(seconds[:-1])
+                                 & (np.diff(seconds) > 0)])
+        start, a, z = 0, 0, -1
+        for i in range(1, len(seconds) + 1):
+            if i < len(seconds) and rising[i]:
+                continue
+            if i - 1 - start > z - a:
+                a, z = start, i - 1
+            start = i
+        if z - a + 1 < max(3, 0.5 * len(block)):
+            continue
+        unit = _time_scale(headers, c)
+        rank = 0 if unit == 1.0 else (1 if unit is None else 2)
+        key = (not _time_evidence(headers, c), -(z - a), rank, c)
+        if best is None or key < best[0]:
+            best = (key, c, a, z)
+    if best is None:
+        raise ValueError("no increasing time column")
+    return best[1], best[2], best[3]
 
 
 def _seconds(cells: Iterable[Any]) -> np.ndarray:

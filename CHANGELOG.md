@@ -19,6 +19,19 @@ Two requests from the engineers' first runs of 0.7.0 and 0.7.1.
   recording terms.
 - A new ROI takes the lowest free number of its kind: after deleting Box 2 of
   Box 1 to 3, the next box is Box 2 again (it used to count on, to Box 4).
+  Joining zones back into their box gives it a free name if a new box has
+  taken the old one meanwhile.
+- A line endpoint dragged on a flipped or turned view lands on the pixel drawn
+  under the pointer; it could take the neighbouring one.
+
+### TC fit
+
+- A TC sheet whose time column stops rising is read over the rows where it
+  rises, and the summary says which rows were left out; it used to be refused
+  ("no increasing time column"). This happens in a lab workbook whose time
+  formulas were not filled down after its shift row changed, or that runs past
+  the end of its log (the engineers' 20261006b.xlsx has both). A column headed
+  as time is preferred over a TC that heats steadily.
 
 ### Documentation
 

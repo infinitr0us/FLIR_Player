@@ -1470,7 +1470,7 @@ class ThermalCanvas(QWidget):
             kind, anchor, _ = self._draft
             self._draft = (kind, anchor, self._draft_point(kind, wpos))
         elif self._drag is not None and self._drag_shape is not None:
-            self._drag_shape = self._dragged_shape(self._widget_to_image(wpos))
+            self._drag_shape = self._dragged_shape(self._widget_to_image(wpos), self._pixel_center_at(wpos))
         else:
             self._update_hover_cursor(wpos)
         self._track_pointer(wpos)
@@ -1587,7 +1587,10 @@ class ThermalCanvas(QWidget):
             return
         super().mouseReleaseEvent(event)
 
-    def _dragged_shape(self, image_pos: tuple[float, float]):
+    def _dragged_shape(self, image_pos: tuple[float, float], pixel_centre: tuple[float, float] | None = None):
+        """The dragged ROI with the pointer at ``image_pos``. ``pixel_centre`` is the centre of the
+        pixel drawn under the pointer, where a line endpoint lands (flooring ``image_pos`` picks the
+        neighbouring pixel on an axis a flip or turn reverses)."""
         drag = self._drag
         original = drag["orig"]
         pixel_points = original.kind in ("cursor", "line")
@@ -1602,7 +1605,10 @@ class ThermalCanvas(QWidget):
         if drag["handle"] in {"p0", "p1"} and len(original.points) == 2:
             index = 0 if drag["handle"] == "p0" else 1
             points = list(original.points)
-            points[index] = self._snap_to_center(image_pos) if pixel_points else image_pos
+            if pixel_points:
+                points[index] = pixel_centre if pixel_centre is not None else self._snap_to_center(image_pos)
+            else:
+                points[index] = image_pos
             return replace(original, points=tuple(points))
         # corner handles on rect/ellipse: anchor the opposite corner. Handles are
         # named as shown ("ne" = top right on screen), so find the image corner

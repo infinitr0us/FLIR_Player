@@ -65,7 +65,7 @@ class ZoneSplitDialog(FramelessDialog):
         self.gap_spin.setRange(0, 20)
         self.gap_spin.setSuffix(" px")
         self.gap_spin.setValue(spec.gap)
-        self.gap_spin.setToolTip("Pixel columns (rows, for a vertical split) left out between neighbouring zones")
+        self.gap_spin.setToolTip("Lines of pixels left out between neighbouring zones, where two cells meet")
         self.prefix_edit = QLineEdit(spec.prefix)
         self.prefix_edit.setToolTip("Zones are named prefix 1, prefix 2, …")
         (left, top), (right, bottom) = spec.box

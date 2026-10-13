@@ -841,6 +841,8 @@ class MainWindow(QMainWindow):
             self._zone_groups.append({"ids": [z.id for z in zones], "spec": new_spec, "name": box_name})
             self._notify(f"Split into {len(zones)} zones: {zones[0].name} to {zones[-1].name}")
         elif code == ZoneSplitDialog.JOIN and group is not None:
+            if any(shape.name == box_name for shape in others):  # a new box took the name meanwhile
+                box_name = self._free_roi_name("rect")
             box = RoiShape(self._roi_next_id, "rect", tuple(group["spec"].box), box_name)
             self._roi_next_id += 1
             self._replace_with(replaced, [box])
