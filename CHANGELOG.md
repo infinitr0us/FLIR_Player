@@ -30,8 +30,9 @@ Two requests from the engineers' first runs of 0.7.0 and 0.7.1.
   rises, and the summary says which rows were left out; it used to be refused
   ("no increasing time column"). This happens in a lab workbook whose time
   formulas were not filled down after its shift row changed, or that runs past
-  the end of its log (the engineers' 20261006b.xlsx has both). A column headed
-  as time is preferred over a TC that heats steadily.
+  the end of its log (the engineers' 20261006b.xlsx has both). Only columns
+  headed as time compete when one exists, a column with a temperature unit
+  never stands in for time, and dates and clock times keep their time zero.
 
 ### Documentation
 
