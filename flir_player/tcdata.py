@@ -266,7 +266,6 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
         raise ValueError("no block of at least three data rows")
     block = rows[first:last + 1]
     headers = rows[:first]
-    dropped = range(0)  # data rows cut at the top: not reported as headers
     cut = []  # rows left out where the time column stops rising (notes)
     try:
         tcol, scale = _time_column(block, headers, width, time_column)
@@ -280,11 +279,16 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
             cut.append(f"rows {first + 1}-{first + a}" if a > 1 else f"row {first + 1}")
         if z < len(block) - 1:
             cut.append(f"rows {first + z + 2}-{last + 1}" if z < len(block) - 2 else f"row {last + 1}")
-        block = block[a:z + 1]
-        dropped = range(first, first + a)
+        scale = _time_column(block[a:z + 1], headers, width, tcol)[1]
+        # Times as read over the whole block (dates and clock times keep their first row as zero);
+        # the rows left out are blanked so that they name no channel and are not reported again.
+        seconds = _seconds([row[tcol] for row in block])
+        for i in [*range(a), *range(z + 1, len(block))]:
+            rows[first + i] = (None,) * width
+        block = [row[:tcol] + ((float(seconds[i]),) if np.isfinite(seconds[i]) else (row[tcol],)) + row[tcol + 1:]
+                 for i, row in enumerate(block) if a <= i <= z]
         first, last = first + a, first + z
         headers = rows[:first]
-        scale = _time_column(block, headers, width, tcol)[1]
     timed = [_time_like(row[tcol]) for row in block]  # rows at the edges without a time are not data
     lead = timed.index(True) if True in timed else 0
     trail = len(timed) - 1 - timed[::-1].index(True) if True in timed else len(timed) - 1
@@ -339,8 +343,6 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     time_label = " ".join(reversed(_texts(titled, tcol))) or "Time"
     ignored = []
     for i, row in enumerate(headers):
-        if i in dropped:
-            continue
         texts = [str(v) for v in row if v is not None and str(v).strip()]
         if texts and not any(row is t for t in titled):
             ignored.append(f"row {i + 1} ({', '.join(texts)[:40]})")
@@ -353,7 +355,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     for c in copies:
         label = " ".join(reversed(_texts(titled, c))) or f"column {c + 1}"
         notes.append(f"column {label!r} is the time again in other units, so it is not used as a TC")
-    if trailing > 0 and not cut:
+    if trailing > 0:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
                    notes=tuple(notes))
@@ -497,15 +499,17 @@ def _rising_run(block: list[tuple], headers: list[tuple], width: int, requested)
     """(column, first, last) of the longest stretch of rows over which a time column rises.
 
     For a block in which no column rises throughout. The stretch must hold at least half of the
-    block's rows. A column headed as time wins over a longer one that is not (a TC heating steadily),
-    then the longer stretch, then a column in seconds.
+    block's rows. When a column is headed as time, only such columns count (a TC heating steadily
+    must not stand in for a broken time column); a column with a temperature unit never does. Then
+    the longer stretch wins, then a column in seconds.
     """
     if isinstance(requested, int):
         columns = [requested]
     elif requested is not None:
         columns = [_time_column(block, headers, width, requested)[0]]
     else:
-        columns = range(width)
+        timed = [c for c in range(width) if _time_evidence(headers, c) and not _temperature_unit(headers, c)]
+        columns = timed or [c for c in range(width) if not _temperature_unit(headers, c)]
     best = None
     for c in columns:
         seconds = _seconds([row[c] for row in block])
@@ -524,7 +528,7 @@ def _rising_run(block: list[tuple], headers: list[tuple], width: int, requested)
             continue
         unit = _time_scale(headers, c)
         rank = 0 if unit == 1.0 else (1 if unit is None else 2)
-        key = (not _time_evidence(headers, c), -(z - a), rank, c)
+        key = (-(z - a), rank, c)
         if best is None or key < best[0]:
             best = (key, c, a, z)
     if best is None:

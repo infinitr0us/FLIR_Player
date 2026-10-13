@@ -347,3 +347,33 @@ def test_the_engineers_1006b_workbook_reads():
     table = read_tc_table(SAMPLES / "1006" / "20261006b.xlsx", sheet="TC")
     assert table.names[:3] == ("T1", "T2", "T3") and (table.times[0], table.times[-1]) == (2.0, 2458.0)
     assert any("rows 5-6 and rows 2464-2862 were left out" in n for n in table.notes)
+
+
+def test_rising_stretch_review_cases():
+    """Second review pass: no temperature column as time, dates keep their zero, cut rows name no
+    channel, and other rows after the data are still reported."""
+    from datetime import datetime, timedelta
+
+    from flir_player.tcdata import parse_rows
+
+    times = [0, 1, 2, 0, 1, 2, 0, 1]
+    t1 = [20, 21, 22, 23, 24, 25, 26, 0]
+    t2 = [30, 29, 30, 29, 30, 29, 30, 0]
+    with pytest.raises(ValueError, match="no increasing time column"):  # a TC must not stand in for time
+        parse_rows([("Time [s]", "T1 [C]", "T2 [C]")] + list(zip(times, t1, t2)))
+
+    start = datetime(2026, 10, 1, 10, 0, 0)
+    offsets = [0, 5000, 3600, 3601, 3602, 3603, 3604, 10]
+    dated = parse_rows([("Date/Time", "TC A")] + [(start + timedelta(seconds=s), v) for s, v in
+                                                  zip(offsets, [20, 21, 23, 21, 24, 22, 24, 0])])
+    np.testing.assert_allclose(dated.times, [3600, 3601, 3602, 3603, 3604])  # as the numbers would read
+
+    named = parse_rows([("Time [s]", "T1", "T2"), (10, "OPEN", 20), (11, "OPEN", 21), (0, 22, 25), (1, 23, 24),
+                        (2, 24, 25), (3, 25, 24), (4, 26, 25), (-1, 0, 0)])
+    assert named.names == ("T1", "T2")
+    np.testing.assert_allclose(named.times, np.arange(5))
+
+    footer = parse_rows([("Time [s]", "T1")] + list(zip([0, 5, 1, 2, 3, 4, -1], [20, 21, 23, 21, 24, 22, 0]))
+                        + [("Acquisition stopped: sensor disconnected",)])
+    assert any("rows 2-3 and row 8 were left out" in n for n in footer.notes)
+    assert any("1 non-empty row(s) after the data block" in n for n in footer.notes)
