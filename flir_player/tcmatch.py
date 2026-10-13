@@ -547,6 +547,14 @@ def clock_estimate(logger_zero: datetime | None, recording_start: datetime | Non
     return ClockEstimate(lag_s=float(lag), hours=hours, note=note)
 
 
+def clock_relation(clock_s: float, match_s: float) -> str:
+    """"30 s later than the match": where the clocks put logger time 0, against the match."""
+    gap = clock_s - match_s
+    if abs(gap) < 0.5:
+        return "where the match put it"
+    return f"{_span(gap)} {'later' if gap > 0 else 'earlier'} than the match"
+
+
 def _span(seconds: float) -> str:
     seconds = abs(seconds)
     return f"{seconds / 60:.0f} min" if seconds >= 600 else f"{seconds:.0f} s"
@@ -829,15 +837,14 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
     too_few = np.array([not c.searchable for c in channels])
     U = U & ~too_few
     min_samples = np.maximum(30, options.min_overlap * n_valid)
-    lo = -(grid_bins[-1]) - 1
-    hi = nb - grid_bins[0]
-    lags_all = np.arange(lo, hi + 1)  # IR bin of logger bin 0 = lag_bins + grid_bins[0]
-    if options.lag_range is not None:
-        a_, b_ = options.lag_range
-        lags_all = lags_all[(lags_all * step >= a_) & (lags_all * step <= b_)]
     if options.lag_s is not None:
         fixed = int(round(options.lag_s / step))
         lags_all = np.arange(fixed - 2, fixed + 3)
+    else:
+        lags_all = _lag_bins(nb, grid_bins, step, options.lag_range)  # IR bin of logger bin 0 = lag + grid_bins[0]
+        if lags_all.size == 0:
+            a_, b_ = options.lag_range
+            raise ValueError(f"No time offset from {a_:g} to {b_:g} s leaves the logger and the recording overlapping")
     scan_lags = lags_all + grid_bins[0]
     curve, where = lag_scan(X, present, Y, U, scan_lags, min_samples=min_samples, abort=abort, progress=progress)
     lags_s = lags_all * step
@@ -915,6 +922,15 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
     return Location(lag_s=lag_bins * step, lag_fixed=options.lag_s is not None, channels=matches,
                     curve_lags_s=lags_s, curve_r=curve, binning=b, score=shared, runner_up_lag_s=runner_lag,
                     runner_up_score=runner)
+
+
+def _lag_bins(nb: int, grid_bins: np.ndarray, step: float, lag_range: tuple[float, float] | None) -> np.ndarray:
+    """The offsets (in bins) at which the logger and ``nb`` IR bins overlap, within ``lag_range`` (seconds)."""
+    lags = np.arange(-(grid_bins[-1]) - 1, nb - grid_bins[0] + 1)
+    if lag_range is not None:
+        a, b = lag_range
+        lags = lags[(lags * step >= a) & (lags * step <= b)]
+    return lags
 
 
 def _refine_lag(samples: Samples, b: int, lag_bins: int, lags_all: np.ndarray, where: np.ndarray,
@@ -1226,6 +1242,7 @@ class MatchResult:
     clock_lag_s: float | None = None  # recording time of logger time 0 by the camera and logger clocks
     clock_frame: int | None = None  # the frame there (0-based)
     clock_note: str = ""  # how the clocks gave it, or why they did not
+    near_clocks: bool = False  # the offset was searched only near the clocks' estimate
 
     def to_dict(self) -> dict:
         def clean(value):
@@ -1305,7 +1322,7 @@ class MatchResult:
             reflected_c=num(data["reflected_c"]), calibration=str(data["calibration"]), spot=int(data["spot"]),
             options=dict(data.get("options") or {}), clock_lag_s=opt(data.get("clock_lag_s")),
             clock_frame=int(data["clock_frame"]) if data.get("clock_frame") is not None else None,
-            clock_note=str(data.get("clock_note") or ""))
+            clock_note=str(data.get("clock_note") or ""), near_clocks=bool(data.get("near_clocks", False)))
 
 
 def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
@@ -1336,6 +1353,7 @@ def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
 def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress: Progress | None = None,
             abort: Abort | None = None) -> tuple[MatchResult, Location, dict]:
     """Locate, select events, fit. Returns the result, the location and the per-channel series."""
+    given = options  # recorded in the result as given (a given frame stays a frame when the fit is reopened)
     if options.lag_frame is not None:  # a frame is timed as the statistics are (by the clock on superframing)
         options = dataclass_replace(options, lag_s=samples.seconds_at(int(options.lag_frame)), lag_frame=None)
     grid, channels = prepare_channels(table, options, samples.step)
@@ -1350,11 +1368,16 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     search = options  # the clock window narrows the search only; the result records the options as given
     early: list[str] = []
     if options.clock_window_s is not None and options.lag_s is None and options.lag_range is None:
-        if by_clocks is not None:
-            window = float(options.clock_window_s)
-            search = dataclass_replace(options, lag_range=(by_clocks.lag_s - window, by_clocks.lag_s + window))
+        window = float(options.clock_window_s)
+        span = (by_clocks.lag_s - window, by_clocks.lag_s + window) if by_clocks is not None else None
+        if span is not None and _lag_bins(samples.mean.shape[0], np.rint(grid / samples.step).astype(np.int64),
+                                          samples.step, span).size:
+            search = dataclass_replace(options, lag_range=span)
         else:
-            early.append(f"No time match near the clocks: {no_clock}, so the whole recording was searched.")
+            why = no_clock if by_clocks is None else (
+                f"within {window:g} s of the clocks' {by_clocks.lag_s:.0f} s the logger and the recording's "
+                "frames do not overlap")
+            early.append(f"No time match near the clocks: {why}, so the whole recording was searched.")
     location = locate(samples, grid, channels, search, progress=progress, abort=abort)
     step = samples.step
     lag_bins = int(round(location.lag_s / step))
@@ -1540,8 +1563,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         tc_spread=tc_spread, tcs_agree=tcs_agree, common_eps=common, origin_s=origin_s, warnings=warnings,
         notes=notes,
         reflected_c=reflected_k - KELVIN, calibration=samples.report.message, spot=options.spot,
-        options=_options_dict(options),
-        clock_lag_s=by_clocks.lag_s if by_clocks is not None else None,
+        options=_options_dict(given),
+        clock_lag_s=by_clocks.lag_s if by_clocks is not None else None, near_clocks=search is not options,
         clock_frame=samples.frame_at(by_clocks.lag_s) if by_clocks is not None else None,
         clock_note=by_clocks.note if by_clocks is not None else no_clock)
     _check(abort)
@@ -1585,7 +1608,7 @@ def summary_text(result: MatchResult) -> str:
     """Plain-language summary for the engineers."""
     window = result.options.get("clock_window_s")
     how = (" (given)" if result.lag_fixed
-           else f" (searched within {window:.0f} s of the clocks)" if window is not None and result.clock_lag_s is not None
+           else f" (searched within {window:.0f} s of the clocks)" if result.near_clocks and window is not None
            else "")
     lines = [f"Recording: {result.recording} ({result.camera}, {result.fps:.2f} fps"
              + (f", preset {result.preset}" if result.preset is not None else "") + ")",
@@ -1595,7 +1618,7 @@ def summary_text(result: MatchResult) -> str:
     if result.clock_lag_s is not None:
         frame = f" (frame {result.clock_frame + 1})" if result.clock_frame is not None else ""
         lines += [f"Clocks: logger time 0 at about {result.clock_lag_s:.0f} s{frame}, "
-                  f"{result.lag_s - result.clock_lag_s:+.0f} s from the match.",
+                  f"{clock_relation(result.clock_lag_s, result.lag_s)}.",
                   f"  {result.clock_note[:1].upper()}{result.clock_note[1:]}."]
     elif result.clock_note:
         lines.append(f"Clocks: not compared, as {result.clock_note}.")

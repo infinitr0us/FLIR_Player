@@ -70,8 +70,8 @@ class TcTable:
     time_label: str = ""
     notes: tuple[str, ...] = ()
     sheet: str = ""  # the workbook sheet read ("" for a text table)
-    # (row, column), 1-based, of the first data row's time cell, and the time unit in s (for the logger clock)
-    time_cell: tuple[int, int] | None = None
+    # (first row, last row, column), 1-based, of the time cells read, and the time unit in s (for the logger clock)
+    time_cells: tuple[int, int, int] | None = None
     time_unit_s: float = 1.0
     clock_zero: datetime | None = None  # the logger's wall clock at logger time 0 (a lab workbook's LogFile sheet)
     clock_note: str = ""  # where clock_zero comes from, or why there is none
@@ -176,11 +176,12 @@ def logger_clock(path: str | Path, sheet: str, table: TcTable) -> tuple[datetime
     """The logger's wall clock at logger time 0 of ``table`` (read from ``sheet`` of the workbook ``path``)
     and where it comes from; (None, why not) when the workbook does not tell.
 
-    Only a lab workbook tells (see ``_DIFFERENCE``), and only when the first data row's time cell holds
-    the difference its formula names, so a moved row or a pasted value gives no clock rather than a
-    wrong one. Never raises.
+    Only a lab workbook tells (see ``_DIFFERENCE``), and only when every time cell the table was read from
+    subtracts the same Log row of an elapsed-time column that starts at 0 (the start of logging) and holds
+    the difference its formula names, so a half-edited sheet, another column or a stale value gives no
+    clock rather than a wrong one. Never raises.
     """
-    if table.time_cell is None:
+    if table.time_cells is None:
         return None, "the TC times do not come from a sheet"
     try:
         return _logger_clock(Path(path), sheet, table)
@@ -188,56 +189,86 @@ def logger_clock(path: str | Path, sheet: str, table: TcTable) -> tuple[datetime
         return None, f"the logger's clock could not be read: {type(exc).__name__} {exc}"
 
 
+_NOT_FORMULAS = "the TC times are not formulas on the logger's elapsed time, as in a lab workbook"
+
+
 def _logger_clock(path: Path, sheet: str, table: TcTable) -> tuple[datetime | None, str]:
     import openpyxl
     from openpyxl.utils import column_index_from_string
 
-    row, col = table.time_cell
+    first, last, col = table.time_cells
     book = openpyxl.load_workbook(path, read_only=True, data_only=False)
     try:
-        formula = _cell(book[sheet], row, col)
+        formulas = _column(book[sheet], col, first, last)
         logs = [ws.title for ws in book.worksheets if _LOGFILE_SHEET.match(ws.title)]
     finally:
         book.close()
-    match = _DIFFERENCE.match(formula.strip()) if isinstance(formula, str) else None
-    if match is None:
-        return None, "the TC times are not formulas on the logger's elapsed time, as in a lab workbook"
-    (a_sheet, a_col, a_row), (b_sheet, b_col, b_row) = (
-        ((match[f"{k}q"].replace("''", "'") if match[f"{k}q"] else match[f"{k}n"]), match[f"{k}c"].upper(),
-         int(match[f"{k}r"])) for k in "ab")
-    if (a_sheet, a_col) != (b_sheet, b_col):
-        return None, "the TC time formula does not subtract one logger time from another"
+    refs: dict[int, tuple[str, str, int, int]] = {}  # sheet row → (source sheet, column, its row, row of time 0)
+    for row, formula in zip(range(first, last + 1), formulas):
+        if formula is None:
+            continue  # a row without a time (the reader skipped it)
+        match = _DIFFERENCE.match(formula.strip()) if isinstance(formula, str) else None
+        if match is None:
+            return None, _NOT_FORMULAS
+        (a_sheet, a_col, a_row), (b_sheet, b_col, b_row) = (
+            ((match[f"{k}q"].replace("''", "'") if match[f"{k}q"] else match[f"{k}n"]), match[f"{k}c"].upper(),
+             int(match[f"{k}r"])) for k in "ab")
+        if (a_sheet, a_col) != (b_sheet, b_col):
+            return None, "the TC time formulas do not subtract one logger time from another"
+        refs[row] = (a_sheet, a_col, a_row, b_row)
+    if not refs:
+        return None, _NOT_FORMULAS
+    origins = sorted({(s, c, z) for s, c, _a, z in refs.values()})
+    if len(origins) != 1:
+        rows = ", ".join(f"{s}!{c}{z}" for s, c, z in origins[:3]) + (", ..." if len(origins) > 3 else "")
+        return None, f"the TC time formulas subtract different logger times ({rows}): a half-edited sheet"
+    (source, letter, zero_row), = origins
     if len(logs) != 1:
         return None, ("no LogFile sheet gives the logger's start" if not logs
                       else f"{len(logs)} LogFile sheets: which one started the log is unclear")
+    end = max(zero_row, max(a for _s, _c, a, _z in refs.values()))
     book = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
-        shown = _number(_cell(book[sheet], row, col))
-        now = _number(_cell(book[a_sheet], a_row, column_index_from_string(a_col)))
-        zero = _number(_cell(book[b_sheet], b_row, column_index_from_string(b_col)))
+        shown = _column(book[sheet], col, first, last)
+        elapsed = _column(book[source], column_index_from_string(letter), 1, end)
         start = _log_start(book[logs[0]])
     finally:
         book.close()
-    if shown is None or now is None or zero is None:
-        return None, f"the logger times at {a_sheet}!{a_col}{a_row} and {b_sheet}!{b_col}{b_row} are not numbers"
-    if abs((now - zero) - shown) > 1e-6 * max(1.0, abs(shown)):
-        return None, "the TC time cell does not hold the difference its formula names; the sheet may need recalculating"
-    source = "its Date/Time cell"
+    header = elapsed[0]
+    numbers = [_number(v) for v in elapsed[1:]]  # sheet rows 2 to end
+    if not (isinstance(header, str) and re.search(r"time", header, re.IGNORECASE)):
+        return None, f"{source}!{letter}1 does not head an elapsed time"
+    if next((v for v in numbers if v is not None), None) != 0:
+        return None, f"{source}!{letter} does not start at 0, so it does not count from the start of logging"
+
+    def at(row: int) -> float | None:
+        return numbers[row - 2] if 2 <= row <= end else None
+
+    zero = at(zero_row)
+    for row, (_s, _c, a_row, _z) in refs.items():
+        now, cell = at(a_row), _number(shown[row - first])
+        if zero is None or now is None or cell is None:
+            return None, f"the logger times at {source}!{letter}{a_row} and {letter}{zero_row} are not numbers"
+        if abs((now - zero) - cell) > 1e-6 * max(1.0, abs(cell)):
+            return None, (f"the TC time in row {row} does not hold the difference its formula names; the sheet "
+                          "may need recalculating")
+    source_text = "its Date/Time cell"
     if start is None:
         stamp = _LOGFILE_STAMP.search(logs[0])
         if stamp is None:
             return None, f"sheet {logs[0]!r} does not say when logging started"
-        start, source = datetime(*(int(v) for v in stamp.groups())), "its name"
+        start, source_text = datetime(*(int(v) for v in stamp.groups())), "its name"
     offset = zero * table.time_unit_s
     return start + timedelta(seconds=offset), (
-        f"logging started {start:%Y-%m-%d %H:%M:%S} by sheet {logs[0]!r} ({source}); logger time 0 is "
-        f"{b_sheet}!{b_col}{b_row}, {offset:g} s later")
+        f"logging started {start:%Y-%m-%d %H:%M:%S} by sheet {logs[0]!r} ({source_text}); logger time 0 is "
+        f"{source}!{letter}{zero_row}, {offset:g} s later")
 
 
-def _cell(ws, row: int, col: int) -> Any:
-    for values in ws.iter_rows(min_row=row, max_row=row, min_col=col, max_col=col, values_only=True):
-        return values[0] if values else None
-    return None
+def _column(ws, col: int, first: int, last: int) -> list[Any]:
+    """The values of column ``col`` in rows ``first`` to ``last`` (None past the sheet's end)."""
+    cells = [row[0] if row else None
+             for row in ws.iter_rows(min_row=first, max_row=last, min_col=col, max_col=col, values_only=True)]
+    return (cells + [None] * (last - first + 1))[:last - first + 1]
 
 
 def _log_start(ws) -> datetime | None:
@@ -456,7 +487,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     if trailing > 0:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
-                   notes=tuple(notes), time_cell=(first + 1, tcol + 1), time_unit_s=scale)
+                   notes=tuple(notes), time_cells=(first + 1, last + 1, tcol + 1), time_unit_s=scale)
 
 
 def _counter(cells: list[Any]) -> bool:

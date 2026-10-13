@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import zipfile
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -28,10 +29,19 @@ START = datetime(2026, 10, 6, 10, 46, 36, 701000)
 
 
 def _lab_workbook(path: Path, *, shift: int = 360, rows: int = 900, half_edited: bool = False,
-                  formulas: bool = True, logfile: bool = True, date_cell: bool = True,
-                  wrong_cache: bool = False) -> Path:
+                  formulas: bool = True, logfile: bool = True, date_cell: bool = True, stale_from: int | None = None,
+                  refs=None, column: str = "E", elapsed_from: float = 0.0) -> Path:
     """A workbook laid out like the engineers' (LogFile, Log and TC sheets; TC times as formulas with their
-    values cached, as Excel saves them). ``half_edited``: rows 5-6 subtract the Log row 217, the rest 360."""
+    values cached, as Excel saves them). ``half_edited``: rows 5-6 subtract the Log row 217, the rest 360;
+    ``refs(i)`` gives (Log row, Log row of time 0) of data row i instead; ``stale_from``: cached times 5 s off
+    their formulas from that data row on; ``column``: the Log column subtracted (E elapsed seconds counting
+    from ``elapsed_from``, F a temperature)."""
+    if refs is None:
+        def refs(i):
+            if half_edited and i < 2:
+                return (217, 217) if i == 0 else (shift + 1, 217)
+            return shift + i, shift
+    pairs = [refs(i) for i in range(rows)]
     book = openpyxl.Workbook()
     book.active.title = "Constants"
     if logfile:
@@ -40,22 +50,21 @@ def _lab_workbook(path: Path, *, shift: int = 360, rows: int = 900, half_edited:
         ws.append(["LogFile_2026-10-06-10-46-36", None, None, START if date_cell else "today", 2])
     log = book.create_sheet("Log")
     log.append(["A_Time*", "A", "B_Time*", "B", "Tree_Time*", "Tree"])
-    for k in range(rows + shift):
-        log.append([k, 0.0, k, 0.0, k, 7.5])  # Log row k + 2 holds elapsed second k
+    logged = {"E": lambda k: k + elapsed_from, "F": lambda k: 20.0 + 0.5 * k}  # Log row k + 2 holds second k
+    for k in range(max(max(pair) for pair in pairs)):
+        log.append([k, 0.0, k, 0.0, logged["E"](k), logged["F"](k)])
     tc = book.create_sheet("TC")
     tc.append(["Time", "ELAPSED TIME", None, None, None, "Free_0r", "Free_0r", "Free_0r"])
     tc.append(["From Ignition", "[sec]", None, None, None, "T1", "Cell Temp", "TRIM temp"])
     tc.append([None, shift])
     tc.append(["[mim]", "shft time"])
     cached = {}
-    for i in range(rows):
+    for i, (source, ref) in enumerate(pairs):
         r = 5 + i
-        ref = 217 if half_edited and i < 2 else shift
-        source = (217 + i if i == 0 else shift + 1) if half_edited and i < 2 else shift + i
-        value = (source - 2) - (ref - 2)
-        if wrong_cache:  # every value 5 s off its formula (not recalculated)
+        value = logged[column](source - 2) - logged[column](ref - 2)
+        if stale_from is not None and i >= stale_from:
             value += 5
-        b = f"=Log!E{source}-Log!E${ref}" if formulas else value
+        b = f"=Log!{column}{source}-Log!{column}${ref}" if formulas else value
         tc.append([f"=(B{r}-0)/60" if formulas else value / 60, b, None, None, None,
                    20.0 + 10.0 * abs(np.sin(i / 30.0)), 600.0 - 0.1 * i, 650.0 - 0.1 * i])  # no rising column
         cached[f"B{r}"], cached[f"A{r}"] = value, value / 60
@@ -99,7 +108,7 @@ def test_cell_and_trim_temps_start_unticked_like_the_tc_tree(qapp, tmp_path) -> 
 
 def test_a_lab_workbook_gives_the_logger_clock_at_time_0(tmp_path) -> None:
     table = read_tc_table(_lab_workbook(tmp_path / "lab.xlsx"))
-    assert table.sheet == "TC" and table.times[0] == 0.0 and table.time_cell == (5, 2)
+    assert table.sheet == "TC" and table.times[0] == 0.0 and table.time_cells == (5, 904, 2)
     assert table.clock_zero == START + timedelta(seconds=358)  # Log row 360 = elapsed 358 s
     assert table.clock_note == ("logging started 2026-10-06 10:46:36 by sheet 'LogFile_2026-10-06-10-46-36 (ro' "
                                 "(its Date/Time cell); logger time 0 is Log!E360, 358 s later")
@@ -109,7 +118,7 @@ def test_a_lab_workbook_gives_the_logger_clock_at_time_0(tmp_path) -> None:
 
 def test_a_half_edited_sheet_takes_the_clock_of_the_rows_read(tmp_path) -> None:
     table = read_tc_table(_lab_workbook(tmp_path / "lab.xlsx", half_edited=True))
-    assert table.time_cell == (7, 2) and any("left out" in n for n in table.notes)
+    assert table.time_cells == (7, 904, 2) and any("left out" in n for n in table.notes)
     assert table.clock_zero == START + timedelta(seconds=358)  # rows 7+ subtract Log row 360, not 217
 
 
@@ -118,8 +127,8 @@ def test_no_clock_unless_the_workbook_says_it(tmp_path) -> None:
     assert values.clock_zero is None and "not formulas" in values.clock_note
     no_log = read_tc_table(_lab_workbook(tmp_path / "nolog.xlsx", logfile=False))
     assert no_log.clock_zero is None and "no LogFile sheet" in no_log.clock_note
-    stale = read_tc_table(_lab_workbook(tmp_path / "stale.xlsx", wrong_cache=True))
-    assert stale.clock_zero is None and "does not hold the difference" in stale.clock_note
+    stale = read_tc_table(_lab_workbook(tmp_path / "stale.xlsx", stale_from=0))
+    assert stale.clock_zero is None and "row 5 does not hold the difference" in stale.clock_note
     by_name = read_tc_table(_lab_workbook(tmp_path / "name.xlsx", date_cell=False))
     assert by_name.clock_zero == START.replace(microsecond=0) + timedelta(seconds=358)
     assert "its name" in by_name.clock_note
@@ -184,7 +193,7 @@ def test_the_search_stays_near_the_clocks_and_reports_them() -> None:
     assert not any("clock" in w for w in result.warnings)
     text = tcmatch.summary_text(result)
     assert "(searched within 120 s of the clocks)" in text and "Clocks: logger time 0 at about 167 s" in text
-    assert "-30 s from the match" in text and "  Logging started (test); the recording's first frame" in text
+    assert "30 s later than the match" in text and "  Logging started (test); the recording's first frame" in text
     back = MatchResult.from_dict(result.to_dict())
     assert (back.clock_lag_s, back.clock_frame, back.clock_note) == (167.0, 167 * 30, result.clock_note)
     assert back.options["clock_window_s"] == CLOCK_WINDOW_S and back.options["lag_range"] is None
@@ -281,5 +290,84 @@ def test_the_results_headline_names_the_clocks(qapp) -> None:
     result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=CLOCK_WINDOW_S))
     dialog = TcResultsDialog(tcmatch.RunOutput(result=result, table=table), None)
     texts = [label.text() for label in dialog.findChildren(QLabel)]
-    assert any("The clocks put it at frame 5,011, -30 s from the match." in t for t in texts)
+    assert any("The clocks put it at frame 5,011, 30 s later than the match." in t for t in texts)
+    dialog.deleteLater()
+
+
+# --- review findings (Codex, 2026-10-13) ------------------------------------------------------------------
+
+
+def test_r1_every_time_cell_must_subtract_the_same_log_row_and_hold_its_difference(tmp_path) -> None:
+    # row 5 subtracts Log row 360, the rest Log row 960: still rising, so the reader keeps every row
+    mixed = read_tc_table(_lab_workbook(tmp_path / "mixed.xlsx",
+                                        refs=lambda i: (360, 360) if i == 0 else (960 + i, 960)))
+    assert mixed.time_cells == (5, 904, 2) and not any("left out" in n for n in mixed.notes)
+    assert mixed.clock_zero is None and "subtract different logger times (Log!E360, Log!E960)" in mixed.clock_note
+    stale = read_tc_table(_lab_workbook(tmp_path / "stale.xlsx", stale_from=40))  # later rows not recalculated
+    assert stale.clock_zero is None and "row 45 does not hold the difference" in stale.clock_note
+
+
+def test_r2_only_an_elapsed_time_counting_from_the_start_of_logging_gives_the_clock(tmp_path) -> None:
+    shifted = read_tc_table(_lab_workbook(tmp_path / "shifted.xlsx", elapsed_from=-900.0))
+    assert shifted.clock_zero is None and "does not start at 0" in shifted.clock_note
+    temperature = read_tc_table(_lab_workbook(tmp_path / "temp.xlsx", column="F"))
+    assert temperature.clock_zero is None and "Log!F1 does not head an elapsed time" in temperature.clock_note
+
+
+def test_r3_a_window_without_offsets_searches_everything_and_an_empty_range_is_an_error() -> None:
+    samples, table = _clocked(137 + 30.25)  # no whole second within 0.1 s of 167.25 s
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=0.1))
+    assert result.lag_s == 137.0 and not result.near_clocks
+    assert any("within 0.1 s of the clocks' 167 s the logger and the recording's frames do not overlap" in w
+               for w in result.warnings)
+    with pytest.raises(ValueError, match="No time offset from 5000 to 6000 s"):
+        tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_range=(5000.0, 6000.0)))
+
+
+def test_r4_superframing_shows_the_clocks_in_seconds_only(qapp, tmp_path) -> None:
+    from flir_player.models import PresetRange
+    from flir_player.tc_dialog import TcCalibrationDialog
+
+    lab = _lab_workbook(tmp_path / "lab.xlsx")
+    zero = START + timedelta(seconds=358)
+    meta = replace(_metadata(tmp_path, zero - timedelta(seconds=400)),
+                   presets=(PresetRange(1, 7000, 523.0, 873.0), PresetRange(2, 7000, 773.0, 1473.0)))
+    dialog = TcCalibrationDialog(meta, (), current_frame=0)
+    dialog.file_edit.setText(str(lab))
+    dialog._load(sheet=None)
+    assert _loaded(qapp, dialog)
+    assert dialog.clock_label.text() == "Clocks: logger time 0 at about 6 min 40 s into the recording."
+    dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("frame"))
+    dialog.frame_spin.setValue(9000)
+    assert "frame given" not in dialog.clock_label.text()  # frames are clock-timed: no frame arithmetic
+    dialog.deleteLater()
+
+
+def test_r5_the_summary_names_the_clock_window_only_when_it_was_used() -> None:
+    samples, table = _clocked(137 + 30)
+    ranged, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=CLOCK_WINDOW_S,
+                                                                   lag_range=(100.0, 200.0)))
+    assert ranged.lag_s == 137.0 and not ranged.near_clocks
+    assert "searched within" not in tcmatch.summary_text(ranged)
+    assert MatchResult.from_dict(ranged.to_dict()).near_clocks is False
+
+
+def test_r6_a_given_frame_is_kept_as_given_and_older_given_offsets_reopen_as_frames(qapp, tmp_path) -> None:
+    from flir_player.tc_dialog import TcCalibrationDialog, saved_request
+
+    samples, table = make_scene()
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_frame=137 * 30))
+    assert result.lag_fixed and result.options["lag_frame"] == 137 * 30 and result.options["lag_s"] is None
+
+    def saved(res):
+        return tcmatch.SavedRun(result=res, folder=tmp_path, tc_file=None, tc_name="lab.xlsx", sheet=None,
+                                time_column=None, parameters=None, options=tcmatch.options_from_dict(res.options))
+
+    old = result.to_dict()
+    old["options"].update(lag_frame=None, lag_s=137.0)  # how fits before 0.7.3 recorded a given frame
+    old["options"].pop("clock_window_s")
+    previous = saved_request(saved(MatchResult.from_dict(old)), table)
+    assert previous["options"].lag_frame == 137 * 30 and previous["options"].clock_window_s is None
+    dialog = TcCalibrationDialog(_metadata(tmp_path), (), current_frame=0, previous={"options": previous["options"]})
+    assert dialog.time_combo.currentData() == "frame" and dialog.frame_spin.value() == 137 * 30 + 1
     dialog.deleteLater()

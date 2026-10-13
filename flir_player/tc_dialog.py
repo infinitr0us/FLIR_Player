@@ -56,6 +56,7 @@ from .tcmatch import (
     RunOutput,
     SavedRun,
     clock_estimate,
+    clock_relation,
     load_saved_run,
     roi_shapes,
     saved_run,
@@ -148,7 +149,10 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
     """The setup dialog's ``previous`` settings for a reopened fit: TC file (``tc_file``, where it was found,
     else where the fit read it), channels, region, options."""
     options = saved.options
-    if "clock_window_s" not in saved.result.options and options.lag_s is None and options.lag_frame is None:
+    if options.lag_s is not None and options.lag_frame is None:
+        # a given offset that fits before 0.7.3 recorded in seconds: offered again as its frame
+        options = replace(options, lag_s=None, lag_frame=saved.result.ignition_frame)
+    if "clock_window_s" not in saved.result.options and options.lag_frame is None:
         options = replace(options, clock_window_s=CLOCK_WINDOW_S)  # a run from before 0.7.3: the clocks were unknown
     names = table.names if table is not None else options.channels
     chosen = set(options.channels) if options.channels else None
@@ -624,7 +628,8 @@ class TcCalibrationDialog(FramelessDialog):
                    else "the clocks put the logger's data outside this recording")
             return (f"Clocks: {why}" + (", so the whole recording is searched." if mode == "clock" else "."),
                     self.table.clock_note)
-        fps = self.metadata.nominal_fps or 0.0
+        # superframing frames are timed by the camera clock, which the dialog does not have: seconds only
+        fps = (self.metadata.nominal_fps or 0.0) if not self.metadata.presets else 0.0
         frame = f"frame {round(estimate.lag_s * fps) + 1:,}, " if fps > 0 else ""
         minutes, seconds = divmod(round(abs(estimate.lag_s)), 60)
         sign = "minus " if estimate.lag_s < 0 else ""
@@ -757,7 +762,7 @@ class TcResultsDialog(FramelessDialog):
         clocks = ""
         if result.clock_lag_s is not None:
             frame = f"frame {result.clock_frame + 1:,}, " if result.clock_frame is not None else ""
-            clocks = (f" The clocks put it at {frame}{result.lag_s - result.clock_lag_s:+.0f} s from the match.")
+            clocks = f" The clocks put it at {frame}{clock_relation(result.clock_lag_s, result.lag_s)}."
         headline = QLabel(f"Logger time 0 = frame {result.ignition_frame + 1:,} (recording time "
                           f"{result.lag_s:.0f} s){given}.{clocks} {len(found)} of {len(result.channels)} TC(s) "
                           f"found, {len(valued)} with an emissivity.")
