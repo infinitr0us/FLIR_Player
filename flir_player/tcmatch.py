@@ -29,6 +29,14 @@ The method of the 0922 battery test, made reusable:
 
 Seconds: "recording time" is frame index / frame rate; "logger time" is the
 TC file's own time column. ``lag_s`` is the recording time of logger time 0.
+
+The TC shapes alone may not fix the offset: where a fire spreads cell by cell,
+every cell's curve resembles the next one's some minutes later, so one TC
+correlates almost equally well at many offsets (the 1006 A700: 0.95 from
+-300 to 3,000 s). When the TC file gives the logger's clock (a lab workbook)
+and the recording has one, ``clock_estimate`` puts logger time 0 in the
+recording by the clocks, and ``MatchOptions.clock_window_s`` keeps the search
+near it; a match far from the clocks is reported either way.
 """
 from __future__ import annotations
 
@@ -78,6 +86,10 @@ MIN_TC_RANGE_K = 10.0  # nor one whose readings span less than this (5th to 95th
 REFINE_BINS = 10  # the binned offset is refined at full resolution within this many bins
 AMBIGUOUS_SCORE = 0.01  # a shared offset this close to the best one (a minute or more away) is a warning
 MAX_CANDIDATES = 200  # nearby pixels (best-correlated first) whose emissivity spread is reported
+# Camera and logger clocks agreed within 40 s on the engineers' tests (0922, 0903, 1006), once whole hours
+# are set aside: cameras keep UTC or a time zone without daylight saving, the logger PC local time.
+CLOCK_WINDOW_S = 120.0  # "near the clocks": the offset is searched this close to their estimate
+CLOCK_TOLERANCE_S = 120.0  # a match (or a given offset) further than this from the clocks is a warning
 PHYSICAL_EPS_MAX = 1.05  # an event whose unconstrained fit wants more than this is not physical
 EPS_GRID = np.round(np.arange(20, 1001) / 1000.0, 3)  # bounded fit: 0.02 to 1 (bare metal is low)
 FIT_BLOCK = 2048  # samples per block of the bounded fit (memory: grid × block)
@@ -100,6 +112,7 @@ class MatchOptions:
     lag_s: float | None = None  # fixed offset (recording seconds of logger time 0)
     lag_frame: int | None = None  # fixed offset as the frame (0-based) of logger time 0; wins over ``lag_s``
     lag_range: tuple[float, float] | None = None  # search window for the offset (recording seconds)
+    clock_window_s: float | None = None  # search only this close to the clocks' offset (None: anywhere)
     pixels: Mapping[str, tuple[int, int]] = field(default_factory=dict)  # fixed (row, col) per channel
     spot: int = 3  # spot block N (N × N pixels)
     min_overlap: float = 0.6  # share of a TC's usable samples the recording must cover
@@ -333,6 +346,8 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             repair = TimestampRepair(path)
             rate = recording_rate(im, repair)
             fps = rate.fps
+            im.get_frame(0)
+            start = repair(im.frame_info.time)  # the camera's clock at recording time 0
             if cache_dir is not None:
                 cache_dir = Path(cache_dir)
                 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +356,7 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
                 "camera": str(getattr(im.source_info, "camera_model", "") or "").strip(),
                 "frames": n, "fps": fps, "clock_fps": rate.clock_fps, "rate_corrected": rate.corrected,
                 "region": [x0, y0, x1, y1], "presets": {str(k): v for k, v in layout.ranges.items()},
+                "clock_start": start if isinstance(start, datetime) else None,
             }
             preset, limits = choose_preset(layout, options.preset)
             if preset is not None:
@@ -485,6 +501,55 @@ def _load_cache(cache_dir: Path, key: str):
     if mean.shape[0] != times.size or spread.shape != mean.shape:
         return None
     return times, mean, spread, counts, first_frame
+
+
+# --- clocks ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClockEstimate:
+    """Where the camera and logger clocks put logger time 0 in the recording."""
+
+    lag_s: float  # recording seconds of logger time 0
+    hours: int  # whole hours set aside between the clocks (time zones)
+    note: str  # how it was found, for the summary
+
+
+def clock_estimate(logger_zero: datetime | None, recording_start: datetime | None, tc_times: np.ndarray,
+                   duration_s: float, *, logger_note: str = "") -> ClockEstimate | None:
+    """The recording time of logger time 0 by the clocks; None when a clock is missing or the clocks put
+    the log outside the recording.
+
+    Whole hours between the clocks are set aside: cameras keep UTC (the A700) or a zone without daylight
+    saving (the T650), the logger PC local time. Of the offsets whole hours apart, the one closest to
+    recording time 0 that puts at least half the log (or half the recording, when that is shorter)
+    inside the recording is taken.
+    """
+    times = np.asarray(tc_times, dtype=np.float64)
+    times = times[np.isfinite(times)]
+    if logger_zero is None or recording_start is None or times.size == 0 or not duration_s > 0:
+        return None
+    base = (logger_zero.replace(tzinfo=None) - recording_start.replace(tzinfo=None)).total_seconds()
+    t0, t1 = float(times.min()), float(times.max())
+    need = 0.5 * min(t1 - t0, duration_s)
+    best: tuple[float, int] | None = None
+    for hours in range(-48, 49):
+        lag = base + 3600.0 * hours
+        overlap = min(lag + t1, duration_s) - max(lag + t0, 0.0)
+        if overlap > 0 and overlap >= need and (best is None or abs(lag) < abs(best[0])):
+            best = (lag, hours)
+    if best is None:
+        return None
+    lag, hours = best
+    note = ((f"{logger_note}; " if logger_note else "")
+            + f"the recording's first frame {recording_start:%Y-%m-%d %H:%M:%S}"
+            + (f"; {abs(hours)} h of time-zone difference between the clocks set aside" if hours else ""))
+    return ClockEstimate(lag_s=float(lag), hours=hours, note=note)
+
+
+def _span(seconds: float) -> str:
+    seconds = abs(seconds)
+    return f"{seconds / 60:.0f} min" if seconds >= 600 else f"{seconds:.0f} s"
 
 
 # --- the TC side ---------------------------------------------------------------------------
@@ -1158,6 +1223,9 @@ class MatchResult:
     calibration: str
     spot: int
     options: dict
+    clock_lag_s: float | None = None  # recording time of logger time 0 by the camera and logger clocks
+    clock_frame: int | None = None  # the frame there (0-based)
+    clock_note: str = ""  # how the clocks gave it, or why they did not
 
     def to_dict(self) -> dict:
         def clean(value):
@@ -1235,7 +1303,9 @@ class MatchResult:
             common_eps=opt(data.get("common_eps")), origin_s=opt(data.get("origin_s")),
             warnings=list(data.get("warnings") or ()), notes=list(data.get("notes") or ()),
             reflected_c=num(data["reflected_c"]), calibration=str(data["calibration"]), spot=int(data["spot"]),
-            options=dict(data.get("options") or {}))
+            options=dict(data.get("options") or {}), clock_lag_s=opt(data.get("clock_lag_s")),
+            clock_frame=int(data["clock_frame"]) if data.get("clock_frame") is not None else None,
+            clock_note=str(data.get("clock_note") or ""))
 
 
 def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
@@ -1269,7 +1339,23 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     if options.lag_frame is not None:  # a frame is timed as the statistics are (by the clock on superframing)
         options = dataclass_replace(options, lag_s=samples.seconds_at(int(options.lag_frame)), lag_frame=None)
     grid, channels = prepare_channels(table, options, samples.step)
-    location = locate(samples, grid, channels, options, progress=progress, abort=abort)
+    n_frames = int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1))
+    start = samples.info.get("clock_start")
+    by_clocks = clock_estimate(table.clock_zero, start, table.times, samples.seconds_at(max(0, n_frames - 1)),
+                           logger_note=table.clock_note)
+    if by_clocks is None:
+        no_clock = ((table.clock_note or "the TC file does not give the logger's clock") if table.clock_zero is None
+                    else "the recording has no clock" if start is None
+                    else "the clocks put the logger's data outside this recording")
+    search = options  # the clock window narrows the search only; the result records the options as given
+    early: list[str] = []
+    if options.clock_window_s is not None and options.lag_s is None and options.lag_range is None:
+        if by_clocks is not None:
+            window = float(options.clock_window_s)
+            search = dataclass_replace(options, lag_range=(by_clocks.lag_s - window, by_clocks.lag_s + window))
+        else:
+            early.append(f"No time match near the clocks: {no_clock}, so the whole recording was searched.")
+    location = locate(samples, grid, channels, search, progress=progress, abort=abort)
     step = samples.step
     lag_bins = int(round(location.lag_s / step))
     grid_bins = np.rint(grid / step).astype(np.int64)
@@ -1277,7 +1363,7 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     params = samples.params.with_(reflected_k=reflected_k)
     cal = samples.calibration
     flicker_known = samples.flicker_available
-    warnings: list[str] = []
+    warnings: list[str] = list(early)
     notes: list[str] = list(table.notes)
     if not flicker_known:
         warnings.append("The recording has fewer than 3 frames per time bin, so flames in front of a spot "
@@ -1401,6 +1487,24 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         warnings.append(f"Another time offset ({location.runner_up_lag_s:.0f} s) fits almost as well as "
                         f"{location.lag_s:.0f} s (score {location.runner_up_score:.3f} vs {location.score:.3f}); "
                         "check the time match, or give it (e.g. from a sync event).")
+    if by_clocks is not None:
+        lag_now = float(options.lag_s) if options.lag_s is not None else location.lag_s
+        gap = lag_now - by_clocks.lag_s
+        at = f"{by_clocks.lag_s:.0f} s (frame {samples.frame_at(by_clocks.lag_s) + 1:,})"
+        if location.lag_fixed:
+            if abs(gap) > CLOCK_TOLERANCE_S:
+                warnings.append(f"The given time match ({lag_now:.0f} s) is {_span(gap)} from where the camera and "
+                                f"logger clocks put logger time 0 ({at}); check it.")
+        elif search is not options:
+            if abs(gap) >= float(options.clock_window_s) - 2 * step:
+                warnings.append(f"The best time match ({lag_now:.0f} s) lies at the edge of the window around "
+                                f"the clocks' {at}: a clock may be off by more than "
+                                f"{float(options.clock_window_s):.0f} s, or the TC curves cannot fix the time. "
+                                "Check the match in the figure, or give the frame.")
+        elif abs(gap) > CLOCK_TOLERANCE_S:
+            warnings.append(f"The camera and logger clocks put logger time 0 at {at}, but the match found "
+                            f"{lag_now:.0f} s, {_span(gap)} away. Unless a clock was wrong, the match is not "
+                            "trustworthy: run again near the clocks, or give the frame.")
     found_now = [m for m in location.channels if m.found and not m.fixed]
     if len(found_now) == 1 and not location.lag_fixed:
         notes.append("Only one TC was found, so the time offset rests on that TC alone.")
@@ -1436,7 +1540,10 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         tc_spread=tc_spread, tcs_agree=tcs_agree, common_eps=common, origin_s=origin_s, warnings=warnings,
         notes=notes,
         reflected_c=reflected_k - KELVIN, calibration=samples.report.message, spot=options.spot,
-        options=_options_dict(options))
+        options=_options_dict(options),
+        clock_lag_s=by_clocks.lag_s if by_clocks is not None else None,
+        clock_frame=samples.frame_at(by_clocks.lag_s) if by_clocks is not None else None,
+        clock_note=by_clocks.note if by_clocks is not None else no_clock)
     _check(abort)
     return result, location, series
 
@@ -1476,13 +1583,24 @@ def _options_dict(options: MatchOptions) -> dict:
 
 def summary_text(result: MatchResult) -> str:
     """Plain-language summary for the engineers."""
+    window = result.options.get("clock_window_s")
+    how = (" (given)" if result.lag_fixed
+           else f" (searched within {window:.0f} s of the clocks)" if window is not None and result.clock_lag_s is not None
+           else "")
     lines = [f"Recording: {result.recording} ({result.camera}, {result.fps:.2f} fps"
              + (f", preset {result.preset}" if result.preset is not None else "") + ")",
              f"TC file: {result.tc_source}",
              f"Time match: logger time 0 = recording time {result.lag_s:.0f} s (frame {result.ignition_frame + 1})"
-             + (" (given)" if result.lag_fixed else ""),
-             f"Spot size: {result.spot} × {result.spot} pixels; reflected temperature {result.reflected_c:.0f} °C",
-             ""]
+             + how]
+    if result.clock_lag_s is not None:
+        frame = f" (frame {result.clock_frame + 1})" if result.clock_frame is not None else ""
+        lines += [f"Clocks: logger time 0 at about {result.clock_lag_s:.0f} s{frame}, "
+                  f"{result.lag_s - result.clock_lag_s:+.0f} s from the match.",
+                  f"  {result.clock_note[:1].upper()}{result.clock_note[1:]}."]
+    elif result.clock_note:
+        lines.append(f"Clocks: not compared, as {result.clock_note}.")
+    lines += [f"Spot size: {result.spot} × {result.spot} pixels; reflected temperature {result.reflected_c:.0f} °C",
+              ""]
     for ch in result.channels:
         m = ch.match
         head = f"{ch.name}: "
@@ -1714,6 +1832,9 @@ def save_figure(path: str | Path, result: MatchResult, location: Location, serie
         k = [c.name for c in location.channels].index(ch.name)
         ax.plot(location.curve_lags_s, location.curve_r[:, k], lw=0.8)
         ax.axvline(result.lag_s, color="#e34948", lw=0.8)
+        if result.clock_lag_s is not None:
+            ax.axvline(result.clock_lag_s, color="#2a9d8f", lw=0.8, ls="--", label="by the clocks")
+            ax.legend(fontsize=7, loc="lower right")
         ax.set_title(f"{ch.name}: best r over pixels vs offset", fontsize=9)
         ax.set_xlabel("recording time of logger time 0 (s)")
         ax = axes[1, j]
@@ -2050,6 +2171,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--scope", help="logger window for all TCs, e.g. 0-2087")
     parser.add_argument("--lag", type=float, help="fixed offset: recording seconds of logger time 0")
     parser.add_argument("--lag-range", help="search window for the offset, recording seconds a,b")
+    parser.add_argument("--near-clocks", action="store_true",
+                        help=f"search the offset within {CLOCK_WINDOW_S:.0f} s of where the camera and logger "
+                             "clocks put it (lab workbooks)")
     parser.add_argument("--pixel", action="append", default=[], help='fixed pixel of one TC, "T2:462,428" (row,col)')
     parser.add_argument("--spot", type=int, default=3)
     parser.add_argument("--tc-min", type=float, default=50.0)
@@ -2076,6 +2200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         roi=_pair(args.roi, int) if args.roi else None, preset=args.preset, step_s=args.step,
         channels=tuple(c.strip() for c in args.channels.split(",")) if args.channels else (),
         valid=valid, scope=scope, lag_s=args.lag, lag_range=_pair(args.lag_range) if args.lag_range else None,
+        clock_window_s=CLOCK_WINDOW_S if args.near_clocks else None,
         pixels=pixels, spot=args.spot, tc_min_c=args.tc_min, reflected_c=args.reflected, jump_k=args.jump,
         jump_hold_s=args.hold, below_range=args.below_range)
     last = [0.0]

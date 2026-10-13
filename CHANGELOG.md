@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.3 — 2026-10-13
+
+The time match of the TC fit, after the engineers' run on the 1006 A700 matched
+the logger 33 minutes off.
+
+### TC fit
+
+- *Near the camera and logger clocks* is the new default time match. A lab
+  workbook says when logging started (the Date/Time cell of its `LogFile_…`
+  sheet, or the sheet's name) and which Log row is logger time 0 (the Log row
+  the TC sheet's time formulas subtract, in the rows the reader uses); the
+  recording's first frame has the camera's clock. The offset is then searched
+  only within 2 minutes of where the clocks put logger time 0. Whole hours
+  between the clocks are set aside, because cameras keep UTC or a time zone
+  without daylight saving while the logger PC keeps local time; of the offsets
+  whole hours apart, the one nearest the recording's start that puts most of
+  the log inside the recording is taken. A time cell that does not hold the
+  difference its formula names (a sheet not recalculated) gives no clock rather
+  than a wrong one. Without a clock the whole recording is searched, with a
+  warning.
+- Why: where a fire spreads cell by cell, every cell's curve resembles the next
+  one's some minutes later, so a TC correlates almost equally well at many
+  offsets (0.95 from -300 to 3,000 s for T2 of the 1006 A700), and the best
+  score can sit far from the truth.
+- Whatever the mode, a match more than 2 minutes from the clocks is a warning
+  (*Anywhere in the recording*), and so are a match at the edge of the window
+  near the clocks and a given frame far from them. The summary, the results
+  headline and the figure show where the clocks put logger time 0; the setup
+  dialog shows it before the run, and `result.json` keeps it.
+- A fit reopened from before 0.7.3 offers the new default.
+- "Cell Temp" and "TRIM temp" (lab workbook columns) start unticked, like the
+  TC tree: the engineers do not compare them with the IR. Ticked, their long
+  cool-down matched the 1006 A700 at the wrong offset.
+- Command line: `--near-clocks`.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.7.2...v0.7.3)
+
 ## 0.7.2 — 2026-10-13
 
 Two requests from the engineers' first runs of 0.7.0 and 0.7.1.

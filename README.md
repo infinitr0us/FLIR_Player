@@ -443,7 +443,8 @@ best value toward the lower limit; the sheet says so.
 thermocouples of the same test. Choose the logger export (`.xlsx` with a sheet
 named like TC data, or `.csv`/`.txt`, time in seconds or minutes in one of the
 first columns) and tick the TCs that sit on a surface the camera sees; TCs in
-air or gas have no pixel. A box ROI around the battery, chosen as the search
+air or gas have no pixel (TC trees and the lab workbooks' *Cell Temp* and
+*TRIM temp* start unticked). A box ROI around the battery, chosen as the search
 region, makes the run faster. The first run reads every frame once and keeps
 per-second statistics in the results folder (`cache/`; delete it to free the
 space), so later runs with the same search region take a minute or two.
@@ -457,6 +458,17 @@ What it does (`flir_player/tcmatch.py`, also a command line:
    logger's time 0 in the recording (one offset for all TCs) and each TC's
    pixel, with the nearby pixels that match almost as well. The offset can be
    given instead (*Logger time 0 is at frame…*).
+
+   Where a fire spreads cell by cell, the TC shapes alone may not fix the
+   time: each cell's curve resembles the next cell's some minutes later. A lab
+   workbook says when logging started (its `LogFile_…` sheet) and which Log row
+   is time 0 (the TC sheet's time formulas), and the recording's first frame
+   has a clock, so *Near the camera and logger clocks* (the default) searches
+   only within 2 minutes of where the clocks put logger time 0. Whole hours
+   between the clocks are set aside, because cameras often keep UTC or a time
+   zone without daylight saving. A match more than 2 minutes from the clocks
+   is reported, as is a match at the edge of that window or a given frame far
+   from them. *Anywhere in the recording* searches every offset.
 2. **Events.** Stretches where IR and TC can be compared are chosen by rules
    that never compare them: the TC is working and hot enough, there are no
    flames in front of the spot (flicker), the IR is in the camera's range, and

@@ -70,6 +70,11 @@ class TcTable:
     time_label: str = ""
     notes: tuple[str, ...] = ()
     sheet: str = ""  # the workbook sheet read ("" for a text table)
+    # (row, column), 1-based, of the first data row's time cell, and the time unit in s (for the logger clock)
+    time_cell: tuple[int, int] | None = None
+    time_unit_s: float = 1.0
+    clock_zero: datetime | None = None  # the logger's wall clock at logger time 0 (a lab workbook's LogFile sheet)
+    clock_note: str = ""  # where clock_zero comes from, or why there is none
 
     @property
     def interval(self) -> float:
@@ -133,7 +138,10 @@ def read_tc_table(path: str | Path, *, sheet: str | None = None, time_column: in
         why = "its name suggests TC data" if hinted else "it has the most rows"
         others = ", ".join(repr(other) for other, _t in tables if other != name)
         best = replace(best, notes=best.notes + (f"sheet {name!r} used ({why}); other sheets with data: {others}",))
-    return replace(best, sheet=name if suffix in WORKBOOK_SUFFIXES else "")
+    if suffix not in WORKBOOK_SUFFIXES:
+        return replace(best, sheet="", clock_note="a text table does not give the logger's clock")
+    clock, note = logger_clock(path, name, best)
+    return replace(best, sheet=name, clock_zero=clock, clock_note=note)
 
 
 def sheet_names(path: str | Path) -> list[str]:
@@ -152,6 +160,96 @@ def suggest_sheet(names: Sequence[str]) -> str | None:
     """The sheet whose name suggests TC data ("TC", "Thermocouples", "Temperature"), if exactly one does."""
     hinted = [name for name in names if _SHEET_HINT.search(_words(name))]
     return hinted[0] if len(hinted) == 1 else None
+
+
+# A lab workbook (the engineers' template) keeps the raw log as a sheet "LogFile_<start>" whose "Date/Time"
+# cell says when logging started, next to a "Log" sheet of elapsed times, and computes the TC times as
+# "=Log!E362-Log!E$360": logger time 0 is the elapsed time of the row subtracted.
+_LOGFILE_SHEET = re.compile(r"^\s*logfile", re.IGNORECASE)
+_LOGFILE_STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})[-_ ](\d{2})-(\d{2})-(\d{2})")
+_START_HEADER = re.compile(r"^\s*date\s*/?\s*time\s*$", re.IGNORECASE)
+_REF = r"(?:'(?P<{0}q>(?:[^']|'')+)'|(?P<{0}n>[A-Za-z_][\w.]*))!\$?(?P<{0}c>[A-Za-z]{{1,3}})\$?(?P<{0}r>\d+)"
+_DIFFERENCE = re.compile(r"^=\s*\(?\s*" + _REF.format("a") + r"\s*-\s*" + _REF.format("b") + r"\s*\)?\s*$")
+
+
+def logger_clock(path: str | Path, sheet: str, table: TcTable) -> tuple[datetime | None, str]:
+    """The logger's wall clock at logger time 0 of ``table`` (read from ``sheet`` of the workbook ``path``)
+    and where it comes from; (None, why not) when the workbook does not tell.
+
+    Only a lab workbook tells (see ``_DIFFERENCE``), and only when the first data row's time cell holds
+    the difference its formula names, so a moved row or a pasted value gives no clock rather than a
+    wrong one. Never raises.
+    """
+    if table.time_cell is None:
+        return None, "the TC times do not come from a sheet"
+    try:
+        return _logger_clock(Path(path), sheet, table)
+    except Exception as exc:  # any other layout: no clock, never an error
+        return None, f"the logger's clock could not be read: {type(exc).__name__} {exc}"
+
+
+def _logger_clock(path: Path, sheet: str, table: TcTable) -> tuple[datetime | None, str]:
+    import openpyxl
+    from openpyxl.utils import column_index_from_string
+
+    row, col = table.time_cell
+    book = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    try:
+        formula = _cell(book[sheet], row, col)
+        logs = [ws.title for ws in book.worksheets if _LOGFILE_SHEET.match(ws.title)]
+    finally:
+        book.close()
+    match = _DIFFERENCE.match(formula.strip()) if isinstance(formula, str) else None
+    if match is None:
+        return None, "the TC times are not formulas on the logger's elapsed time, as in a lab workbook"
+    (a_sheet, a_col, a_row), (b_sheet, b_col, b_row) = (
+        ((match[f"{k}q"].replace("''", "'") if match[f"{k}q"] else match[f"{k}n"]), match[f"{k}c"].upper(),
+         int(match[f"{k}r"])) for k in "ab")
+    if (a_sheet, a_col) != (b_sheet, b_col):
+        return None, "the TC time formula does not subtract one logger time from another"
+    if len(logs) != 1:
+        return None, ("no LogFile sheet gives the logger's start" if not logs
+                      else f"{len(logs)} LogFile sheets: which one started the log is unclear")
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        shown = _number(_cell(book[sheet], row, col))
+        now = _number(_cell(book[a_sheet], a_row, column_index_from_string(a_col)))
+        zero = _number(_cell(book[b_sheet], b_row, column_index_from_string(b_col)))
+        start = _log_start(book[logs[0]])
+    finally:
+        book.close()
+    if shown is None or now is None or zero is None:
+        return None, f"the logger times at {a_sheet}!{a_col}{a_row} and {b_sheet}!{b_col}{b_row} are not numbers"
+    if abs((now - zero) - shown) > 1e-6 * max(1.0, abs(shown)):
+        return None, "the TC time cell does not hold the difference its formula names; the sheet may need recalculating"
+    source = "its Date/Time cell"
+    if start is None:
+        stamp = _LOGFILE_STAMP.search(logs[0])
+        if stamp is None:
+            return None, f"sheet {logs[0]!r} does not say when logging started"
+        start, source = datetime(*(int(v) for v in stamp.groups())), "its name"
+    offset = zero * table.time_unit_s
+    return start + timedelta(seconds=offset), (
+        f"logging started {start:%Y-%m-%d %H:%M:%S} by sheet {logs[0]!r} ({source}); logger time 0 is "
+        f"{b_sheet}!{b_col}{b_row}, {offset:g} s later")
+
+
+def _cell(ws, row: int, col: int) -> Any:
+    for values in ws.iter_rows(min_row=row, max_row=row, min_col=col, max_col=col, values_only=True):
+        return values[0] if values else None
+    return None
+
+
+def _log_start(ws) -> datetime | None:
+    """The date and time under a "Date/Time" header in the first rows of a raw log sheet."""
+    rows = [tuple(r) for r in ws.iter_rows(min_row=1, max_row=6, values_only=True)]
+    for i, cells in enumerate(rows[:-1]):
+        for j, text in enumerate(cells):
+            if isinstance(text, str) and _START_HEADER.match(text):
+                below = rows[i + 1][j] if j < len(rows[i + 1]) else None
+                if isinstance(below, datetime):
+                    return below
+    return None
 
 
 def _open_workbook(path: Path):
@@ -358,7 +456,7 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     if trailing > 0:
         notes.append(f"{trailing} non-empty row(s) after the data block were ignored")
     return TcTable(times=times, values=values, names=names, source=source, time_label=time_label,
-                   notes=tuple(notes))
+                   notes=tuple(notes), time_cell=(first + 1, tcol + 1), time_unit_s=scale)
 
 
 def _counter(cells: list[Any]) -> bool:

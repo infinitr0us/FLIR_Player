@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +48,18 @@ from .export_dialogs import _path_row, confirm_replace
 from .models import RoiShape, VideoMetadata
 from .settings import app_settings
 from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES, TcTable, parse_windows, read_tc_table, sheet_names, suggest_sheet
-from .tcmatch import MEMORY_LIMIT, MatchOptions, RunOutput, SavedRun, load_saved_run, roi_shapes, saved_run
+from .tcmatch import (
+    CLOCK_TOLERANCE_S,
+    CLOCK_WINDOW_S,
+    MEMORY_LIMIT,
+    MatchOptions,
+    RunOutput,
+    SavedRun,
+    clock_estimate,
+    load_saved_run,
+    roi_shapes,
+    saved_run,
+)
 from .widgets import ICON_MUTED, ChevronComboBox, FramelessDialog, MessageDialog, awesome_icon
 
 RESULT_FILES = ("result.json", "summary.txt", "overview.png")  # what a run writes besides the ROI set
@@ -55,8 +67,10 @@ LARGE_STATISTICS = 4e9  # bytes of frame statistics worth a hint to draw a small
 # Held in memory, the estimated statistics must fit with this margin (the engine times frames by the
 # recording's own rate, which can differ slightly from the nominal one shown here).
 MEMORY_MARGIN = 1.25
-# Channels that measure air or gas have no surface pixel: unticked at first (the user decides).
-_AIR_HINT = re.compile(r"(?<![a-z])(tree|air|gas|duct|ambient|room|plume|flame|exhaust)(?![a-z])", re.IGNORECASE)
+# Channels that measure air or gas have no surface pixel: unticked at first (the user decides). So are the
+# lab workbooks' "Cell Temp" and "TRIM temp", which the engineers compare like the TC tree: not at all.
+_AIR_HINT = re.compile(r"(?<![a-z])(tree|air|gas|duct|ambient|room|plume|flame|exhaust|trim|cell\s+temp)(?![a-z])",
+                       re.IGNORECASE)
 _LAST_DIR_KEY = "tcmatch/last_dir"
 _ALIVE: set[QThread] = set()  # readers outliving a closed dialog finish here
 
@@ -134,6 +148,8 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
     """The setup dialog's ``previous`` settings for a reopened fit: TC file (``tc_file``, where it was found,
     else where the fit read it), channels, region, options."""
     options = saved.options
+    if "clock_window_s" not in saved.result.options and options.lag_s is None and options.lag_frame is None:
+        options = replace(options, clock_window_s=CLOCK_WINDOW_S)  # a run from before 0.7.3: the clocks were unknown
     names = table.names if table is not None else options.channels
     chosen = set(options.channels) if options.channels else None
     rows = []
@@ -297,11 +313,13 @@ class TcCalibrationDialog(FramelessDialog):
         grid.addWidget(self.params_combo, r, 1, 1, 2)
         r += 1
         self.time_combo = ChevronComboBox()
-        self.time_combo.addItem("Find automatically (recommended)", "auto")
+        self.time_combo.addItem("Near the camera and logger clocks (recommended)", "clock")
+        self.time_combo.addItem("Anywhere in the recording", "auto")
         self.time_combo.addItem("Logger time 0 is at frame", "frame")
-        self.time_combo.setToolTip("The logger's time 0 in the recording. Automatic matching uses the TC "
-                                   "curves; give the frame when it is known (e.g. ignition) or the match "
-                                   "is reported as uncertain.")
+        self.time_combo.setToolTip("The logger's time 0 in the recording. The match uses the TC curves, "
+                                   f"within {CLOCK_WINDOW_S:.0f} s of where the clocks put it (lab "
+                                   "workbooks) or anywhere; give the frame when it is known (e.g. ignition) "
+                                   "or the match is reported as uncertain.")
         self.frame_spin = QSpinBox()
         self.frame_spin.setRange(1, max(1, metadata.num_frames))
         self.frame_spin.setValue((ignition_frame if ignition_frame is not None else current_frame) + 1)
@@ -315,6 +333,11 @@ class TcCalibrationDialog(FramelessDialog):
         time_row.addWidget(self.current_button)
         grid.addWidget(QLabel("Time match"), r, 0)
         grid.addLayout(time_row, r, 1, 1, 2)
+        r += 1
+        self.clock_label = QLabel()
+        self.clock_label.setObjectName("FieldLabel")
+        self.clock_label.setWordWrap(True)
+        grid.addWidget(self.clock_label, r, 1, 1, 2)
         grid.setColumnStretch(1, 1)
         box.addLayout(grid)
         panels.addWidget(frame)
@@ -403,6 +426,7 @@ class TcCalibrationDialog(FramelessDialog):
         self._add_size_grip()
 
         self.time_combo.currentIndexChanged.connect(self._update)
+        self.frame_spin.valueChanged.connect(self._update)
         self.region_combo.currentIndexChanged.connect(self._update)
         self._restore(previous)
         self._update()
@@ -560,6 +584,7 @@ class TcCalibrationDialog(FramelessDialog):
             channels=tuple(self.chosen_channels()),
             valid=self._windows(),
             lag_frame=self.frame_spin.value() - 1 if fixed else None,
+            clock_window_s=CLOCK_WINDOW_S if self.time_combo.currentData() == "clock" else None,
             spot=self.spot_spin.value(),
             tc_min_c=self.tc_min_spin.value(),
             jump_k=self.jump_spin.value(),
@@ -585,7 +610,38 @@ class TcCalibrationDialog(FramelessDialog):
         bins = self.metadata.duration_seconds / max(step, 1e-3) + 1
         return 8.0 * bins * (x1 - x0) * (y1 - y0)
 
+    def _clock_text(self) -> tuple[str, str]:
+        """(line under the time match, its tooltip): where the camera and logger clocks put logger time 0."""
+        if self.table is None:
+            return "", ""
+        mode = self.time_combo.currentData()
+        start = self.metadata.start_time
+        estimate = clock_estimate(self.table.clock_zero, start, self.table.times, self.metadata.duration_seconds,
+                                  logger_note=self.table.clock_note)
+        if estimate is None:
+            why = ("the TC file does not give the logger's clock" if self.table.clock_zero is None
+                   else "the recording has no clock" if start is None
+                   else "the clocks put the logger's data outside this recording")
+            return (f"Clocks: {why}" + (", so the whole recording is searched." if mode == "clock" else "."),
+                    self.table.clock_note)
+        fps = self.metadata.nominal_fps or 0.0
+        frame = f"frame {round(estimate.lag_s * fps) + 1:,}, " if fps > 0 else ""
+        minutes, seconds = divmod(round(abs(estimate.lag_s)), 60)
+        sign = "minus " if estimate.lag_s < 0 else ""
+        text = f"Clocks: logger time 0 at about {frame}{sign}{minutes} min {seconds} s into the recording."
+        if mode == "frame" and fps > 0:
+            gap = (self.frame_spin.value() - 1) / fps - estimate.lag_s
+            if abs(gap) > CLOCK_TOLERANCE_S:
+                text += f" The frame given is {abs(gap) / 60:.0f} min from it."
+        elif mode == "auto":
+            text += f" A match more than {CLOCK_TOLERANCE_S:.0f} s from it is reported."
+        return text, estimate.note
+
     def _update(self) -> None:
+        clock_text, clock_tip = self._clock_text()
+        self.clock_label.setText(clock_text)
+        self.clock_label.setToolTip(clock_tip)
+        self.clock_label.setVisible(bool(clock_text))
         self.frame_spin.setEnabled(self.time_combo.currentData() == "frame")
         self.current_button.setEnabled(self.time_combo.currentData() == "frame")
         size = self._statistics_bytes()
@@ -626,6 +682,9 @@ class TcCalibrationDialog(FramelessDialog):
             if options.lag_frame is not None:
                 self.time_combo.setCurrentIndex(self.time_combo.findData("frame"))
                 self.frame_spin.setValue(options.lag_frame + 1)
+            else:
+                self.time_combo.setCurrentIndex(self.time_combo.findData(
+                    "clock" if options.clock_window_s is not None else "auto"))
             self.spot_spin.setValue(options.spot)
             self.tc_min_spin.setValue(options.tc_min_c)
             self.jump_spin.setValue(options.jump_k)
@@ -695,9 +754,13 @@ class TcResultsDialog(FramelessDialog):
         valued = [ch for ch in result.channels if ch.eps is not None]
 
         given = " (given)" if result.lag_fixed else ""
+        clocks = ""
+        if result.clock_lag_s is not None:
+            frame = f"frame {result.clock_frame + 1:,}, " if result.clock_frame is not None else ""
+            clocks = (f" The clocks put it at {frame}{result.lag_s - result.clock_lag_s:+.0f} s from the match.")
         headline = QLabel(f"Logger time 0 = frame {result.ignition_frame + 1:,} (recording time "
-                          f"{result.lag_s:.0f} s){given}. {len(found)} of {len(result.channels)} TC(s) found, "
-                          f"{len(valued)} with an emissivity.")
+                          f"{result.lag_s:.0f} s){given}.{clocks} {len(found)} of {len(result.channels)} TC(s) "
+                          f"found, {len(valued)} with an emissivity.")
         headline.setWordWrap(True)
         self.body.addWidget(headline)
         note = QLabel("Each emissivity is the median of that TC's usable events. Check them in the figure: "
