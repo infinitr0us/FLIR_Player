@@ -830,13 +830,8 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
     missing = np.isnan(X)
     if missing.any():
         X[missing] = np.broadcast_to(fill, X.shape)[missing]
-    Y = tc_signal(samples.calibration, np.column_stack([c.values for c in channels]))
-    U = np.column_stack([c.locate_usable for c in channels]) & np.isfinite(Y)
-    Y = np.where(U, Y, 0.0)
-    n_valid = U.sum(axis=0)
+    Y, U, min_samples = _scan_inputs(samples.calibration, channels, options)
     too_few = np.array([not c.searchable for c in channels])
-    U = U & ~too_few
-    min_samples = np.maximum(30, options.min_overlap * n_valid)
     if options.lag_s is not None:
         fixed = int(round(options.lag_s / step))
         lags_all = np.arange(fixed - 2, fixed + 3)
@@ -933,19 +928,40 @@ def _lag_bins(nb: int, grid_bins: np.ndarray, step: float, lag_range: tuple[floa
     return lags
 
 
-def _overlapping(samples: Samples, grid: np.ndarray, lag_range: tuple[float, float], need: int = 30) -> bool:
-    """True when some offset in ``lag_range`` puts at least ``need`` logger bins on recorded IR bins (the
-    scan's own floor; its end offsets touch no IR bin at all)."""
+def _scan_inputs(calibration: Calibration, channels: list[TcChannel],
+                 options: MatchOptions) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(signal, usable, minimum overlap) per logger bin and channel, as the offset scan uses them: a channel
+    too thin to search has no usable bin, and an offset counts for a channel only where at least the minimum
+    of its usable bins fall on recorded IR bins."""
+    Y = tc_signal(calibration, np.column_stack([c.values for c in channels]))
+    U = np.column_stack([c.locate_usable for c in channels]) & np.isfinite(Y)
+    n_valid = U.sum(axis=0)
+    U = U & ~np.array([not c.searchable for c in channels])
+    return np.where(U, Y, 0.0), U, np.maximum(30, options.min_overlap * n_valid)
+
+
+def _overlapping(samples: Samples, grid: np.ndarray, channels: list[TcChannel], options: MatchOptions,
+                 lag_range: tuple[float, float]) -> bool:
+    """True when some offset in ``lag_range`` gives some channel the overlap the scan needs (its usable
+    logger bins on recorded IR bins, at least its minimum); the scan's end offsets touch no IR bin at all."""
+    if samples.calibration is None:
+        return True  # ``locate`` reports the missing calibration
     step = samples.step
     grid_bins = np.rint(grid / step).astype(np.int64)
     nb = samples.mean.shape[0]
     lags = _lag_bins(nb, grid_bins, step, lag_range)
-    if lags.size == 0:
-        return False
-    recorded = np.concatenate([[0], np.cumsum(samples.counts > 0)])  # recorded bins before each IR bin
-    lo = np.clip(lags + grid_bins[0], 0, nb)
-    hi = np.clip(lags + grid_bins[-1] + 1, 0, nb)
-    return bool(np.any(recorded[hi] - recorded[lo] >= need))
+    _Y, U, need = _scan_inputs(samples.calibration, channels, options)
+    present = samples.counts > 0
+    for c in range(U.shape[1]):
+        bins = grid_bins[U[:, c]]
+        if bins.size < need[c]:
+            continue
+        for start in range(0, lags.size, 256):
+            at = lags[start:start + 256, None] + bins[None, :]
+            hits = ((at >= 0) & (at < nb) & present[np.clip(at, 0, nb - 1)]).sum(axis=1)
+            if np.any(hits >= need[c]):
+                return True
+    return False
 
 
 def _refine_lag(samples: Samples, b: int, lag_bins: int, lags_all: np.ndarray, where: np.ndarray,
@@ -1385,12 +1401,12 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     if options.clock_window_s is not None and options.lag_s is None and options.lag_range is None:
         window = float(options.clock_window_s)
         span = (by_clocks.lag_s - window, by_clocks.lag_s + window) if by_clocks is not None else None
-        if span is not None and _overlapping(samples, grid, span):
+        if span is not None and _overlapping(samples, grid, channels, options, span):
             search = dataclass_replace(options, lag_range=span)
         else:
             why = no_clock if by_clocks is None else (
-                f"within {window:g} s of the clocks' {by_clocks.lag_s:.0f} s there is no offset at which the "
-                "logger and the recording's frames overlap")
+                f"within {window:g} s of the clocks' {by_clocks.lag_s:.0f} s too little of the TC data falls on "
+                "the recording's frames to match")
             early.append(f"No time match near the clocks: {why}, so the whole recording was searched.")
     location = locate(samples, grid, channels, search, progress=progress, abort=abort)
     step = samples.step

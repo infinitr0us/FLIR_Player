@@ -318,8 +318,8 @@ def test_r3_a_window_without_offsets_searches_everything_and_an_empty_range_is_a
     samples, table = _clocked(137 + 30.25)  # no whole second within 0.1 s of 167.25 s
     result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=0.1))
     assert result.lag_s == 137.0 and not result.near_clocks
-    assert any("within 0.1 s of the clocks' 167 s there is no offset at which the logger and the recording's "
-               "frames overlap" in w for w in result.warnings)
+    assert any("within 0.1 s of the clocks' 167 s too little of the TC data falls on the recording's frames"
+               in w for w in result.warnings)
     with pytest.raises(ValueError, match="No time offset from 5000 to 6000 s"):
         tcmatch.analyse(samples, table, MatchOptions(spot=1, lag_range=(5000.0, 6000.0)))
 
@@ -402,8 +402,7 @@ def test_r8_the_window_needs_real_overlap_not_just_an_end_offset() -> None:
     samples.info["frames"] = 2000 * 30
     result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, clock_window_s=CLOCK_WINDOW_S))
     assert not result.near_clocks and result.lag_s == 137.0
-    assert any("there is no offset at which the logger and the recording's frames overlap" in w
-               for w in result.warnings)
+    assert any("too little of the TC data falls on the recording's frames" in w for w in result.warnings)
 
 
 def test_r9_a_given_offset_before_the_recording_reopens_as_given(qapp, tmp_path) -> None:
@@ -414,3 +413,20 @@ def test_r9_a_given_offset_before_the_recording_reopens_as_given(qapp, tmp_path)
     assert dialog.time_combo.currentData() == "frame" and dialog.frame_spin.value() == -2999
     assert dialog.options().lag_frame == -3000
     dialog.deleteLater()
+
+
+@pytest.mark.parametrize("clocks, rows, overlap", [
+    (850.0, None, 0.6),  # at most 30 bins overlap where each TC needs 60 % of its data (288)
+    (650.0, np.r_[0:20, 300:480], 0.0),  # a gapped log: at most 20 bins overlap, the scan needs 30
+])
+def test_r10_the_window_needs_the_overlap_the_scan_needs(clocks, rows, overlap) -> None:
+    samples, table = _clocked(clocks, n_ir=760)
+    samples.info["frames"] = 2000 * 30  # the recording goes on after the statistics end
+    if rows is not None:
+        table = TcTable(times=table.times[rows], values=table.values[rows], names=table.names, source=table.source,
+                        clock_zero=table.clock_zero, clock_note=table.clock_note)
+    result, _l, _s = tcmatch.analyse(samples, table, MatchOptions(spot=1, min_overlap=overlap,
+                                                                  clock_window_s=CLOCK_WINDOW_S))
+    assert not result.near_clocks and result.lag_s == 137.0
+    assert sum(ch.match.found for ch in result.channels) == 2
+    assert any("too little of the TC data falls on the recording's frames" in w for w in result.warnings)
