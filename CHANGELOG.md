@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.2 — 2026-10-13
+
+Two requests from the engineers' first runs of 0.7.0 and 0.7.1.
+
+### Player
+
+- Rotate the image 90° left or right (two buttons next to the flips), for a
+  camera mounted on its side. Only the picture turns: ROIs, cell zones, TC
+  pixels, the readout and every exported number stay in the recording's own
+  pixels, so a turned view measures exactly what the unturned view does. A turn
+  turns the picture as it is shown, flips included, and refits the view when the
+  picture's shape changes. Image and movie exports show the turned picture; the
+  Excel workbook's ROI map, the TC results and numeric TIFFs keep the
+  recording's orientation.
+- The zone dialog names the end for zone 1 as the picture is shown, so "right
+  end" is the right of the turned view too; the zones and the saved split keep
+  recording terms.
+- A new ROI takes the lowest free number of its kind: after deleting Box 2 of
+  Box 1 to 3, the next box is Box 2 again (it used to count on, to Box 4).
+
+### Documentation
+
+- The README's cell-zone example no longer quotes the 0903 test: the module fell
+  into its container about 8 minutes after ignition, so the later 0903 values
+  describe the container wall, not the battery.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.7.1...v0.7.2)
+
 ## 0.7.1 — 2026-10-10
 
 Smaller steps for the TC and cell-zone route, found while writing the

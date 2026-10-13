@@ -4,8 +4,8 @@
 
 Unlike the QPainter overlays used by the live view, these helpers run anywhere —
 including the decoder thread during movie/series export. All coordinates are in
-raw image space; the caller passes the flip flags so they match the rendered
-image exactly.
+raw image space; the caller passes the turn and flip flags so they match the
+rendered image exactly.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from matplotlib import font_manager
 
 from .models import ROI_COLORS, RoiShape, RoiStats
+from .orientation import Orientation
 from .render import format_tick, legend_colors
 from .zones import short_label
 
@@ -45,15 +46,13 @@ def _hex_rgb(value: str) -> tuple[int, int, int]:
 
 
 def _flip_point(
-    x: float, y: float, width: int, height: int, flips: tuple[bool, bool]
+    x: float, y: float, width: int, height: int, orientation: Orientation
 ) -> tuple[float, float]:
     """Continuous image coordinates (pixel i spans [i, i+1), as on the
-    canvas) → PIL drawing coordinates (pixel i is centred on i), mirrored."""
-    if flips[0]:
-        x = width - x
-    if flips[1]:
-        y = height - y
-    return (x - 0.5, y - 0.5)
+    canvas) → PIL drawing coordinates (pixel i is centred on i), turned and
+    mirrored. ``width``/``height`` are the recording's, not the picture's."""
+    u, v = orientation.to_display(x, y, width, height)
+    return (u - 0.5, v - 0.5)
 
 
 def compose_frame(
@@ -70,19 +69,26 @@ def compose_frame(
     max_position: tuple[int, int] | None = None,
     label: str = "",
     flips: tuple[bool, bool] = (False, False),
+    turns: int = 0,
     mapping=None,
     segmentation=(False, 0.0, 1.0),
     isotherm=("off", 0.0, 1.0),
 ) -> np.ndarray:
-    """Compose the final export image: frame + overlays (+ optional color bar)."""
+    """Compose the final export image: frame + overlays (+ optional color bar).
+
+    ``rgb`` is the rendered picture, already turned ``turns`` clockwise quarter turns and
+    then flipped; ROIs and markers are placed to match it.
+    """
     image = Image.fromarray(rgb, mode="RGB")
     draw = ImageDraw.Draw(image, "RGBA")
     width, height = image.size
+    orientation = Orientation(turns, *flips)
+    raw_width, raw_height = orientation.display_size(width, height)  # a quarter turn swaps back
 
     if options.rois and rois:
-        _draw_rois(draw, rois, width, height, flips, options.roi_names)
+        _draw_rois(draw, rois, raw_width, raw_height, orientation, options.roi_names)
     if options.markers:
-        _draw_markers(draw, roi_stats, min_position, max_position, width, height, flips)
+        _draw_markers(draw, roi_stats, min_position, max_position, raw_width, raw_height, orientation)
     if options.timestamp and label:
         _draw_label(draw, label, (10, height - 10), anchor="ls", size=14)
     if options.border:
@@ -100,20 +106,20 @@ def _draw_rois(
     rois: tuple[RoiShape, ...],
     width: int,
     height: int,
-    flips: tuple[bool, bool],
+    orientation: Orientation,
     with_names: bool,
 ) -> None:
     for shape in rois:
         color = _hex_rgb(ROI_COLORS[shape.id % len(ROI_COLORS)])
         if shape.kind == "cursor" and len(shape.points) == 1:
-            cx, cy = _flip_point(*shape.points[0], width, height, flips)
+            cx, cy = _flip_point(*shape.points[0], width, height, orientation)
             draw.line((cx - 8, cy, cx + 8, cy), fill=color, width=2)
             draw.line((cx, cy - 8, cx, cy + 8), fill=color, width=2)
             draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), outline=color, width=1)
             anchor = (cx - 10, cy - 12)
         elif len(shape.points) == 2:
-            first = _flip_point(*shape.points[0], width, height, flips)
-            second = _flip_point(*shape.points[1], width, height, flips)
+            first = _flip_point(*shape.points[0], width, height, orientation)
+            second = _flip_point(*shape.points[1], width, height, orientation)
             if shape.kind == "line":
                 draw.line((*first, *second), fill=color, width=2)
             else:
@@ -161,13 +167,13 @@ def _draw_markers(
     max_position,
     width: int,
     height: int,
-    flips: tuple[bool, bool],
+    orientation: Orientation,
 ) -> None:
     def cross(position, color) -> None:
         if position is None:
             return
         # extrema are pixel indices: mark the pixel centre
-        x, y = _flip_point(position[0] + 0.5, position[1] + 0.5, width, height, flips)
+        x, y = _flip_point(position[0] + 0.5, position[1] + 0.5, width, height, orientation)
         draw.line((x - 6, y, x + 6, y), fill=(7, 9, 10), width=4)
         draw.line((x, y - 6, x, y + 6), fill=(7, 9, 10), width=4)
         draw.line((x - 6, y, x + 6, y), fill=color, width=2)

@@ -59,7 +59,11 @@ all decoding work off the GUI thread.
   or by dragging directly on the color bar.
 - Segmentation: user-defined valid range with blue/red out-of-range display
   and auto-scale restricted to valid pixels.
-- Software image flip, horizontal and vertical.
+- Software image flip, horizontal and vertical, and 90° turns left or right
+  for a camera mounted on its side. Only the picture turns: ROIs, zones, the
+  readout and every exported number stay in the recording's own pixels.
+  Image and movie exports show the turned picture; the Excel workbook's ROI
+  map and the TC results keep the recording's orientation.
 - File operation: add / subtract / multiply / divide by a reference frame
   (any frame of the open file or of another same-size recording).
 - Point (gain, offset, exp, ln, sqrt), spatial (gaussian, window average,
@@ -308,7 +312,7 @@ file operations, differences and incompatible unit or source changes re-seed
 them from the new frame (an isotherm restarts at the middle of the range).
 
 ROI coordinates are continuous image positions in which pixel *i* spans
-[*i*, *i*+1), in the live view, under flips and in exports. Boxes contain the
+[*i*, *i*+1), in the live view, under flips and turns and in exports. Boxes contain the
 pixels whose centers lie inside their outline, ellipses test those centers,
 and spots and line endpoints snap to, and measure, the pixel they are placed
 on. Lines sample each major-axis pixel once. The hover readout shows the pixel
@@ -331,7 +335,7 @@ Numeric TIFF16 preserves unprocessed `uint16` Counts exactly. Other data is
 mapped over the selected range; TIFF `ImageDescription` records the scale,
 offset, clipping policy, unit, processing and measurement provenance. Use float
 TIFF or NumPy export for processed values outside the display range or nonfinite
-values. Numeric TIFFs have no RGB overlays, flips or composition. Movie export
+values. Numeric TIFFs have no RGB overlays, flips, turns or composition. Movie export
 preserves the image dimensions and pads an odd edge by one pixel for encoding.
 Still exports retain the frame chosen before the dialog; statistics CSV saves
 the displayed statistics snapshot, including when the table is paused.
@@ -406,9 +410,10 @@ For a battery module seen from the side:
    thermocouple's pixel.
 2. Draw a box over the row of cells (for the fire tests, the top slice above
    the metal plate), select it and press the toolbar's columns button. Choose
-   the number of zones (18), where zone 1 is (the heater end), the gap between
-   zones (1 px leaves out the mixed pixels where two cells meet) and the box
-   edges in pixels. The zones preview on the image, and the dialog says which
+   the number of zones (18), where zone 1 is (the heater end, named as the
+   picture is shown, also when it is turned), the gap between zones (1 px
+   leaves out the mixed pixels where two cells meet) and the box edges in
+   pixels. The zones preview on the image, and the dialog says which
    zone each TC pixel falls in: TCs on cells 3, 6 and 9 should land in zones 3,
    6 and 9.
 3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
@@ -421,10 +426,8 @@ For a battery module seen from the side:
    the limits; set it on Settings.
 
 A zone averages a whole cell, which reads colder than the spot under a TC
-wherever the cell heats unevenly: on the 0903 test the side TC of cell 9 wants
-0.58 at its own 3 × 3 pixels but 0.44 against its whole zone (cell 6: 0.84 and
-0.80). To match at the
-TC itself, press *Add TC ROIs to Player* in the TC results before exporting:
+wherever the cell heats unevenly, so a TC matched against its whole zone wants
+a lower emissivity than at its own few pixels. To match at the TC itself, press *Add TC ROIs to Player* in the TC results before exporting:
 each TC then pairs with its small box (the smallest ROI holding the pixel), and
 the zones report every cell at the matched emissivity.
 

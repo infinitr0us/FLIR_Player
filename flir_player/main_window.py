@@ -6,6 +6,7 @@ import csv
 import os
 import sys
 from collections import deque
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -61,6 +62,7 @@ from .models import (
 )
 from .plots import line_profile_values, roi_values
 from .processing import median_max_size
+from .orientation import Orientation
 from .render import (
     CUSTOM_PALETTE_STOPS,
     DisplayState,
@@ -153,16 +155,17 @@ class MainWindow(QMainWindow):
         self._focus_mode = False
         self._rois: list[RoiShape] = []
         self._roi_next_id = 1
-        self._roi_name_counts: dict[str, int] = {}
         self._selected_roi_id: int | None = None
         self._zone_groups: list[dict] = []  # zones split from one box: ids, ZoneSpec, the box's name
-        self._zone_defaults = ZoneSpec(box=((0.0, 0.0), (1.0, 1.0)))  # count, end, gap, names last used
+        # count, end, gap, names last used; the end as seen on screen (the view may be turned)
+        self._zone_defaults = ZoneSpec(box=((0.0, 0.0), (1.0, 1.0)))
         self._extract_progress: ProgressDialog | None = None
         self._export_progress: ProgressDialog | None = None
         self.show_clipping = True
         self.show_markers = False
         self.flip_h = False
         self.flip_v = False
+        self.rotation = 0  # clockwise quarter turns of the picture (view only)
         self.enhancement = "linear"
         self.pe_strength = 0.5
         self.segmentation_on = False
@@ -348,6 +351,7 @@ class MainWindow(QMainWindow):
         self.inspector.tc_fit_requested.connect(self._open_tc_dialog)
         self.inspector.overlays_changed.connect(self._change_overlays)
         self.inspector.flips_changed.connect(self._change_flips)
+        self.inspector.rotate_requested.connect(self._rotate_view)
         self.inspector.corrections_changed.connect(self._change_corrections)
         self.inspector.reference_requested.connect(self._open_reference_dialog)
         self.inspector.reference_cleared.connect(self._clear_reference)
@@ -706,8 +710,7 @@ class MainWindow(QMainWindow):
             return
         if not self._covers_pixels(kind, points):
             return  # like a too-short drag: nothing measurable was drawn
-        self._roi_name_counts[kind] = self._roi_name_counts.get(kind, 0) + 1
-        name = f"{ROI_KIND_LABELS[kind]} {self._roi_name_counts[kind]}"
+        name = self._free_roi_name(kind)
         shape = RoiShape(
             id=self._roi_next_id,
             kind=kind,
@@ -720,6 +723,16 @@ class MainWindow(QMainWindow):
         if not self.bottom_panel.isVisible():
             self._toggle_statistics(True)
         self._push_rois()
+
+    def _free_roi_name(self, kind: str) -> str:
+        """The kind's label with the lowest number no ROI uses now: after deleting Box 2 of
+        Box 1-3, the next box is Box 2 again."""
+        label = ROI_KIND_LABELS[kind]
+        taken = {shape.name for shape in self._rois}
+        number = 1
+        while f"{label} {number}" in taken:
+            number += 1
+        return f"{label} {number}"
 
     def _select_roi(self, roi_id: int | None) -> None:
         self._selected_roi_id = roi_id
@@ -765,7 +778,6 @@ class MainWindow(QMainWindow):
         self._tc_roi_ids: set[int] = set()  # ROIs from "Fit Emissivity from TCs" (ids restart)
         self._zone_groups = []
         self._roi_next_id = 1
-        self._roi_name_counts = {}
         self._selected_roi_id = None
         self.canvas.set_rois([], None)
 
@@ -797,8 +809,8 @@ class MainWindow(QMainWindow):
             spec, replaced, box_name = group["spec"], set(group["ids"]), group["name"]
         elif selected is not None and selected.kind == "rect":
             d = self._zone_defaults
-            spec = ZoneSpec(box=normalized_box(selected.points), count=d.count, start=d.start, gap=d.gap,
-                            prefix=d.prefix)
+            spec = ZoneSpec(box=normalized_box(selected.points), count=d.count,
+                            start=self.orientation.recording_end(d.start), gap=d.gap, prefix=d.prefix)
             replaced, box_name = {selected.id}, selected.name
         else:
             self._notify("Select a box ROI to split into zones (or a zone to re-split)")
@@ -813,12 +825,13 @@ class MainWindow(QMainWindow):
             self.canvas.set_rois(others + shapes, None)
 
         dialog = ZoneSplitDialog(spec, width, height, tc_pixels=self._tc_pixels(), regroup=group is not None,
-                                 taken={shape.name for shape in others}, parent=self)
+                                 taken={shape.name for shape in others}, orientation=self.orientation,
+                                 parent=self)
         dialog.preview.connect(preview)
         code = dialog.exec()
         if code == ZoneSplitDialog.DialogCode.Accepted and dialog.zones():
             new_spec = dialog.spec()
-            self._zone_defaults = new_spec
+            self._zone_defaults = dataclass_replace(new_spec, start=self.orientation.shown_end(new_spec.start))
             zones = [RoiShape(self._roi_next_id + k, "rect", points, name)
                      for k, (name, points) in enumerate(dialog.zones())]
             self._roi_next_id += len(zones)
@@ -1076,6 +1089,7 @@ class MainWindow(QMainWindow):
             max_position=packet.max_position,
             label=label,
             flips=(state.flip_h, state.flip_v),
+            turns=state.rotation,
             mapping=mapping, segmentation=state.segmentation, isotherm=state.isotherm,
         )
         dest = Path(params["dest"])
@@ -1232,7 +1246,6 @@ class MainWindow(QMainWindow):
                                        name=shape.name))
             ids[k] = self._roi_next_id
             self._roi_next_id += 1
-            self._roi_name_counts[shape.kind] = self._roi_name_counts.get(shape.kind, 0) + 1
         kept = list(self._rois)
         for group in roi_set.zone_groups:
             members = [ids[k] for k in group.rois if k in ids]
@@ -1577,6 +1590,7 @@ class MainWindow(QMainWindow):
             clipping=self.show_clipping,
             flip_h=self.flip_h,
             flip_v=self.flip_v,
+            rotation=self.rotation,
         )
 
     def _current_scale(self, packet: FramePacket) -> tuple[float, float]:
@@ -1613,6 +1627,19 @@ class MainWindow(QMainWindow):
         self.flip_h = flip_h
         self.flip_v = flip_v
         self.canvas.set_flips(flip_h, flip_v)
+        self._render_current_frame()
+
+    @property
+    def orientation(self) -> Orientation:
+        """How the picture is turned and mirrored (view and image/movie exports only)."""
+        return Orientation(self.rotation, self.flip_h, self.flip_v)
+
+    def _rotate_view(self, step: int) -> None:
+        """Turn the picture as shown by ``step`` quarter turns (+1 clockwise)."""
+        turned = self.orientation.turned(step)
+        self.rotation, self.flip_h, self.flip_v = turned.turns, turned.flip_h, turned.flip_v
+        self.inspector.set_flip_states(self.flip_h, self.flip_v)
+        self.canvas.set_orientation(turned)
         self._render_current_frame()
 
     def _change_corrections(self, nuc: bool, bp: bool) -> None:

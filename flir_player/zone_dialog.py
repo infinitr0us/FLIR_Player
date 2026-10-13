@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import RoiShape
+from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
 from .zones import ENDS, ZoneSpec, pair_tcs, split_box
 
@@ -27,7 +28,8 @@ class ZoneSplitDialog(FramelessDialog):
 
     ``preview`` carries the zones as (name, corners) pairs on every valid change, or an empty
     list when the settings cannot be split; ``tc_pixels`` (TC → (row, col)) from a TC fit of the
-    recording adds a line saying which zone each TC pixel falls in.
+    recording adds a line saying which zone each TC pixel falls in. The ends are named as the
+    picture is shown (``orientation``: the view's turn and flips); the spec keeps recording terms.
     """
 
     JOIN = 2  # done() code: join the zones back into one box
@@ -36,7 +38,7 @@ class ZoneSplitDialog(FramelessDialog):
 
     def __init__(self, spec: ZoneSpec, width: int, height: int, *,
                  tc_pixels: Mapping[str, tuple[int, int]] | None = None, regroup: bool = False,
-                 taken: Collection[str] = (), parent=None) -> None:
+                 taken: Collection[str] = (), orientation: Orientation = Orientation(), parent=None) -> None:
         super().__init__("Split Box into Zones", parent)
         self.setMinimumWidth(460)
         self._width, self._height = width, height
@@ -56,9 +58,9 @@ class ZoneSplitDialog(FramelessDialog):
         self.count_spin.setRange(1, 200)
         self.count_spin.setValue(spec.count)
         self.start_combo = ChevronComboBox()
-        for end in ENDS:
-            self.start_combo.addItem(END_LABELS[end], end)
-        self.start_combo.setCurrentIndex(ENDS.index(spec.start))
+        for shown in ENDS:  # labels as seen on screen, data in recording terms
+            self.start_combo.addItem(END_LABELS[shown], orientation.recording_end(shown))
+        self.start_combo.setCurrentIndex(max(0, self.start_combo.findData(spec.start)))
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(0, 20)
         self.gap_spin.setSuffix(" px")

@@ -170,7 +170,7 @@ class ExportImageDialog(FramelessDialog):
             str(Path(self.path_edit.text()).with_suffix(EXTENSIONS[self._fmt()]))
         )
         self.composition.setEnabled(self._fmt() not in {"tiff16", "tiff_float"})
-        self.composition.setToolTip("Numeric TIFFs contain unflipped data without RGB composition")
+        self.composition.setToolTip("Numeric TIFFs contain the recording's own (unflipped, unturned) data without RGB composition")
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -256,7 +256,7 @@ class ExportSeriesDialog(FramelessDialog):
         self._replace: list[str] = []  # existing outputs the user agreed to replace
         self.format_combo.currentIndexChanged.connect(lambda: self.composition.setEnabled(
             str(self.format_combo.currentData()) not in {"tiff16", "tiff_float"}))
-        self.composition.setToolTip("Numeric TIFFs contain unflipped data without RGB composition")
+        self.composition.setToolTip("Numeric TIFFs contain the recording's own (unflipped, unturned) data without RGB composition")
         layout.addWidget(self.stats_check)
 
         self.button_box = QDialogButtonBox(

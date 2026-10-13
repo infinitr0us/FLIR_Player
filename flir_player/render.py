@@ -11,6 +11,7 @@ from functools import lru_cache
 import numpy as np
 from matplotlib import colormaps
 
+from .orientation import Orientation
 from .settings import app_settings
 
 
@@ -344,6 +345,11 @@ class DisplayState:
     clipping: bool = True
     flip_h: bool = False
     flip_v: bool = False
+    rotation: int = 0  # clockwise quarter turns of the picture, before the flips
+
+    @property
+    def orientation(self) -> Orientation:
+        return Orientation(self.rotation, self.flip_h, self.flip_v)
 
 
 def display_scale(
@@ -379,7 +385,7 @@ def render_frame_rgb(
     extrema: tuple[float, float] | None = None,
     *, return_mapping: bool = False,
 ) -> tuple[np.ndarray, float, float]:
-    """Full display pipeline: palette/PE → overlays → flips. Returns (rgb, low, high).
+    """Full display pipeline: palette/PE → overlays → turn and flips. Returns (rgb, low, high).
 
     ``extrema`` forwards the frame's known (min, max) to display_scale so
     dynamic scaling skips a redundant full-frame scan.
@@ -398,12 +404,7 @@ def render_frame_rgb(
         _paint_isotherm_overlay(rgb, data, iso_mode, iso_l1, iso_l2)
     if state.clipping:
         _paint_clip_overlay(rgb, clip_mask)
-    if state.flip_h:
-        rgb = np.fliplr(rgb)
-    if state.flip_v:
-        rgb = np.flipud(rgb)
-    if state.flip_h or state.flip_v:
-        rgb = np.ascontiguousarray(rgb)
+    rgb = state.orientation.apply(rgb)
     return (rgb, low, high, mapping) if return_mapping else (rgb, low, high)
 
 

@@ -65,6 +65,7 @@ from .settings import app_settings
 from .fff import describe_parameters
 from .geometry import area_extent, pixel_index
 from .models import ROI_COLORS, ROI_KIND_LABELS, CadenceInfo, UnitOption, VideoMetadata
+from .orientation import Orientation
 from .zones import short_label
 from .plots import HistogramPlotPanel, ProfilePlotPanel, TemporalPlotPanel
 from .render import (
@@ -618,7 +619,8 @@ class ThermalCanvas(QWidget):
         self._show_markers = False
         self._marker_image: tuple = (None, None)
         self._marker_rois: tuple = ()
-        self._flip_h = False
+        self._orientation = Orientation()
+        self._flip_h = False  # mirrors of _orientation, kept for readers of the flip state
         self._flip_v = False
         self._zoom: float | None = None  # None = fit to window
         self._pan = QPointF(0, 0)
@@ -683,10 +685,24 @@ class ThermalCanvas(QWidget):
 
     def set_flips(self, flip_h: bool, flip_v: bool) -> None:
         """Mirror the displayed image; coordinates stay in raw image space (§4.6.3)."""
-        self._flip_h = bool(flip_h)
-        self._flip_v = bool(flip_v)
+        self.set_orientation(Orientation(self._orientation.turns, flip_h, flip_v))
+
+    def set_orientation(self, orientation: Orientation) -> None:
+        """Turn and mirror the displayed image; coordinates stay in raw image space.
+
+        A quarter turn changes the picture's shape, so the view goes back to fit."""
+        if orientation.swaps_axes != self._orientation.swaps_axes:
+            self._zoom = None
+            self._pan = QPointF(0, 0)
+        self._orientation = orientation
+        self._flip_h = orientation.flip_h
+        self._flip_v = orientation.flip_v
         self._refresh_probe()
         self.update()
+
+    def _shown_size(self) -> tuple[int, int]:
+        """(width, height) of the picture as shown, in recording pixels."""
+        return self._orientation.display_size(self._raw.shape[1], self._raw.shape[0])
 
     # --- zoom / pan ----------------------------------------------------------
 
@@ -731,13 +747,10 @@ class ThermalCanvas(QWidget):
             return
         image_point = self._widget_to_image(anchor)
         zero_pan_rect = self._rect_for(zoom, QPointF(0, 0))
-        dx, dy = image_point
-        if self._flip_h:
-            dx = self._raw.shape[1] - dx
-        if self._flip_v:
-            dy = self._raw.shape[0] - dy
-        wx = zero_pan_rect.left() + dx * zero_pan_rect.width() / self._raw.shape[1]
-        wy = zero_pan_rect.top() + dy * zero_pan_rect.height() / self._raw.shape[0]
+        dx, dy = self._orientation.to_display(*image_point, self._raw.shape[1], self._raw.shape[0])
+        shown_width, shown_height = self._shown_size()
+        wx = zero_pan_rect.left() + dx * zero_pan_rect.width() / shown_width
+        wy = zero_pan_rect.top() + dy * zero_pan_rect.height() / shown_height
         self._zoom = float(zoom)
         self._pan = QPointF(anchor.x() - wx, anchor.y() - wy)
         self._clamp_pan()
@@ -839,7 +852,8 @@ class ThermalCanvas(QWidget):
 
     # Image coordinates are continuous: pixel i spans [i, i + 1), exactly as
     # the pixmap is drawn. A flip therefore mirrors x to width - x; the
-    # discrete pixel index mirrors as width - 1 - i (see _pixel_at).
+    # discrete pixel index mirrors as width - 1 - i (see _pixel_at). A quarter
+    # turn swaps the axes (orientation.Orientation maps both ways).
 
     def _device_image_rect(self) -> tuple[int, int, int, int]:
         """The image rectangle in whole device pixels: (left, top, width, height)."""
@@ -864,40 +878,34 @@ class ThermalCanvas(QWidget):
         if self._raw is None or self._image_rect.width() <= 0 or self._image_rect.height() <= 0:
             return (0.0, 0.0)
         width, height = self._raw.shape[1], self._raw.shape[0]
+        shown_width, shown_height = self._shown_size()
         target = self._image_target()
-        x = (pos.x() - target.left()) * width / target.width()
-        y = (pos.y() - target.top()) * height / target.height()
-        x = max(0.0, min(x, float(width)))
-        y = max(0.0, min(y, float(height)))
-        if self._flip_h:
-            x = width - x
-        if self._flip_v:
-            y = height - y
-        return (x, y)
+        u = (pos.x() - target.left()) * shown_width / target.width()
+        v = (pos.y() - target.top()) * shown_height / target.height()
+        u = max(0.0, min(u, float(shown_width)))
+        v = max(0.0, min(v, float(shown_height)))
+        return self._orientation.to_image(u, v, width, height)
 
     def _pixel_at(self, pos) -> tuple[int, int]:
         """Image pixel drawn under the screen pixel at ``pos``.
 
         Found in display space at the screen pixel's centre (as the pixmap is
-        sampled), then mirrored as a discrete index, so a flip never picks the
-        neighbouring pixel on a boundary.
+        sampled), then turned and mirrored as a discrete index, so a flip or
+        turn never picks the neighbouring pixel on a boundary.
         """
         width, height = self._raw.shape[1], self._raw.shape[0]
+        shown_width, shown_height = self._shown_size()
         ratio = max(1e-6, self.devicePixelRatioF())
         left, top, device_width, device_height = self._device_image_rect()
         # Work in device pixels (125 % / 150 % display scaling), at the centre
         # of the device pixel under the logical position. ceil(v) - 1:
         # nearest-neighbour scaling gives a device pixel whose centre sits
         # exactly on a source boundary to the lower source pixel.
-        column = math.ceil((pos.x() * ratio + 0.5 - left) * width / device_width) - 1
-        row = math.ceil((pos.y() * ratio + 0.5 - top) * height / device_height) - 1
-        column = max(0, min(column, width - 1))
-        row = max(0, min(row, height - 1))
-        if self._flip_h:
-            column = width - 1 - column
-        if self._flip_v:
-            row = height - 1 - row
-        return (column, row)
+        column = math.ceil((pos.x() * ratio + 0.5 - left) * shown_width / device_width) - 1
+        row = math.ceil((pos.y() * ratio + 0.5 - top) * shown_height / device_height) - 1
+        column = max(0, min(column, shown_width - 1))
+        row = max(0, min(row, shown_height - 1))
+        return self._orientation.pixel_to_image(column, row, width, height)
 
     def _pixel_center_at(self, pos) -> tuple[float, float]:
         column, row = self._pixel_at(pos)
@@ -911,13 +919,11 @@ class ThermalCanvas(QWidget):
     def _image_to_widget(self, x: float, y: float) -> QPointF:
         if self._raw is None:
             return QPointF()
-        if self._flip_h:
-            x = self._raw.shape[1] - x
-        if self._flip_v:
-            y = self._raw.shape[0] - y
+        u, v = self._orientation.to_display(x, y, self._raw.shape[1], self._raw.shape[0])
+        shown_width, shown_height = self._shown_size()
         target = self._image_target()
-        wx = target.left() + x * target.width() / self._raw.shape[1]
-        wy = target.top() + y * target.height() / self._raw.shape[0]
+        wx = target.left() + u * target.width() / shown_width
+        wy = target.top() + v * target.height() / shown_height
         return QPointF(wx, wy)
 
     # --- painting -------------------------------------------------------------
@@ -1598,25 +1604,20 @@ class ThermalCanvas(QWidget):
             points = list(original.points)
             points[index] = self._snap_to_center(image_pos) if pixel_points else image_pos
             return replace(original, points=tuple(points))
-        # corner handles on rect/ellipse: anchor opposite corner
+        # corner handles on rect/ellipse: anchor the opposite corner. Handles are
+        # named as shown ("ne" = top right on screen), so find the image corner
+        # drawn there (flips and turns move corners) and keep its diagonal opposite.
         first, second = original.points
         left, right = sorted((first[0], second[0]))
         top, bottom = sorted((first[1], second[1]))
-        handle = drag["handle"]
-        if self._flip_h:
-            handle = handle.translate(str.maketrans("we", "ew"))
-        if self._flip_v:
-            handle = handle.translate(str.maketrans("ns", "sn"))
-        anchors = {
-            "nw": (right, bottom),
-            "se": (left, top),
-            "ne": (left, bottom),
-            "sw": (right, top),
-        }
-        anchor = anchors.get(handle)
-        if anchor is None:
-            return original
-        return replace(original, points=(anchor, image_pos))
+        compass = {"top": "n", "bottom": "s", "left": "w", "right": "e"}
+        for x_side in ("left", "right"):
+            for y_side in ("top", "bottom"):
+                shown = {compass[self._orientation.shown_end(x_side)], compass[self._orientation.shown_end(y_side)]}
+                if shown == set(drag["handle"]):
+                    anchor = (right if x_side == "left" else left, bottom if y_side == "top" else top)
+                    return replace(original, points=(anchor, image_pos))
+        return original
 
     def _clamped_delta(
         self, points, dx: float, dy: float, margin: float = 0.0
@@ -2096,6 +2097,7 @@ class InspectorPanel(QWidget):
     tc_fit_requested = Signal()
     overlays_changed = Signal(bool, bool)
     flips_changed = Signal(bool, bool)
+    rotate_requested = Signal(int)  # +1 clockwise, -1 anticlockwise
     corrections_changed = Signal(bool, bool)
     reference_requested = Signal()
     reference_cleared = Signal()
@@ -2333,11 +2335,27 @@ class InspectorPanel(QWidget):
         self.flip_v_button.setIconSize(QSize(16, 16))
         self.flip_v_button.setToolTip("Flip image vertically")
         self.flip_v_button.setCheckable(True)
+        # Turning is for cameras mounted on their side: only the picture turns,
+        # ROIs, zones and every value stay in the recording's own pixels.
+        self.rotate_left_button = QToolButton()
+        self.rotate_left_button.setObjectName("AnalysisButton")
+        self.rotate_left_button.setIcon(awesome_icon("fa6s.rotate-left", ICON_TEXT))
+        self.rotate_left_button.setIconSize(QSize(16, 16))
+        self.rotate_left_button.setToolTip("Rotate image 90° left (view only; values and ROIs stay the same)")
+        self.rotate_right_button = QToolButton()
+        self.rotate_right_button.setObjectName("AnalysisButton")
+        self.rotate_right_button.setIcon(awesome_icon("fa6s.rotate-right", ICON_TEXT))
+        self.rotate_right_button.setIconSize(QSize(16, 16))
+        self.rotate_right_button.setToolTip("Rotate image 90° right (view only; values and ROIs stay the same)")
         flip_row.addWidget(self.flip_h_button)
         flip_row.addWidget(self.flip_v_button)
+        flip_row.addWidget(self.rotate_left_button)
+        flip_row.addWidget(self.rotate_right_button)
         flip_row.addStretch(1)
         self.flip_h_button.toggled.connect(self._flips_changed)
         self.flip_v_button.toggled.connect(self._flips_changed)
+        self.rotate_left_button.clicked.connect(lambda: self.rotate_requested.emit(-1))
+        self.rotate_right_button.clicked.connect(lambda: self.rotate_requested.emit(1))
         layout.addLayout(flip_row)
 
         self.corrections_heading = self._field_label("Corrections")
@@ -2875,6 +2893,13 @@ class InspectorPanel(QWidget):
             self.clipping_check.isChecked(), self.markers_check.isChecked()
         )
 
+    def set_flip_states(self, flip_h: bool, flip_v: bool) -> None:
+        """Show the flips a turn swapped, without emitting flips_changed."""
+        for button, checked in ((self.flip_h_button, flip_h), (self.flip_v_button, flip_v)):
+            blocked = button.blockSignals(True)
+            button.setChecked(bool(checked))
+            button.blockSignals(blocked)
+
     def _flips_changed(self) -> None:
         self.flips_changed.emit(
             self.flip_h_button.isChecked(), self.flip_v_button.isChecked()
@@ -2907,6 +2932,8 @@ class InspectorPanel(QWidget):
         self.markers_check.setEnabled(enabled)
         self.flip_h_button.setEnabled(enabled)
         self.flip_v_button.setEnabled(enabled)
+        self.rotate_left_button.setEnabled(enabled)
+        self.rotate_right_button.setEnabled(enabled)
         self.nuc_check.setEnabled(enabled)
         self.bp_check.setEnabled(enabled)
         self.reference_button.setEnabled(enabled)

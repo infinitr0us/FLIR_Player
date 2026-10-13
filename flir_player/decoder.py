@@ -156,6 +156,7 @@ def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
         max_position=packet.max_position,
         label=label,
         flips=(display.flip_h, display.flip_v),
+        turns=display.rotation,
         mapping=mapping, segmentation=display.segmentation, isotherm=display.isotherm,
     )
     return packet, rgb, composed, (low, high)
