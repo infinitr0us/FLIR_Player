@@ -203,3 +203,52 @@ def test_t9_split_with_a_slant_resplit_join_and_reload_in_the_player(qapp, tmp_p
         assert opened["far"] == (200, 211)
     finally:
         window.close()
+
+
+# --- Codex review of 0.7.4 (run 20261014-161126-review-v074-slant) -------------------------------------------
+
+
+def test_r1_a_band_of_constant_height_keeps_it_at_exact_half_ties() -> None:
+    # cell 13 spans columns 147-157: its rows are exactly 19.5-36.5, rounded half up to 20-36 (floats gave 19-36)
+    zones = dict(split_box(ZoneSpec(box=((0, 50), (220, 67)), count=18, gap=1, start="left", far=(6, 23))))
+    assert zones["Cell 13"] == ((147.0, 20.0), (158.0, 37.0))
+    assert {b[1] - a[1] for a, b in zones.values()} == {17.0}
+    shapes = _shapes(split_box(ZoneSpec(box=((0, 50), (220, 67)), count=18, gap=1, start="left", far=(6, 23))))
+    assert "Cell 13" not in pair_tcs({"X": (19, 150)}, shapes, H, W).pairs.values()
+    # negative rows: a one-row band stays one row in every zone
+    thin = split_box(ZoneSpec(box=((0, -64), (5, -63)), count=4, gap=0, start="left", far=(-19, -18)))
+    assert all(b[1] - a[1] == 1.0 for _n, (a, b) in thin)
+
+
+def test_r2_the_slant_rounds_like_the_box_corners() -> None:
+    # far equal to the box's own fractional rows is no slant, whatever the rounding of .5
+    box = ((0.0, 0.5), (4.0, 10.5))
+    flat = split_box(ZoneSpec(box=box, count=2, gap=0, start="left"))
+    assert split_box(ZoneSpec(box=box, count=2, gap=0, start="left", far=(0.5, 10.5))) == flat
+    assert split_box(ZoneSpec(box=BOX, far=(357.6, 374.6))) == split_box(ZoneSpec(box=BOX, far=FAR))
+
+
+def test_r3_the_dialog_rounds_a_saved_fractional_slant(qapp) -> None:
+    dialog = ZoneSplitDialog(ZoneSpec(box=BOX, far=(357.6, 374.6)), W, H, regroup=True)
+    dialog.show()
+    qapp.processEvents()
+    assert (dialog.f0.value(), dialog.f1.value()) == (358, 374) and dialog.spec().far == FAR
+    dialog.close()
+    broken = ZoneSplitDialog(ZoneSpec(box=BOX, far=(380.0, 380.0)), W, H, regroup=True)  # covers no row
+    broken.show()
+    qapp.processEvents()
+    assert (broken.f0.value(), broken.f1.value()) == (388, 404) and broken.spec().far is None
+    broken.close()
+
+
+@pytest.mark.parametrize("bad", ["12", {"358": None, "375": "x"}, [False, True], [358, None], "358,375"])
+def test_r4_a_slant_that_is_not_two_numbers_is_refused(tmp_path, bad) -> None:
+    spec = ZoneSpec(box=BOX, count=3, gap=0, far=FAR)
+    zones = [RoiShape(k + 1, "rect", points, name) for k, (name, points) in enumerate(split_box(spec))]
+    path = tmp_path / "a.rois.json"
+    save_roi_set(path, RoiSet(rois=tuple(zones), zone_groups=(ZoneGroup(rois=(0, 1, 2), spec=spec),)))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["zone_groups"][0]["far"] = bad
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="Zone group 1"):
+        load_roi_set(path)

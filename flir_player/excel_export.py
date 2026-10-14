@@ -138,8 +138,12 @@ def load_roi_set(path: str | Path) -> RoiSet:
         try:
             members = tuple(int(i) for i in item["rois"])
             (x0, y0), (x1, y1) = ((float(x), float(y)) for x, y in item["box"])
-            far = item.get("far")  # sets from 0.7.4 on, for a module at a slant
-            far = None if far is None else tuple(sorted(float(v) for v in far))
+            far = item.get("far")  # sets from 0.7.4 on, for a module at a slant: [first, end]
+            if far is not None:
+                if not (isinstance(far, list) and len(far) == 2
+                        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in far)):
+                    raise ValueError("far")
+                far = tuple(sorted(float(v) for v in far))
             spec = ZoneSpec(box=((x0, y0), (x1, y1)), count=int(item["count"]), start=str(item["start"]),
                             gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")), far=far)
             label = str(item.get("name") or "Box")

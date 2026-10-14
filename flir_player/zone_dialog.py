@@ -3,6 +3,7 @@
 """Split a box ROI into equal cell zones, previewed on the image while the dialog is open."""
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Collection, Mapping
 
 from PySide6.QtCore import Signal
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
 from .models import RoiShape
 from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
-from .zones import ENDS, ZoneSpec, far_label, pair_tcs, split_box
+from .zones import ENDS, ZoneSpec, far_label, normalized_far, pair_tcs, split_box
 
 END_LABELS = {"right": "Right end", "left": "Left end", "top": "Top end", "bottom": "Bottom end"}
 
@@ -78,7 +79,12 @@ class ZoneSplitDialog(FramelessDialog):
         # the slant: the zones' rows at the box's last column (columns at its last row for a split along the
         # rows); they follow the box's own until set by hand, and again after the split turns
         self._along = spec.start in ("right", "left")
-        a, b = spec.far if spec.far is not None else ((top, bottom) if self._along else (left, right))
+        a, b = (top, bottom) if self._along else (left, right)
+        if spec.far is not None:
+            try:  # a saved slant on whole pixels, rounded as the box's corners are
+                a, b = normalized_far(spec)
+            except ValueError:
+                spec = replace(spec, far=None)
         limit = (height if self._along else width) - 1
         self.f0 = self._spin(0, limit, int(a))
         self.f1 = self._spin(0, limit, int(b) - 1)
