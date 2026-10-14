@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.4 — 2026-10-14
+
+Cell zones for a module that runs at a slant in the picture: the T650 of the
+1006 test a looks along the module from above, so its top face rises about
+38 px from the far end to the heater end and is only about 17 px tall.
+
+### Cell zones
+
+- The split dialog has a third pair of edges, *Rows at the last column*
+  (*Columns at the last row* for a split along the rows): where the module is
+  at the box's other end. Each zone keeps its cell's columns and takes the
+  module's rows at its own centre, on the straight line from the box's rows at
+  its first column to these, so the zones step along the slant and stay
+  ordinary boxes: the workbook, the TC pairing and the ROI map treat them as
+  before. Left as the box's rows (the default, and they follow the box until
+  edited), nothing changes.
+- The dialog's line under the edges gives the zones' rows at both ends, and the
+  preview and the TC line follow the slant as it is typed.
+- ROI sets keep the slant with the split, so re-splitting starts from it; sets
+  without one load as before, and a split without a slant is saved exactly as
+  0.7.3 saved it.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.7.3...v0.7.4)
+
 ## 0.7.3 — 2026-10-13
 
 The time match of the TC fit, after the engineers' run on the 1006 A700 matched

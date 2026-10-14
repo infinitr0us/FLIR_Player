@@ -101,7 +101,8 @@ def save_roi_set(path: str | Path, roi_set: RoiSet) -> None:
     if roi_set.zone_groups:
         payload["zone_groups"] = [{"rois": list(group.rois), "name": group.name,
                                    "box": [list(corner) for corner in group.spec.box], "count": group.spec.count,
-                                   "start": group.spec.start, "gap": group.spec.gap, "prefix": group.spec.prefix}
+                                   "start": group.spec.start, "gap": group.spec.gap, "prefix": group.spec.prefix,
+                                   **({"far": list(group.spec.far)} if group.spec.far is not None else {})}
                                   for group in roi_set.zone_groups]
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -137,14 +138,18 @@ def load_roi_set(path: str | Path) -> RoiSet:
         try:
             members = tuple(int(i) for i in item["rois"])
             (x0, y0), (x1, y1) = ((float(x), float(y)) for x, y in item["box"])
+            far = item.get("far")  # sets from 0.7.4 on, for a module at a slant
+            far = None if far is None else tuple(sorted(float(v) for v in far))
             spec = ZoneSpec(box=((x0, y0), (x1, y1)), count=int(item["count"]), start=str(item["start"]),
-                            gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")))
+                            gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")), far=far)
             label = str(item.get("name") or "Box")
         except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"Zone group {number} in {name} is not valid") from exc
         if (not members or len(set(members)) != len(members) or not all(0 <= i < len(rois) for i in members)
                 or spec.start not in ZONE_ENDS or spec.count < 1 or spec.gap < 0
-                or not all(math.isfinite(v) for v in (x0, y0, x1, y1))):
+                or not all(math.isfinite(v) for v in (x0, y0, x1, y1))
+                or (far is not None and (len(far) != 2 or not all(math.isfinite(v) for v in far)
+                                         or far[1] <= far[0]))):
             raise ValueError(f"Zone group {number} in {name} is not valid")
         groups.append(ZoneGroup(rois=members, spec=spec, name=label))
     try:

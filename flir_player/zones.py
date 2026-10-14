@@ -4,7 +4,10 @@
 
 A battery module seen from the side is a row of cells. Splitting a box drawn over the row into
 equal boxes gives one zone per cell, numbered from the chosen end (the heater end on the fire
-tests). Equal widths assume the camera faces the row square on.
+tests). Equal widths assume the camera faces the row square on. A row that runs at a slant in the
+picture (a camera looking along the module from above) is followed by giving its rows at the box's
+last column as well: each zone keeps the box's columns for its cell and takes the row's rows at its
+own centre, so the zones step along the slant and stay plain boxes.
 """
 from __future__ import annotations
 
@@ -26,6 +29,9 @@ class ZoneSpec:
     start: str = "right"
     gap: int = 1  # pixel columns (rows) left out between neighbouring zones
     prefix: str = "Cell"
+    # the zones' rows (top, bottom) at the box's last column, or their columns (left, right) at its last
+    # row for a split along the rows; end exclusive like ``box``. None: the box's own (no slant)
+    far: tuple[float, float] | None = None
 
 
 def normalized_box(points) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -36,6 +42,11 @@ def normalized_box(points) -> tuple[tuple[float, float], tuple[float, float]]:
     return (float(left), float(top)), (float(right), float(bottom))
 
 
+def far_label(start: str) -> str:
+    """What ``ZoneSpec.far`` holds for a split from ``start``: "rows at the last column" or the like."""
+    return "rows at the last column" if start in ("right", "left") else "columns at the last row"
+
+
 def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = None
               ) -> list[tuple[str, tuple[tuple[float, float], tuple[float, float]]]]:
     """(name, box corners) of each zone, zone 1 at ``spec.start``.
@@ -43,8 +54,11 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     Zone edges lie on pixel boundaries (box coverage would otherwise round ties apart).
     ``spec.gap`` whole pixel columns (rows, for a vertical split) are left out at each inner
     boundary, centred on it, so the mixed pixels where two cells meet belong to no zone; the outer
-    edges stay where the box is. Zone sizes differ by at most one pixel. Raises ValueError when
-    the box is too small for the zones, or, given the image size, when a zone covers no pixel.
+    edges stay where the box is. Zone sizes differ by at most one pixel. With ``spec.far``, the
+    zones' rows (columns) run in a straight line from the box's at its first column (row) to
+    ``spec.far`` at its last, each zone taking them at its centre, rounded to whole pixels. Raises
+    ValueError when the box is too small for the zones, or, given the image size, when a zone
+    covers no pixel.
     """
     if spec.start not in ENDS:
         raise ValueError(f"Zone 1 must be at one of: {', '.join(ENDS)}")
@@ -57,6 +71,16 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
         raise ValueError("The box covers no pixel")
     along_x = spec.start in ("right", "left")
     low, high = (int(left), int(right)) if along_x else (int(top), int(bottom))
+    near = (top, bottom) if along_x else (left, right)  # across the split, at its first column (row)
+    far = near
+    if spec.far is not None:
+        a, b = (float(v) for v in spec.far)
+        if not (math.isfinite(a) and math.isfinite(b)):
+            raise ValueError(f"The {far_label(spec.start)} must be numbers")
+        a, b = sorted((math.floor(a + 0.5), math.floor(b + 0.5)))
+        if b <= a:
+            raise ValueError(f"The {far_label(spec.start)} must cover at least one pixel")
+        far = (float(a), float(b))
     step = (high - low) / spec.count
     # inner boundary j (ascending): the lower zone ends at ends[j], the upper one starts gap later
     ends = [math.floor(low + j * step - spec.gap / 2 + 0.5) for j in range(1, spec.count)]
@@ -72,7 +96,12 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     zones = []
     for k, (lo, hi) in enumerate(ascending):
         lo, hi = float(lo), float(hi)
-        points = ((lo, top), (hi, bottom)) if along_x else ((left, lo), (right, hi))
+        a, b = near
+        if far != near:  # across the split at this zone's centre; both ends are a pixel or more apart
+            s = ((lo + hi) / 2 - low) / (high - low)
+            a = float(math.floor(near[0] + s * (far[0] - near[0]) + 0.5))
+            b = float(math.floor(near[1] + s * (far[1] - near[1]) + 0.5))
+        points = ((lo, a), (hi, b)) if along_x else ((a, lo), (b, hi))
         zones.append((f"{prefix} {k + 1}", points))
     if width is not None and height is not None:
         for name, points in zones:

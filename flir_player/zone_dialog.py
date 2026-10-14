@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from .models import RoiShape
 from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
-from .zones import ENDS, ZoneSpec, pair_tcs, split_box
+from .zones import ENDS, ZoneSpec, far_label, pair_tcs, split_box
 
 END_LABELS = {"right": "Right end", "left": "Left end", "top": "Top end", "bottom": "Bottom end"}
 
@@ -46,7 +46,9 @@ class ZoneSplitDialog(FramelessDialog):
         self._taken = set(taken)  # names of the other ROIs: zones must not repeat them
         self._zones: list = []
         intro = QLabel("Equal zones along the box, one per cell. Zone 1 is at the end you choose (the heater end "
-                       "on the fire tests). The gap leaves out the mixed pixels where two cells meet.")
+                       "on the fire tests). The gap leaves out the mixed pixels where two cells meet. If the module "
+                       "runs at a slant in the picture, give its rows at the box's last column too: the zones then "
+                       "step along it.")
         intro.setObjectName("FieldLabel")
         intro.setWordWrap(True)
         self.body.addWidget(intro)
@@ -73,19 +75,30 @@ class ZoneSplitDialog(FramelessDialog):
         self.x1 = self._spin(0, width - 1, int(right) - 1)
         self.y0 = self._spin(0, height - 1, int(top))
         self.y1 = self._spin(0, height - 1, int(bottom) - 1)
+        # the slant: the zones' rows at the box's last column (columns at its last row for a split along the
+        # rows); they follow the box's own until set by hand, and again after the split turns
+        self._along = spec.start in ("right", "left")
+        a, b = spec.far if spec.far is not None else ((top, bottom) if self._along else (left, right))
+        limit = (height if self._along else width) - 1
+        self.f0 = self._spin(0, limit, int(a))
+        self.f1 = self._spin(0, limit, int(b) - 1)
+        self._linked = spec.far is None
+        for spin in (self.f0, self.f1):
+            spin.setToolTip("Where the module is at the other end of the box. The same as the box's: no slant. "
+                            "Otherwise each zone takes the module's rows (columns) at its centre, so the zones "
+                            "step along a module that runs at a slant in the picture.")
+        self.far_label = QLabel()
         rows = (("Zones", self.count_spin), ("Zone 1 at the", self.start_combo), ("Gap between zones", self.gap_spin),
                 ("Names", self.prefix_edit))
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QLabel(label), r, 0)
             grid.addWidget(widget, r, 1, 1, 3)
-        grid.addWidget(QLabel("Columns"), len(rows), 0)
-        grid.addWidget(self.x0, len(rows), 1)
-        grid.addWidget(QLabel("to"), len(rows), 2)
-        grid.addWidget(self.x1, len(rows), 3)
-        grid.addWidget(QLabel("Rows"), len(rows) + 1, 0)
-        grid.addWidget(self.y0, len(rows) + 1, 1)
-        grid.addWidget(QLabel("to"), len(rows) + 1, 2)
-        grid.addWidget(self.y1, len(rows) + 1, 3)
+        edge_rows = (("Columns", self.x0, self.x1), ("Rows", self.y0, self.y1), (self.far_label, self.f0, self.f1))
+        for r, (label, first, last) in enumerate(edge_rows, start=len(rows)):
+            grid.addWidget(label if isinstance(label, QLabel) else QLabel(label), r, 0)
+            grid.addWidget(first, r, 1)
+            grid.addWidget(QLabel("to"), r, 2)
+            grid.addWidget(last, r, 3)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         self.body.addLayout(grid)
@@ -119,8 +132,11 @@ class ZoneSplitDialog(FramelessDialog):
 
         for spin in (self.count_spin, self.gap_spin, self.x0, self.x1, self.y0, self.y1):
             spin.valueChanged.connect(self._update)
+        for spin in (self.f0, self.f1):
+            spin.valueChanged.connect(self._far_edited)
         self.start_combo.currentIndexChanged.connect(self._update)
         self.prefix_edit.textChanged.connect(self._update)
+        self._sync_far()
 
     @staticmethod
     def _spin(low: int, high: int, value: int) -> QSpinBox:
@@ -132,9 +148,34 @@ class ZoneSplitDialog(FramelessDialog):
     def spec(self) -> ZoneSpec:
         left, right = sorted((self.x0.value(), self.x1.value()))
         top, bottom = sorted((self.y0.value(), self.y1.value()))
+        start = str(self.start_combo.currentData())
+        near = (float(top), float(bottom + 1)) if start in ("right", "left") else (float(left), float(right + 1))
+        a, b = sorted((self.f0.value(), self.f1.value()))
+        far = (float(a), float(b + 1))
         return ZoneSpec(box=((float(left), float(top)), (float(right + 1), float(bottom + 1))),
-                        count=self.count_spin.value(), start=str(self.start_combo.currentData()),
-                        gap=self.gap_spin.value(), prefix=self.prefix_edit.text())
+                        count=self.count_spin.value(), start=start, gap=self.gap_spin.value(),
+                        prefix=self.prefix_edit.text(), far=None if far == near else far)
+
+    def _far_edited(self) -> None:
+        self._linked = False
+        self._update()
+
+    def _sync_far(self) -> None:
+        """Name the slant row for the split's direction; while not set by hand, it follows the box."""
+        start = str(self.start_combo.currentData())
+        along = start in ("right", "left")
+        if along != self._along:  # the split turned: the slant row means the other direction now
+            self._along = along
+            self._linked = True
+        self.far_label.setText(far_label(start).capitalize())
+        if self._linked:
+            first, last = (self.y0, self.y1) if along else (self.x0, self.x1)
+            limit = (self._height if along else self._width) - 1
+            for spin, value in ((self.f0, first.value()), (self.f1, last.value())):
+                spin.blockSignals(True)
+                spin.setRange(0, max(0, limit))
+                spin.setValue(value)
+                spin.blockSignals(False)
 
     def zones(self) -> list:
         """(name, corners) of the zones the dialog shows (empty when the settings cannot split)."""
@@ -145,6 +186,7 @@ class ZoneSplitDialog(FramelessDialog):
         self._update()
 
     def _update(self) -> None:
+        self._sync_far()
         spec = self.spec()
         ok = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
         try:
@@ -165,13 +207,22 @@ class ZoneSplitDialog(FramelessDialog):
         (left, top), (right, bottom) = spec.box
         along = spec.start in ("right", "left")
         length = (right - left) if along else (bottom - top)
-        across = (bottom - top) if along else (right - left)
         widths = [(p[1][0] - p[0][0]) if along else (p[1][1] - p[0][1]) for _name, p in self._zones]
-        size = f"{min(widths):g}" if min(widths) == max(widths) else f"{min(widths):g}-{max(widths):g}"
+        heights = [(p[1][1] - p[0][1]) if along else (p[1][0] - p[0][0]) for _name, p in self._zones]
+
+        def span(values) -> str:
+            return f"{min(values):g}" if min(values) == max(values) else f"{min(values):g}-{max(values):g}"
+
+        text = (f"{spec.count} zone{'s' if spec.count != 1 else ''} of {span(widths)} × {span(heights)} pixels "
+                f"({length:g} px long box, {spec.gap} px gap{'s' if spec.gap != 1 else ''}).")
+        if spec.far is not None:
+            near = (top, bottom) if along else (left, right)
+            ends = (left, right - 1) if along else (top, bottom - 1)
+            kind, at = ("Rows", "column") if along else ("Columns", "row")
+            text += (f" {kind} {near[0]:g}-{near[1] - 1:g} at {at} {ends[0]:g}, "
+                     f"{spec.far[0]:g}-{spec.far[1] - 1:g} at {at} {ends[1]:g}: the zones step along the slant.")
         self.info_label.setStyleSheet("")
-        self.info_label.setText(
-            f"{spec.count} zone{'s' if spec.count != 1 else ''} of {size} × {across:g} pixels "
-            f"({length:g} px long box, {spec.gap} px gap{'s' if spec.gap != 1 else ''}).")
+        self.info_label.setText(text)
         if self._tc_pixels:
             shapes = [RoiShape(k + 1, "rect", points, name) for k, (name, points) in enumerate(self._zones)]
             pairing = pair_tcs(self._tc_pixels, shapes, self._height, self._width)

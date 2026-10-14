@@ -415,7 +415,11 @@ For a battery module seen from the side:
    leaves out the mixed pixels where two cells meet) and the box edges in
    pixels. The zones preview on the image, and the dialog says which
    zone each TC pixel falls in: TCs on cells 3, 6 and 9 should land in zones 3,
-   6 and 9.
+   6 and 9. If the module runs at a slant in the picture (a camera looking
+   along it from above), draw the box over the row of cells at its left end and
+   type the row's first and last pixel rows at the box's last column under
+   *Rows at the last column*: each zone then takes the rows at its own centre,
+   so the zones step along the slant.
 3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
    ticked: each TC is paired with its zone, the logger data sit at the fitted
    time offset, and Use = 1 marks the seconds the fit used (no flames on the TC,
@@ -433,7 +437,8 @@ the zones report every cell at the matched emissivity.
 
 Without a TC fit, paste the logger data on TC Compare and pick each zone's TC
 on Settings; the ignition frame must then be logger time 0. Equal zone widths
-assume the camera faces the side square on. TCs on the top face can read the
+assume the cells look equally wide in the picture (no strong perspective along
+the module). TCs on the top face can read the
 jet flames and run hotter than the surface the camera sees, which pulls the
 best value toward the lower limit; the sheet says so.
 
