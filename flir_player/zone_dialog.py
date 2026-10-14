@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from .models import RoiShape
 from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
-from .zones import ENDS, ZoneSpec, far_label, normalized_far, pair_tcs, split_box
+from .zones import ENDS, ZoneSpec, far_label, normalized_box, normalized_far, pair_tcs, split_box
 
 END_LABELS = {"right": "Right end", "left": "Left end", "top": "Top end", "bottom": "Bottom end"}
 
@@ -71,7 +71,7 @@ class ZoneSplitDialog(FramelessDialog):
         self.gap_spin.setToolTip("Lines of pixels left out between neighbouring zones, where two cells meet")
         self.prefix_edit = QLineEdit(spec.prefix)
         self.prefix_edit.setToolTip("Zones are named prefix 1, prefix 2, …")
-        (left, top), (right, bottom) = spec.box
+        (left, top), (right, bottom) = normalized_box(spec.box)  # whole pixels, rounded as the slant is
         self.x0 = self._spin(0, width - 1, int(left))
         self.x1 = self._spin(0, width - 1, int(right) - 1)
         self.y0 = self._spin(0, height - 1, int(top))

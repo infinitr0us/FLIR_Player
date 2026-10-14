@@ -241,6 +241,20 @@ def test_r3_the_dialog_rounds_a_saved_fractional_slant(qapp) -> None:
     broken.close()
 
 
+@pytest.mark.parametrize(("box", "far", "start"), [
+    (((0.0, 10.6), (40.0, 20.6)), (10.6, 20.6), "left"),
+    (((10.6, 0.0), (20.6, 40.0)), (10.6, 20.6), "top"),
+])
+def test_r5_a_saved_fractional_box_with_an_equal_slant_reopens_flat(qapp, box, far, start) -> None:
+    spec = ZoneSpec(box=box, count=2, gap=0, start=start, far=far)
+    dialog = ZoneSplitDialog(spec, W, H, regroup=True)
+    dialog.show()
+    qapp.processEvents()
+    assert dialog.spec().far is None
+    assert dialog.zones() == split_box(ZoneSpec(box=box, count=2, gap=0, start=start), W, H)
+    dialog.close()
+
+
 @pytest.mark.parametrize("bad", ["12", {"358": None, "375": "x"}, [False, True], [358, None], "358,375"])
 def test_r4_a_slant_that_is_not_two_numbers_is_refused(tmp_path, bad) -> None:
     spec = ZoneSpec(box=BOX, count=3, gap=0, far=FAR)
