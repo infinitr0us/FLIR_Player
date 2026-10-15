@@ -191,3 +191,17 @@ def test_excel_notes_follow_the_residuals_with_hot_surroundings(excel, tmp_path)
         assert "read hotter" in book.Worksheets("Emissivity Match").Range("D9").Value
     finally:
         book.Close(False)
+
+
+def test_excel_leaves_out_the_rows_where_a_zone_clips(excel, tmp_path) -> None:
+    source, temps = _zone_source()
+    cell3 = next(r for r in source.rois if r.shape.name == "Cell 3")
+    cell3.status = cell3.status.copy()
+    cell3.status[30:41] = 3  # Saturated, while the mean count stays in range
+    path = _write(tmp_path, source, _prefill(temps))
+    book = _open(excel, path)
+    try:
+        _compare_sheet(book, path, range(6, 9), (7,))
+        _compare_sheet(book, path, range(13, 15), range(2, 11))  # the rows of Cell 3 lose the 11 clipped ones
+    finally:
+        book.Close(False)

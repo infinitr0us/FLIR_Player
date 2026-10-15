@@ -38,6 +38,9 @@ _SHEET_HINT = re.compile(r"(?<![a-z])(tcs?|thermo\w*|temp|temps|temperatures?)(?
 WORKBOOK_SUFFIXES = (".xlsx", ".xlsm")
 TEXT_SUFFIXES = (".csv", ".txt", ".tsv", ".dat")
 _TEMPERATURE_UNIT = re.compile(r"°\s*[CFK]\b|\bdeg\.?\s*[CFK]\b|^[\[\(]\s*[CFK]\s*[\]\)]$|^[CFK]$", re.IGNORECASE)
+# Fahrenheit said outright: refused, since readings are taken as °C ("K" is left alone: it usually names a type-K TC;
+# a bare "(F)" may name a position, like "(S)" for south)
+_FAHRENHEIT = re.compile(r"°\s*F\b|\bdeg\.?\s*F\b|\bfahrenheit\b", re.IGNORECASE)
 
 
 def _unit_patterns(words: str, spelled: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
@@ -438,6 +441,11 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     channels = [c for c in channels if c not in counters and c not in copies]
     if not channels:
         raise ValueError("no numeric TC columns next to the time column")
+    fahrenheit = [c for c in channels if any(isinstance(row[c], str) and _FAHRENHEIT.search(row[c]) for row in headers)]
+    if fahrenheit:
+        raise ValueError("TC readings must be in °C, but " + ", ".join(
+            repr(name) for name in _names(headers, fahrenheit)) + " " + ("is" if len(fahrenheit) == 1 else "are")
+            + " headed as °F")
     # rows without any reading at the edges of the block are not data (e.g. a lone number above it)
     filled = [any(_number(row[c]) is not None for c in channels) for row in block]
     lead = filled.index(True)
@@ -605,13 +613,17 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
                 return c, scale_of(c)
         raise ValueError(f"no column headed {requested!r}")
     candidates = []
+    headed = False  # a column headed as time holds times (rising or not)
     for c in range(width):
+        if _temperature_unit(headers, c):  # a TC heating steadily is no time axis
+            continue
         # between its first and last time, (nearly) every row holds one; rows at the edges need not
         # (a summary row such as "Max" under the data)
         values = [row[c] for row in block]
         ok = [_time_like(v) for v in values]
         if sum(ok) < 3:
             continue
+        headed = headed or _time_evidence(headers, c)
         a, z = ok.index(True), len(ok) - 1 - ok[::-1].index(True)
         cells = [v for v, good in zip(values[a:z + 1], ok[a:z + 1]) if good]
         if len(cells) < 0.9 * (z - a + 1):
@@ -623,7 +635,9 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
             unit = 1.0 if dated else _time_scale(headers, c)
             rank = 0 if unit == 1.0 else (1 if unit is None else 2)
             candidates.append((not hinted, rank, c))
-    if not candidates:
+    if not candidates or (headed and all(unhinted for unhinted, _rank, _c in candidates)):
+        # a time column that stops rising goes to _rising_run; a column without a time header (a scan
+        # number, a reading) must not take its place
         raise ValueError("no increasing time column")
     c = min(candidates)[2]
     return c, scale_of(c)

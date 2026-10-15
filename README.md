@@ -495,8 +495,8 @@ default results folder (`<recording>_tcmatch`, reading the TC file again), so a
 workbook can be filled from it in a later session; the setup dialog also offers
 the last run's search region, whose saved statistics make a rerun quick.
 Superframing recordings use the frames of one preset; their workbook cannot
-separate presets yet. Recordings without a factory calibration cannot be
-fitted.
+separate presets yet, so the Excel export refuses them (its rows would mix the
+presets). Recordings without a factory calibration cannot be fitted.
 
 Known SDK issue (fixed by FileSDK 2026.1): with FileSDK 5.0.1, switching
 units on recordings that carry a ResearchIR user calibration

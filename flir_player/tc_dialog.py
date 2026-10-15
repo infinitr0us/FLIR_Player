@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from .excel_dialog import _panel
 from .export_dialogs import _path_row, confirm_replace
+from .geometry import area_extent
 from .models import RoiShape, VideoMetadata
 from .settings import app_settings
 from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES, TcTable, parse_windows, read_tc_table, sheet_names, suggest_sheet
@@ -159,7 +160,8 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
     rows = []
     for name in names:
         checked = name in chosen if chosen is not None else not _AIR_HINT.search(name)
-        windows = ", ".join(f"{a:g}-{b:g}" for a, b in options.valid.get(name, ()))
+        windows = ", ".join(f"{a:g}-{b:g}".replace("-inf-", "-").replace("inf", "")  # open ends stay empty
+                            for a, b in options.valid.get(name, ()))
         rows.append((name, checked, windows))
     return {
         "kind": "tc",
@@ -175,11 +177,13 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
 
 
 def _box_region(shape: RoiShape, width: int, height: int) -> tuple[int, int, int, int]:
-    """(x0, y0, x1, y1), end exclusive, of the pixels a box ROI touches."""
-    (ax, ay), (bx, by) = shape.points
-    x0, x1 = sorted((ax, bx))
-    y0, y1 = sorted((ay, by))
-    return (max(0, math.floor(x0)), max(0, math.floor(y0)), min(width, math.ceil(x1)), min(height, math.ceil(y1)))
+    """(x0, y0, x1, y1), end exclusive, of the pixels a box ROI measures (its corners rounded to pixel
+    boundaries, as everywhere else); an empty region when it covers no pixel."""
+    extent = area_extent("rect", shape.points, height, width)
+    if extent is None:
+        return (0, 0, 0, 0)
+    x_min, x_max, y_min, y_max = extent[:4]
+    return (x_min, y_min, x_max + 1, y_max + 1)
 
 
 class TcCalibrationDialog(FramelessDialog):

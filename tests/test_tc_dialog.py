@@ -203,7 +203,7 @@ def test_setup_dialog_reads_the_tc_file_and_builds_the_options(qapp, tmp_path) -
     run = dialog.button_box.button(dialog.button_box.StandardButton.Ok)
     assert not run.isEnabled() and "TC file first" in dialog.estimate_label.text()
     assert dialog.out_edit.text() == str(results_folder(tmp_path / "test.csq"))
-    assert dialog.region() == (100, 50, 160, 91)  # the selected box, every pixel it touches
+    assert dialog.region() == (100, 50, 160, 90)  # the selected box: the pixels it measures (corners rounded)
     assert dialog.preset_combo is None  # one preset
     dialog.file_edit.setText(str(tc))
     dialog._load(sheet=None)
@@ -214,7 +214,7 @@ def test_setup_dialog_reads_the_tc_file_and_builds_the_options(qapp, tmp_path) -
     dialog.time_combo.setCurrentIndex(dialog.time_combo.findData("frame"))
     dialog.current_button.click()
     options = dialog.options()
-    assert options.roi == (100, 50, 160, 91) and options.channels == ("S1", "S2")
+    assert options.roi == (100, 50, 160, 90) and options.channels == ("S1", "S2")
     assert options.valid == {"S2": ((0.0, 40.0),)} and options.lag_frame == 41 and options.preset is None
     params = dialog.parameters()
     assert params["tc_file"] == str(tc) and params["sheet"] is None and params["parameters_from"] == "player"

@@ -66,6 +66,14 @@ class TimestampRepair:
         return result
 
 
+def superframing(im: Any) -> bool:
+    """True when the recording cycles through two or more presets (each with frames of its own)."""
+    info = getattr(im, "source_info", None)
+    presets = [p for p in (getattr(info, "preset_info", ()) or ())
+               if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
+    return len(presets) >= 2
+
+
 def preset_frame_rate(im: Any) -> float:
     """Camera rate of the recording's active preset, or 0.0 when unknown.
 

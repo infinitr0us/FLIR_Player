@@ -49,8 +49,8 @@ from .jobs import JobCancelled, OutputTransaction
 from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, count_status
 from .fff import saved_object_parameters
-from .sdktime import TimestampRepair, recording_rate
-from .zones import ENDS as ZONE_ENDS, ZoneSpec
+from .sdktime import TimestampRepair, recording_rate, superframing
+from .zones import ENDS as ZONE_ENDS, MAX_GAP, MAX_ZONES, ZoneSpec
 
 ROI_SET_FORMAT = "flir-player-roi-set"
 EXCEL_COLUMNS = 16_384
@@ -150,7 +150,7 @@ def load_roi_set(path: str | Path) -> RoiSet:
         except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"Zone group {number} in {name} is not valid") from exc
         if (not members or len(set(members)) != len(members) or not all(0 <= i < len(rois) for i in members)
-                or spec.start not in ZONE_ENDS or spec.count < 1 or spec.gap < 0
+                or spec.start not in ZONE_ENDS or not 1 <= spec.count <= MAX_ZONES or not 0 <= spec.gap <= MAX_GAP
                 or not all(math.isfinite(v) for v in (x0, y0, x1, y1))
                 or (far is not None and (len(far) != 2 or not all(math.isfinite(v) for v in far)
                                          or far[1] <= far[0]))):
@@ -764,6 +764,10 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
             opened.append(im)
         infos = []
         for spec, im in zip(specs, opened):
+            if superframing(im):
+                # rows would alternate presets (and a calibration fitted on some of them could pass)
+                raise ValueError(f"{spec.path.name} cycles through several presets (superframing); the Excel "
+                                 "export cannot keep them apart yet")
             n = int(im.num_frames)
             if not 0 <= spec.ignition_frame < n:
                 raise ValueError(f"{spec.path.name}: ignition frame {spec.ignition_frame + 1} is outside the recording")

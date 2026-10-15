@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a review of everything added since 0.5.2 (the TC fit, the
+workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
+
+### TC fit
+
+- An emissivity that leaves some seconds of an event without any temperature
+  (with a high reflected temperature) no longer wins on the seconds it can
+  explain: every candidate is compared over the same seconds.
+- A TC sheet whose time column stops rising is no longer read with another
+  rising column (a TC heating steadily, a scan number) as its time: a column
+  headed as time is read over the stretch where it rises, and a column with a
+  temperature unit is never the time. TC columns headed in °F are refused.
+- A pixel given for T1 no longer also fixes T10: a name matches exactly first,
+  then a channel number, then a start that names one channel only.
+- A fit with an open-ended validity window ("50-") reopens; the dialog shows
+  the open end empty again.
+- When no TC is found within 2 minutes of the clocks, the results say so and
+  suggest *Anywhere in the recording* or giving the frame (there is still no
+  silent switch to the whole recording).
+- Saved frame statistics remember the recording's content and are not reused
+  for another file of the same name, size and time; a statistics file cut off
+  while it was written counts as no cache instead of stopping the fit.
+- The summary gives event durations in seconds when a time bin is longer than
+  a second.
+- A reflected temperature given for the fit on the command line also goes into
+  its workbook.
+- The search region of a box is the pixels the box measures (its corners
+  rounded as everywhere else), not the pixels it touches.
+- A fit kept in the player for a recording is dropped when another file is put
+  at the same path; a rerun that draws no figure no longer reopens the previous
+  run's figure; a workbook from a fit saved before 0.7.1 (which did not record
+  its object parameters) asks first.
+
+### Workbook
+
+- The Excel export refuses a recording that cycles through several presets
+  (superframing), whose rows would mix the presets.
+- The Emissivity Match leaves out the rows where a zone has clipped pixels
+  (Status *Saturated*), in Excel and in the values written with the workbook.
+- More than 255 ROIs take more overview charts (an Excel chart holds 255
+  series); the Match and matching-emissivity charts say when they show only
+  the first ones.
+
+### Cell zones and ROI sets
+
+- With a gap between zones, the box's ends lose half a gap as well, so every
+  zone is as wide (the end zones were wider by half a gap); the shortest box
+  the dialog asks for is now exact.
+- ROI sets with more zones or a wider gap than the split dialog allows are
+  refused, and a set saved for another image size is refused with both sizes
+  named.
+
 ## 0.7.4 — 2026-10-14
 
 Cell zones for a module that runs at a slant in the picture: the T650 of the

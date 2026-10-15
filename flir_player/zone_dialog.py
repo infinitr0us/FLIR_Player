@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 from .models import RoiShape
 from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
-from .zones import ENDS, ZoneSpec, far_label, normalized_box, normalized_far, pair_tcs, split_box
+from .zones import (ENDS, MAX_GAP, MAX_ZONES, ZoneSpec, far_label, normalized_box, normalized_far, pair_tcs,
+                    split_box)
 
 END_LABELS = {"right": "Right end", "left": "Left end", "top": "Top end", "bottom": "Bottom end"}
 
@@ -58,14 +59,14 @@ class ZoneSplitDialog(FramelessDialog):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
         self.count_spin = QSpinBox()
-        self.count_spin.setRange(1, 200)
+        self.count_spin.setRange(1, MAX_ZONES)
         self.count_spin.setValue(spec.count)
         self.start_combo = ChevronComboBox()
         for shown in ENDS:  # labels as seen on screen, data in recording terms
             self.start_combo.addItem(END_LABELS[shown], orientation.recording_end(shown))
         self.start_combo.setCurrentIndex(max(0, self.start_combo.findData(spec.start)))
         self.gap_spin = QSpinBox()
-        self.gap_spin.setRange(0, 20)
+        self.gap_spin.setRange(0, MAX_GAP)
         self.gap_spin.setSuffix(" px")
         self.gap_spin.setValue(spec.gap)
         self.gap_spin.setToolTip("Lines of pixels left out between neighbouring zones, where two cells meet")

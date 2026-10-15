@@ -18,6 +18,8 @@ from typing import Mapping, Sequence
 from .geometry import roi_coordinates
 
 ENDS = ("right", "left", "top", "bottom")  # where zone 1 is
+MAX_ZONES = 200  # the split dialog's limits, also for zone groups read from a saved set
+MAX_GAP = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,14 +65,26 @@ def normalized_far(spec: ZoneSpec) -> tuple[int, int]:
     return a, b
 
 
+def _spans(low: int, high: int, count: int, gap: int) -> tuple[list[int], list[int]]:
+    """(starts, ends) of ``count`` zones over pixels low..high-1, ascending, end exclusive.
+
+    Inner boundary j: the lower zone ends at ends[j], the upper one starts ``gap`` later (the gap centred
+    on the boundary); the box's ends lose half a gap too (the module's ends are mixed pixels as well), so
+    every zone is as wide, to a pixel.
+    """
+    step = (high - low) / count
+    ends = [math.floor(low + j * step - gap / 2 + 0.5) for j in range(1, count)]
+    return [low + gap // 2] + [end + gap for end in ends], ends + [high - gap // 2]
+
+
 def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = None
               ) -> list[tuple[str, tuple[tuple[float, float], tuple[float, float]]]]:
     """(name, box corners) of each zone, zone 1 at ``spec.start``.
 
     Zone edges lie on pixel boundaries (box coverage would otherwise round ties apart).
     ``spec.gap`` whole pixel columns (rows, for a vertical split) are left out at each inner
-    boundary, centred on it, so the mixed pixels where two cells meet belong to no zone; the outer
-    edges stay where the box is. Zone sizes differ by at most one pixel. With ``spec.far`` (rounded
+    boundary, centred on it, so the mixed pixels where two cells meet belong to no zone; the box's
+    ends lose half a gap (rounded down) each. Zone sizes differ by at most one pixel. With ``spec.far`` (rounded
     to whole pixels like the box's corners), the zones' rows (columns) run in a straight line from
     the box's at its first column (row) to ``spec.far`` at its last, each zone taking them at its
     centre, rounded half up. Raises
@@ -90,14 +104,13 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     low, high = (int(left), int(right)) if along_x else (int(top), int(bottom))
     near = (int(top), int(bottom)) if along_x else (int(left), int(right))  # across, at the first column (row)
     far = normalized_far(spec) if spec.far is not None else near
-    step = (high - low) / spec.count
-    # inner boundary j (ascending): the lower zone ends at ends[j], the upper one starts gap later
-    ends = [math.floor(low + j * step - spec.gap / 2 + 0.5) for j in range(1, spec.count)]
-    starts = [low] + [end + spec.gap for end in ends]
-    ends = ends + [high]
+    starts, ends = _spans(low, high, spec.count, spec.gap)
     if any(end <= start for start, end in zip(starts, ends)):
+        shortest = next((n for n in range(high - low + 1, spec.count * (spec.gap + 2) + 2)
+                         if all(e > a for a, e in zip(*_spans(0, n, spec.count, spec.gap)))),
+                        spec.count * (spec.gap + 1))
         raise ValueError(f"{spec.count} zones with a {spec.gap} px gap need a box at least "
-                         f"{spec.count * (1 + spec.gap) - spec.gap} px long; this one is {high - low} px")
+                         f"{shortest} px long; this one is {high - low} px")
     ascending = list(zip(starts, ends))
     if spec.start in ("right", "bottom"):
         ascending.reverse()

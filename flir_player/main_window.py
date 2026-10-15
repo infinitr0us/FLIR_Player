@@ -120,6 +120,15 @@ def _file_dialog_filter() -> str:
     return f"FLIR recordings ({patterns});;All files (*.*)"
 
 
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """(size, modification time in ns) of a recording, to tell a file put in its place later; None if unreadable."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
 class MainWindow(QMainWindow):
     """Application shell and playback controller."""
 
@@ -1239,6 +1248,12 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as exc:
             self._show_error("Load ROI set", f"{type(exc).__name__}: {exc}")
             return
+        here = (self.metadata.width, self.metadata.height)
+        if roi_set.size is not None and tuple(roi_set.size) != here:
+            # pixel positions mean other places on another image size (a set without a size is taken as is)
+            self._show_error("Load ROI set", f"This ROI set was saved for a {roi_set.size[0]} × {roi_set.size[1]} "
+                                             f"image; {self.metadata.path.name} is {here[0]} × {here[1]}.")
+            return
         self._clear_rois()
         ids: dict[int, int] = {}  # position in the set → new id
         for k, shape in enumerate(roi_set.rois):
@@ -1361,6 +1376,7 @@ class MainWindow(QMainWindow):
         run = self._tc_runs.setdefault(str(self.metadata.path), {})
         run["output"] = output
         run["out_dir"] = (getattr(self, "_tc_pending", None) or {}).get("out_dir")
+        run["identity"] = _file_identity(self.metadata.path)
         self._show_tc_results()
 
     def _show_tc_results(self) -> None:
@@ -1385,8 +1401,12 @@ class MainWindow(QMainWindow):
         even to say a file is not there); no folder or another recording's fit is silent.
         """
         key = str(metadata.path)
-        if "output" in self._tc_runs.get(key, {}):
-            return
+        run = self._tc_runs.get(key, {})
+        if "output" in run:
+            if run.get("identity") == _file_identity(metadata.path):
+                return
+            # another recording now sits at this path: its fit (if any) is read from its folder, checked
+            self._tc_runs.pop(key, None)
         reader = SavedFitReader(key, results_folder(metadata.path), metadata.path, metadata.num_frames)
         reader.done.connect(self._on_saved_tc_fit)
         reader.start_kept()
@@ -1414,6 +1434,7 @@ class MainWindow(QMainWindow):
             return
         run["output"] = output
         run["out_dir"] = str(saved.folder)
+        run["identity"] = _file_identity(Path(key))
         self._notify(f"Reopened the last TC fit ({saved.folder.name}): logger time 0 = frame "
                      f"{output.result.ignition_frame + 1:,}")
 
@@ -1450,6 +1471,13 @@ class MainWindow(QMainWindow):
 
     def _save_tc_workbook(self, output, folder: Path) -> None:
         if self.metadata is None:
+            return
+        if not getattr(output, "parameters_known", True) and not MessageDialog.question(
+                self, "Save Excel workbook",
+                "This fit was saved by a version before 0.7.1, which did not record the object parameters "
+                "(distance, reflected temperature, ...) it used. The workbook will start from the recording's "
+                "own values; if the fit used others, set them on its Settings sheet, or run the fit again.\n\n"
+                "Save the workbook?"):
             return
         default = folder / f"{self.metadata.path.stem}_vs_TC.xlsx"
         path, _ = QFileDialog.getSaveFileName(self, "Save Excel workbook", str(default), "Excel workbook (*.xlsx)")

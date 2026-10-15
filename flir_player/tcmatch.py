@@ -62,7 +62,8 @@ try:
 except ModuleNotFoundError:  # pure parts stay importable without the SDK
     fnv = None  # type: ignore[assignment]
 
-from .calibration import CalibrationReport, derive_calibration, preserved_state, read_array, set_unit_safely
+from .calibration import (CalibrationReport, derive_calibration, preserved_state, read_array, sdk_values,
+                          set_unit_safely)
 from .jobs import JobCancelled, OutputTransaction
 from .models import RoiShape
 from .radiometry import (
@@ -75,7 +76,7 @@ from .radiometry import (
     count_status,
     object_temperature,
 )
-from .sdktime import TimestampRepair, recording_rate
+from .sdktime import TimestampRepair, recording_rate, superframing
 from .tcdata import ChannelFlags, TcTable, failure_flags, read_tc_table, resample, window_mask
 
 Progress = Callable[[int, int], None]
@@ -283,11 +284,7 @@ def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = Fal
     return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []))
 
 
-def _superframing(im: Any) -> bool:
-    info = getattr(im, "source_info", None)
-    presets = [p for p in (getattr(info, "preset_info", ()) or ())
-               if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
-    return len(presets) >= 2
+_superframing = superframing
 
 
 def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress, abort,
@@ -296,9 +293,12 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
     if not _superframing(im):
         return PresetLayout()
     store = Path(cache_dir) / f"{_file_key(path, 'presets', 1)}_presets.npz" if cache_dir is not None else None
+    fingerprint = recording_fingerprint(path) if store is not None and path.is_file() else None
     if store is not None and store.exists():
         try:
             with np.load(store) as data:
+                if fingerprint and "fingerprint" in data.files and str(data["fingerprint"]) != fingerprint:
+                    raise ValueError("the layout was read from another recording")
                 presets = [int(p) for p in data["presets"]]
                 return PresetLayout(frames={p: data[f"frames_{p}"] for p in presets},
                                     ranges={p: tuple(data[f"range_{p}"]) for p in presets if f"range_{p}" in data},
@@ -312,6 +312,8 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
         arrays = {f"frames_{p}": f for p, f in layout.frames.items()}
         arrays.update({f"range_{p}": np.asarray(r) for p, r in layout.ranges.items()})
         partial = store.with_name(store.stem + ".partial.npz")
+        if fingerprint:
+            arrays["fingerprint"] = np.array(fingerprint)
         np.savez(partial, presets=np.array(sorted(layout.frames)), seconds=layout.seconds, breaks=layout.breaks,
                  **arrays)
         os.replace(partial, store)  # complete files only
@@ -372,14 +374,15 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             step = float(step_s) if interval <= 1.01 * float(step_s) else interval
             info["step"] = step
             key = _cache_key(path, options, step, clock=layout.seconds is not None) if cache_dir is not None else None
-            cached = _load_cache(cache_dir, key) if key else None
+            fingerprint = recording_fingerprint(path) if key and path.is_file() else None
+            cached = _load_cache(cache_dir, key, fingerprint) if key else None
             if cached is not None:
                 stage("Using the frame statistics saved by an earlier run")
                 times, mean, spread, counts, first_frame = cached
             else:
                 stage(f"Reading {frames.size:,} frames")
                 times, mean, spread, counts, first_frame = _accumulate(
-                    im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key)
+                    im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key, fingerprint)
             if abort():
                 raise JobCancelled("Cancelled")
             stage("Checking the temperature calibration")
@@ -404,7 +407,7 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
                 pass
 
 
-def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_dir, key):
+def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_dir, key, fingerprint=None):
     """Per-bin statistics of ``frames`` (recording seconds ``frame_times``, ascending) in ``region``."""
     x0, y0, x1, y1 = region
     h, w = y1 - y0, x1 - x0
@@ -480,12 +483,17 @@ def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_di
     if cache_dir is not None:
         mean.flush()
         spread.flush()
-        np.savez(Path(cache_dir) / f"{key}_meta.npz", times=times, counts=counts, first_frame=first_frame,
-                 complete=True)
+        meta = Path(cache_dir) / f"{key}_meta.npz"
+        partial = meta.with_name(meta.stem + ".partial.npz")
+        extra = {"fingerprint": np.array(fingerprint)} if fingerprint else {}
+        np.savez(partial, times=times, counts=counts, first_frame=first_frame, complete=True, **extra)
+        os.replace(partial, meta)  # a run stopped while writing leaves no metadata, so no cache
     return times, mean, spread, counts, first_frame
 
 
-def _load_cache(cache_dir: Path, key: str):
+def _load_cache(cache_dir: Path, key: str, fingerprint: str | None = None):
+    """The saved statistics, or None when there are none, they are unreadable, or they were taken from a
+    recording whose content differs (same name, size and time, another file: caches from 0.7.5 on)."""
     meta = cache_dir / f"{key}_meta.npz"
     if not meta.exists():
         return None
@@ -493,10 +501,12 @@ def _load_cache(cache_dir: Path, key: str):
         with np.load(meta) as data:
             if not bool(data["complete"]):
                 return None
+            if fingerprint and "fingerprint" in data.files and str(data["fingerprint"]) != fingerprint:
+                return None
             times, counts, first_frame = data["times"], data["counts"], data["first_frame"]
         mean = np.load(cache_dir / f"{key}_mean.npy", mmap_mode="r")
         spread = np.load(cache_dir / f"{key}_spread.npy", mmap_mode="r")
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
         return None
     if mean.shape[0] != times.size or spread.shape != mean.shape:
         return None
@@ -883,14 +893,15 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
         if math.isfinite(refined):
             lag_bins, shared = refined_bins, refined
     x0, y0 = samples.origin
+    names = [ch.name for ch in channels]
     for c, (ch, match) in enumerate(zip(channels, matches)):
         if abort is not None and abort():
             raise JobCancelled("Cancelled")
-        if too_few[c] and _fixed_pixel(options.pixels, ch.name, ch.index) is None:
+        if too_few[c] and _fixed_pixel(options.pixels, ch.name, ch.index, names) is None:
             continue
         rmap = _r_map(samples, lag_bins, grid_bins, ch.values, ch.locate_usable, min_samples=min_samples[c])
         match.r_map = rmap
-        fixed_pixel = _fixed_pixel(options.pixels, ch.name, ch.index)
+        fixed_pixel = _fixed_pixel(options.pixels, ch.name, ch.index, names)
         if fixed_pixel is not None:
             row, col = fixed_pixel
             match.pixel, match.fixed = (int(row), int(col)), True
@@ -1001,9 +1012,16 @@ def _refine_lag(samples: Samples, b: int, lag_bins: int, lags_all: np.ndarray, w
     return int(local[best]), float(score[best])
 
 
-def _fixed_pixel(pixels: Mapping[str, tuple[int, int]], name: str, index: int):
+def _fixed_pixel(pixels: Mapping[str, tuple[int, int]], name: str, index: int, names: Sequence[str] = ()):
+    """The pixel given for a channel: by its exact name, then its number, then a prefix that names it alone
+    ("T1" must not also fix "T10")."""
     for key, value in pixels.items():
-        if key == name or key == str(index + 1) or name.casefold().startswith(str(key).casefold()):
+        if key == name or key == str(index + 1):
+            return value
+    for key, value in pixels.items():
+        folded = str(key).casefold()
+        if name.casefold().startswith(folded) and [n.casefold().startswith(folded) for n in names or (name,)].count(
+                True) == 1:
             return value
     return None
 
@@ -1191,8 +1209,10 @@ def fit_eps(calibration: Calibration, params: MeasurementParameters, counts: np.
         good = np.isfinite(sq)
         total += np.where(good, sq, 0.0).sum(axis=1)
         valid += good.sum(axis=1)
+    # a candidate is compared over every second the best-covered ones explain: one that leaves seconds without a
+    # temperature (below what its reflected part alone gives) must not win on the rest
     with np.errstate(invalid="ignore", divide="ignore"):
-        rmse = np.where(valid > 0, np.sqrt(total / np.maximum(valid, 1)), math.inf)
+        rmse = np.where((valid > 0) & (valid == valid.max()), np.sqrt(total / np.maximum(valid, 1)), math.inf)
     k = int(np.argmin(rmse))
     eps = float(grid[k])
     k1, k2 = coefficients(calibration, params.with_(emissivity=eps))
@@ -1367,6 +1387,13 @@ def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
     def pair(value):
         return numbers(value, 2) if value is not None else None
 
+    def window(value):  # an open end is saved as null (JSON has no infinity): "50-" is (50, inf)
+        if value is None:
+            return None
+        if len(value) != 2:
+            raise ValueError(f"expected 2 numbers, got {len(value)}")
+        return (-math.inf if value[0] is None else float(value[0]), math.inf if value[1] is None else float(value[1]))
+
     if not isinstance(data, Mapping):
         raise TypeError("options are not a mapping")
     known = {f.name for f in fields(MatchOptions)}
@@ -1374,10 +1401,11 @@ def options_from_dict(data: Mapping[str, Any]) -> MatchOptions:
     if values.get("roi") is not None:
         values["roi"] = numbers(values["roi"], 4, int)
     values["channels"] = tuple(str(name) for name in values.get("channels") or ())
-    values["valid"] = {str(name): tuple(pair(w) for w in windows) for name, windows in (values.get("valid") or {}).items()}
+    values["valid"] = {str(name): tuple(window(w) for w in windows)
+                       for name, windows in (values.get("valid") or {}).items()}
     values["pixels"] = {str(name): numbers(pixel, 2, int) for name, pixel in (values.get("pixels") or {}).items()}
-    for key in ("scope", "lag_range"):
-        values[key] = pair(values.get(key))
+    values["scope"] = window(values.get("scope"))
+    values["lag_range"] = pair(values.get("lag_range"))
     return MatchOptions(**values)
 
 
@@ -1549,7 +1577,13 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
                 warnings.append(f"The given time match ({lag_now:.0f} s) is {_span(gap)} from where the camera and "
                                 f"logger clocks put logger time 0 ({at}); check it.")
         elif search is not options:
-            if abs(gap) >= float(options.clock_window_s) - 2 * step:
+            if not any(m.found for m in location.channels):
+                # no fallback to the whole recording: on a cell-by-cell fire the TC shapes fit at many offsets
+                warnings.append(f"No TC was found within {float(options.clock_window_s):.0f} s of where the camera "
+                                f"and logger clocks put logger time 0 ({at}). If a clock may be wrong, run again "
+                                "with \"Anywhere in the recording\", or give the frame of logger time 0 (e.g. from "
+                                "a sync event).")
+            elif abs(gap) >= float(options.clock_window_s) - 2 * step:
                 warnings.append(f"The best time match ({lag_now:.0f} s) lies at the edge of the window around "
                                 f"the clocks' {at}: a clock may be off by more than "
                                 f"{float(options.clock_window_s):.0f} s, or the TC curves cannot fix the time. "
@@ -1636,6 +1670,7 @@ def _options_dict(options: MatchOptions) -> dict:
 
 def summary_text(result: MatchResult) -> str:
     """Plain-language summary for the engineers."""
+    step = result.step  # events count time bins; durations are reported in seconds
     window = result.options.get("clock_window_s")
     how = (" (given)" if result.lag_fixed
            else f" (searched within {window:.0f} s of the clocks)" if result.near_clocks and window is not None
@@ -1674,14 +1709,14 @@ def summary_text(result: MatchResult) -> str:
             lo, med, hi = e.pixel_eps
             bound = " (at the limit of 1)" if f.at_bound else ""
             tag = "" if e.used else (" [not physical, not used]" if not e.physical else " [not used]")
-            head = (f"  Event {e.start_s:.0f}-{e.end_s:.0f} s{tag} ({e.samples} s, "
+            head = (f"  Event {e.start_s:.0f}-{e.end_s:.0f} s{tag} ({e.samples * step:g} s, "
                     f"TC {e.tc_min_c:.0f}-{e.tc_max_c:.0f} °C): ")
             if f.n == 0 or not math.isfinite(f.eps):
                 lines.append(head + "no fit: no emissivity from 0 to 1 explains the IR in these seconds")
                 continue
             lines.append(head + f"emissivity {f.eps:.2f}{bound}, RMSE {f.rmse_k:.0f} K"
                          + (f"; {e.pixel_n} nearby pixels give {lo:.2f}-{hi:.2f}" if math.isfinite(lo) else "")
-                         + (f"; {e.excluded_bound} s left out (no emissivity explains the IR)"
+                         + (f"; {e.excluded_bound * step:g} s left out (no emissivity explains the IR)"
                             if e.excluded_bound else ""))
     lines.append("")
     used = [e for ch in result.channels for e in ch.events if e.used]
@@ -1700,7 +1735,8 @@ def summary_text(result: MatchResult) -> str:
             lines.append(f"The TCs agree: emissivity {result.common_eps:.2f} (the median of their values).")
         if result.pooled is not None:
             p = result.pooled
-            text = f"All usable events fitted together: emissivity {p.eps:.2f}, RMSE {p.rmse_k:.0f} K over {p.n} s."
+            text = (f"All usable events fitted together: emissivity {p.eps:.2f}, RMSE {p.rmse_k:.0f} K over "
+                    f"{p.n * step:g} s.")
             if result.common_eps is not None and abs(p.eps - result.common_eps) > result.options.get(
                     "consistent_eps", 0.05):
                 text += (f" This is off the median ({result.common_eps:.2f}) because some events disagree; "
@@ -1942,6 +1978,7 @@ class RunOutput:
     files: dict[str, Path] = field(default_factory=dict)  # "summary", "json", "rois", "figure", "workbook"
     parameters: dict | None = None  # the SDK object parameters used instead of the recording's own
     tc_file: Path | None = None  # the logger file read
+    parameters_known: bool = True  # False: a fit saved before 0.7.1, which did not record its parameters
 
 
 @dataclass
@@ -1959,6 +1996,7 @@ class SavedRun:
     run_info: bool = True  # False: written before 0.7.1, without the TC file's path, hash and the parameters
     tc_sha256: str | None = None  # the logger file's content when fitted (None: not recorded)
     tc_candidates: tuple[Path, ...] = ()  # where else a moved logger file with that content may be
+    files: tuple[str, ...] | None = None  # the files the run wrote ("figure", ...); None: not recorded (before 0.7.5)
 
 
 def _source_parts(source: str) -> tuple[str, str | None]:
@@ -2024,6 +2062,9 @@ def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None 
         recording_size = run.get("recording_size")
         fingerprint = run.get("recording_fingerprint")
         tc_sha256 = run.get("tc_sha256")
+        written = run.get("files")
+        if not (written is None or (isinstance(written, list) and all(isinstance(k, str) for k in written))):
+            raise TypeError("its list of files is not valid")
         if not (tc_path is None or isinstance(tc_path, str)) or not (sheet_saved is None or isinstance(sheet_saved, str)) \
                 or not (time_column is None or isinstance(time_column, (int, str))) \
                 or not (parameters is None or isinstance(parameters, dict)) \
@@ -2057,7 +2098,8 @@ def saved_run(folder: str | Path, recording: str | Path, num_frames: int | None 
         candidates = ()
     return SavedRun(result=result, folder=folder, tc_file=tc_file, tc_name=Path(tc_path or name).name,
                     sheet=sheet or None, time_column=time_column, parameters=parameters, options=options,
-                    run_info=bool(run), tc_sha256=tc_sha256, tc_candidates=candidates)
+                    run_info=bool(run), tc_sha256=tc_sha256, tc_candidates=candidates,
+                    files=tuple(written) if written is not None else None)
 
 
 def _locate_tc_file(saved: SavedRun) -> Path:
@@ -2092,8 +2134,11 @@ def load_saved_run(saved: SavedRun) -> RunOutput:
         raise ValueError(f"{tc_file.name} has no column {', '.join(missing)} any more")
     names = {"json": "result.json", "summary": "summary.txt", "rois": f"{saved.result.recording}.rois.json",
              "figure": "overview.png"}
-    files = {key: saved.folder / name for key, name in names.items() if (saved.folder / name).is_file()}
-    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters, tc_file=tc_file)
+    # only the files this run wrote: an earlier run's figure stays behind when a rerun draws none
+    files = {key: saved.folder / name for key, name in names.items() if (saved.folder / name).is_file()
+             and (saved.files is None or key in saved.files)}
+    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters, tc_file=tc_file,
+                     parameters_known=saved.run_info)
 
 
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
@@ -2179,7 +2224,7 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                         "time_column": time_column if isinstance(time_column, (int, str)) else None,
                         "parameters": dict(parameters) if parameters is not None else None,
                         "tc_sha256": tc_sha256,
-                        "recording_size": size, "recording_fingerprint": fingerprint}
+                        "recording_size": size, "recording_fingerprint": fingerprint, "files": sorted(files)}
             staged["json"].write_text(json.dumps({**result.to_dict(), "run": run_info}, indent=1), encoding="utf-8")
             staged["summary"].write_text(summary_text(result), encoding="utf-8")
             width, height = samples.size
@@ -2190,9 +2235,13 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                 grid, _channels = prepare_channels(table, options, samples.step)
                 save_figure(staged["figure"], result, location, series, samples, grid)
             if "workbook" in staged:
+                # the workbook converts with the parameters the fit used, a reflected temperature given for the
+                # fit included (the CLI's --reflected)
+                used = (sdk_values(samples.params.with_(reflected_k=result.reflected_c + KELVIN))
+                        if options.reflected_c is not None else parameters)
                 write_workbook(staged["workbook"], recording, result, table, abort=abort,
                                handles={Path(recording).resolve(): im} if im is not None else None,
-                               parameters=parameters)
+                               parameters=used)
                 say(f"Workbook: {files['workbook']}")
             job.commit()
         output.files.update(files)

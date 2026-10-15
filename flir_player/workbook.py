@@ -61,6 +61,7 @@ MATCH_CANDIDATES = 41  # rows of the candidate table (step 0.002 still spans 0.9
 OWN_GRID = tuple(round(0.05 + 0.01 * k, 2) for k in range(96))  # each TC's own value: best of 0.05 … 1.00
 PROBE = 0.001  # the error just inside a limit tells whether the best match lies beyond it
 CHART_ROWS = 21  # rows the Match chart covers below the pairs table
+CHART_SERIES = 255  # Excel's limit of series in one chart
 NOTE_LOW = "The best value is the lowest emissivity allowed; the best match may lie below it."
 NOTE_HIGH = "The best value is the highest emissivity allowed; the best match may lie above it."
 # what the zones read at the best value, from the signs of the ROIs' mean IR − TC there (with a hot surrounding
@@ -1005,10 +1006,11 @@ class _Writer:
                     continue
                 c_cell = _cell("Counts", data_r, layout.count_cols[layout.main])
                 u_cell = xl_rowcol_to_cell(r, cols["use"])
+                s_cell = _cell("Data", data_r, layout.status_col)  # a clipped pixel biases the mean count
                 write(r, cols["fit"],
                                  f"=IF(AND({u_cell}=1,ISNUMBER({xl_rowcol_to_cell(r, cols['tc'])}),ISNUMBER({c_cell}),"
-                                 f"{c_cell}>={src}_CNTLO,{c_cell}<={src}_CNTHI,{t_cell}>=MATCH_FROM,"
-                                 f"{t_cell}<=MATCH_TO),1,0)", self.f_int, int(inputs["fit"][i]))
+                                 f"{c_cell}>={src}_CNTLO,{c_cell}<={src}_CNTHI,{s_cell}<>\"Saturated\","
+                                 f"{t_cell}>=MATCH_FROM,{t_cell}<=MATCH_TO),1,0)", self.f_int, int(inputs["fit"][i]))
                 data_col = layout.data_cols[layout.main]
                 ir = xl_rowcol_to_cell(r, cols["ir"])
                 tc = xl_rowcol_to_cell(r, cols["tc"])
@@ -1099,8 +1101,9 @@ class _Writer:
             tc = self._tc_at(layout)
             cnt = np.asarray(layout.roi.counts[layout.main], dtype=np.float64)
             low, high = self._count_range(layout.source)
+            saturated = np.asarray(layout.roi.status) == 3  # as the Data sheet's Status column says
             with np.errstate(invalid="ignore"):
-                fit = ((use == 1) & np.isfinite(tc) & np.isfinite(cnt) & (cnt >= low) & (cnt <= high)
+                fit = ((use == 1) & np.isfinite(tc) & np.isfinite(cnt) & (cnt >= low) & (cnt <= high) & ~saturated
                        & (self.times >= window[0]) & (self.times <= window[1]))
             if not layout.source.report.verified:
                 fit[:] = False
@@ -1362,6 +1365,10 @@ class _Writer:
         shown = [(k, layout) for k, layout in enumerate(layouts) if self._roi_tc.get(layout.roi.shape.name)]
         if not shown:  # TCs are picked later in Excel: every ROI's series (empty until then)
             shown = list(enumerate(layouts))
+        if len(shown) > CHART_SERIES - 1:  # with "All TCs", at most 255 series in a chart
+            shown = shown[:CHART_SERIES - 1]
+            chart.set_title({"name": f"Error against emissivity (first {CHART_SERIES - 1} ROIs)",
+                             "name_font": {"size": 12}})
         for j, (k, layout) in enumerate(shown):
             color = SERIES[j % len(SERIES)]
             chart.add_series({"name": [M, c0 - 1, cc + 2 + k], "categories": x,
@@ -1626,14 +1633,18 @@ class _Writer:
             ws.insert_chart(3 + (position // 2) * 22, (position % 2) * 15, chart)
             position += 1
 
-        overview = new_chart("All ROIs" + (" (darkest = first ROI)" if many else ""))
-        for k, layout in enumerate(verified):
-            col = layout.data_cols[layout.main]
-            color = overview_colors[k] if overview_colors else palette[k % len(palette)]
-            overview.add_series({"name": layout.title, "categories": x,
-                                 "values": ["Data", first, col, last, col],
-                                 "line": {"width": 1.25, "color": color}})
-        if verified:
+        # a chart holds at most 255 series (Excel): more ROIs take more overview charts, each saying which
+        for c0 in range(0, len(verified), CHART_SERIES):
+            part = verified[c0:c0 + CHART_SERIES]
+            title = ("All ROIs" if len(verified) <= CHART_SERIES
+                     else f"ROIs {c0 + 1}-{c0 + len(part)} of {len(verified)}")
+            overview = new_chart(title + (" (darkest = first ROI)" if many else ""))
+            for k, layout in enumerate(part, start=c0):
+                col = layout.data_cols[layout.main]
+                color = overview_colors[k] if overview_colors else palette[k % len(palette)]
+                overview.add_series({"name": layout.title, "categories": x,
+                                     "values": ["Data", first, col, last, col],
+                                     "line": {"width": 1.25, "color": color}})
             if many:
                 overview.set_size({"width": 1820, "height": 420})
             place(overview)
@@ -1667,7 +1678,12 @@ class _Writer:
             chart.set_y_axis({"name": "Emissivity", "min": 0, "max": 1.5, "num_format": "0.0"})
             chart.set_legend({"position": "bottom"})
             chart.set_size({"width": 900, "height": 420})
-            for j, layout in enumerate(l for m in groups.values() for l in m if self._has_tc(l)):
+            with_tc = [l for m in groups.values() for l in m if self._has_tc(l)]
+            if len(with_tc) > CHART_SERIES:
+                with_tc = with_tc[:CHART_SERIES]
+                chart.set_title({"name": f"Matching emissivity (from TC Compare; first {CHART_SERIES} ROIs)",
+                                 "name_font": {"size": 12}})
+            for j, layout in enumerate(with_tc):
                 cols = self.tc_cols[layout.number]
                 chart.add_series({"name": layout.title,
                                   "categories": ["TC Compare", TC_FIRST + 1, TC_COLUMNS + 2,
