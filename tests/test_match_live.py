@@ -198,10 +198,14 @@ def test_excel_leaves_out_the_rows_where_a_zone_clips(excel, tmp_path) -> None:
     cell3 = next(r for r in source.rois if r.shape.name == "Cell 3")
     cell3.status = cell3.status.copy()
     cell3.status[30:41] = 3  # Saturated, while the mean count stays in range
+    clean = _write(tmp_path, _zone_source()[0], _prefill(temps), name="clean.xlsx")
     path = _write(tmp_path, source, _prefill(temps))
-    book = _open(excel, path)
+    book, plain = _open(excel, path), _open(excel, clean)
     try:
         _compare_sheet(book, path, range(6, 9), (7,))
-        _compare_sheet(book, path, range(13, 15), range(2, 11))  # the rows of Cell 3 lose the 11 clipped ones
+        _compare_sheet(book, path, range(13, 15), range(2, 11))
+        rows = [b.Worksheets("Emissivity Match").Range("E13").Value for b in (plain, book)]  # Cell 3's rows
+        assert rows[1] == rows[0] - 11  # the 11 clipped rows, left out by Excel itself
     finally:
         book.Close(False)
+        plain.Close(False)

@@ -38,9 +38,9 @@ _SHEET_HINT = re.compile(r"(?<![a-z])(tcs?|thermo\w*|temp|temps|temperatures?)(?
 WORKBOOK_SUFFIXES = (".xlsx", ".xlsm")
 TEXT_SUFFIXES = (".csv", ".txt", ".tsv", ".dat")
 _TEMPERATURE_UNIT = re.compile(r"°\s*[CFK]\b|\bdeg\.?\s*[CFK]\b|^[\[\(]\s*[CFK]\s*[\]\)]$|^[CFK]$", re.IGNORECASE)
-# Fahrenheit said outright: refused, since readings are taken as °C ("K" is left alone: it usually names a type-K TC;
-# a bare "(F)" may name a position, like "(S)" for south)
-_FAHRENHEIT = re.compile(r"°\s*F\b|\bdeg\.?\s*F\b|\bfahrenheit\b", re.IGNORECASE)
+# Fahrenheit or kelvin said outright: refused, since readings are taken as °C (a bare "K" is left alone: it usually
+# names a type-K TC; a bare "(F)" may name a position, like "(S)" for south)
+_NOT_CELSIUS = re.compile(r"°\s*[FK]\b|\bdeg\.?\s*[FK]\b|\bfahrenheit\b|\bkelvins?\b", re.IGNORECASE)
 
 
 def _unit_patterns(words: str, spelled: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
@@ -441,11 +441,11 @@ def parse_rows(rows: Sequence[Sequence[Any]], *, time_column: int | str | None =
     channels = [c for c in channels if c not in counters and c not in copies]
     if not channels:
         raise ValueError("no numeric TC columns next to the time column")
-    fahrenheit = [c for c in channels if any(isinstance(row[c], str) and _FAHRENHEIT.search(row[c]) for row in headers)]
-    if fahrenheit:
+    other = [c for c in channels if any(isinstance(row[c], str) and _NOT_CELSIUS.search(row[c]) for row in headers)]
+    if other:
         raise ValueError("TC readings must be in °C, but " + ", ".join(
-            repr(name) for name in _names(headers, fahrenheit)) + " " + ("is" if len(fahrenheit) == 1 else "are")
-            + " headed as °F")
+            repr(name) for name in _names(headers, other)) + " " + ("is" if len(other) == 1 else "are")
+            + " headed in °F or kelvin")
     # rows without any reading at the edges of the block are not data (e.g. a lone number above it)
     filled = [any(_number(row[c]) is not None for c in channels) for row in block]
     lead = filled.index(True)
@@ -621,9 +621,9 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
         # (a summary row such as "Max" under the data)
         values = [row[c] for row in block]
         ok = [_time_like(v) for v in values]
+        headed = headed or (any(ok) and _time_evidence(headers, c))  # even with too few times to be read
         if sum(ok) < 3:
             continue
-        headed = headed or _time_evidence(headers, c)
         a, z = ok.index(True), len(ok) - 1 - ok[::-1].index(True)
         cells = [v for v, good in zip(values[a:z + 1], ok[a:z + 1]) if good]
         if len(cells) < 0.9 * (z - a + 1):

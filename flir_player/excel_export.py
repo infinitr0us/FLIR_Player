@@ -158,10 +158,11 @@ def load_roi_set(path: str | Path) -> RoiSet:
         groups.append(ZoneGroup(rois=members, spec=spec, name=label))
     try:
         ignition = payload.get("ignition_frame")
-        size = payload.get("size")
+        size = tuple(int(v) for v in payload.get("size") or ()) or None
+        if size is not None and (len(size) != 2 or min(size) < 1):
+            raise ValueError("not a width and a height")
         return RoiSet(rois=tuple(rois), ignition_frame=None if ignition is None else int(ignition),
-                      recording=str(payload.get("recording", "")),
-                      size=tuple(int(v) for v in size) if size else None, zone_groups=tuple(groups))
+                      recording=str(payload.get("recording", "")), size=size, zone_groups=tuple(groups))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name}: the ignition frame or image size is not valid") from exc
 

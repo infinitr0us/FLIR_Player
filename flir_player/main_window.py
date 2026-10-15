@@ -1401,19 +1401,27 @@ class MainWindow(QMainWindow):
         even to say a file is not there); no folder or another recording's fit is silent.
         """
         key = str(metadata.path)
+        identity = _file_identity(metadata.path)
         run = self._tc_runs.get(key, {})
         if "output" in run:
-            if run.get("identity") == _file_identity(metadata.path):
+            if identity is not None and run.get("identity") == identity:
                 return
-            # another recording now sits at this path: its fit (if any) is read from its folder, checked
+            # another recording now sits at this path (or it cannot be checked): drop what the old one's fit gave,
+            # its time zero included; its own fit (if any) is read from its folder, checked
             self._tc_runs.pop(key, None)
+            self._ignition_frames.pop(key, None)
+        generation = self._open_request_id
         reader = SavedFitReader(key, results_folder(metadata.path), metadata.path, metadata.num_frames)
-        reader.done.connect(self._on_saved_tc_fit)
+        reader.done.connect(lambda path, saved, output, error, opened=generation, seen=identity:
+                            self._on_saved_tc_fit(path, saved, output, error, opened, seen))
         reader.start_kept()
 
-    def _on_saved_tc_fit(self, key: str, saved, output, error: str) -> None:
+    def _on_saved_tc_fit(self, key: str, saved, output, error: str, opened: int | None = None,
+                         identity: tuple[int, int] | None = None) -> None:
         if self.metadata is None or str(self.metadata.path) != key:
             return  # another recording is open now; the fit stays in its folder
+        if opened is not None and opened != self._open_request_id:
+            return  # read for an earlier open of this path (the file may have been replaced since)
         if saved is None:  # the folder's fit is another recording's, or the result could not be read
             if error:
                 self._notify(f"The last TC fit was not reopened: {error}")
@@ -1434,7 +1442,7 @@ class MainWindow(QMainWindow):
             return
         run["output"] = output
         run["out_dir"] = str(saved.folder)
-        run["identity"] = _file_identity(Path(key))
+        run["identity"] = identity if opened is not None else _file_identity(Path(key))  # the file the reader checked
         self._notify(f"Reopened the last TC fit ({saved.folder.name}): logger time 0 = frame "
                      f"{output.result.ignition_frame + 1:,}")
 

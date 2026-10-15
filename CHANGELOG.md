@@ -13,9 +13,11 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 - A TC sheet whose time column stops rising is no longer read with another
   rising column (a TC heating steadily, a scan number) as its time: a column
   headed as time is read over the stretch where it rises, and a column with a
-  temperature unit is never the time. TC columns headed in °F are refused.
-- A pixel given for T1 no longer also fixes T10: a name matches exactly first,
-  then a channel number, then a start that names one channel only.
+  temperature unit is never the time. TC columns headed in °F or kelvin are
+  refused.
+- A pixel given for T1 no longer also fixes T10: a given pixel names a TC by
+  its name (any case), its number, or a start only its name has, against the
+  whole TC table, whichever TCs are chosen.
 - A fit with an open-ended validity window ("50-") reopens; the dialog shows
   the open end empty again.
 - When no TC is found within 2 minutes of the clocks, the results say so and
@@ -24,14 +26,16 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 - Saved frame statistics remember the recording's content and are not reused
   for another file of the same name, size and time; a statistics file cut off
   while it was written counts as no cache instead of stopping the fit.
-- The summary gives event durations in seconds when a time bin is longer than
-  a second.
+- The summary and the warnings give durations in seconds when a time bin is
+  longer than a second.
 - A reflected temperature given for the fit on the command line also goes into
-  its workbook.
+  its workbook and is saved with the fit, so a workbook from the reopened fit
+  converts the same way.
 - The search region of a box is the pixels the box measures (its corners
   rounded as everywhere else), not the pixels it touches.
-- A fit kept in the player for a recording is dropped when another file is put
-  at the same path; a rerun that draws no figure no longer reopens the previous
+- A fit kept in the player for a recording is dropped, with the time zero it
+  gave, when another file is put at the same path, and a fit read for an
+  earlier opening of the path is not used; a rerun that draws no figure no longer reopens the previous
   run's figure; a workbook from a fit saved before 0.7.1 (which did not record
   its object parameters) asks first.
 
@@ -42,8 +46,8 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 - The Emissivity Match leaves out the rows where a zone has clipped pixels
   (Status *Saturated*), in Excel and in the values written with the workbook.
 - More than 255 ROIs take more overview charts (an Excel chart holds 255
-  series); the Match and matching-emissivity charts say when they show only
-  the first ones.
+  series); the Match, matching-emissivity and per-name charts say when they
+  show only the first ones.
 
 ### Cell zones and ROI sets
 

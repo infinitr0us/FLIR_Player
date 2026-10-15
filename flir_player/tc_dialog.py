@@ -160,9 +160,7 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
     rows = []
     for name in names:
         checked = name in chosen if chosen is not None else not _AIR_HINT.search(name)
-        windows = ", ".join(f"{a:g}-{b:g}".replace("-inf-", "-").replace("inf", "")  # open ends stay empty
-                            for a, b in options.valid.get(name, ()))
-        rows.append((name, checked, windows))
+        rows.append((name, checked, windows_text(options.valid.get(name, ()))))
     return {
         "kind": "tc",
         "tc_file": str(tc_file or saved.tc_file or ""),
@@ -174,6 +172,11 @@ def saved_request(saved: SavedRun, table: TcTable | None, tc_file: Path | None =
         "parameters_from": "file" if saved.run_info and saved.parameters is None else "player",
         "channel_rows": rows,
     }
+
+
+def windows_text(windows) -> str:
+    """Validity windows as typed in the dialog ("0-1150, 1300-"), open ends left empty: ``parse_windows`` back."""
+    return ", ".join(f"{a:g}-{b:g}".replace("-inf-", "-").replace("inf", "") for a, b in windows)
 
 
 def _box_region(shape: RoiShape, width: int, height: int) -> tuple[int, int, int, int]:

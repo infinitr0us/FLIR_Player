@@ -133,24 +133,34 @@ def test_w4_a_reflected_temperature_given_for_the_fit_goes_into_its_workbook(tmp
     recording = tmp_path / "synthetic.seq"
     recording.write_bytes(bytes(1000))
     tc = _write_csv(tmp_path / "tc.csv", ["A"], [[0, 20.0]])
-    tcmatch.run_analysis(recording, tc, MatchOptions(spot=1, reflected_c=300.0), out_dir=tmp_path / "out",
-                         workbook=True, figure=False)
+    output = tcmatch.run_analysis(recording, tc, MatchOptions(spot=1, reflected_c=300.0), out_dir=tmp_path / "out",
+                                  workbook=True, figure=False)
     assert seen["p"]["reflected_temp"] == pytest.approx(573.15)
+    # kept with the run, so a workbook from the reopened fit converts the same way
+    assert output.parameters["reflected_temp"] == pytest.approx(573.15)
+    again = tcmatch.load_saved_run(tcmatch.saved_run(tmp_path / "out", recording))
+    assert again.parameters["reflected_temp"] == pytest.approx(573.15) and again.parameters_known
 
 
 def test_w5_a_pixel_given_for_t1_does_not_fix_t10() -> None:
     from flir_player import tcmatch
     from flir_player.tcdata import TcTable
-    from flir_player.tcmatch import MatchOptions, _fixed_pixel
+    from flir_player.tcmatch import MatchOptions, resolve_pixels
     from test_tcmatch import make_scene
 
     samples, table = make_scene()
     both = TcTable(table.times, np.column_stack([table.values[:, 0]] * 2), ("T1", "T10"))
     result, _location, _series = tcmatch.analyse(samples, both, MatchOptions(spot=1, pixels={"T1": (9, 12)}))
     assert {ch.name: ch.match.fixed for ch in result.channels} == {"T1": True, "T10": False}
-    assert _fixed_pixel({"T": (1, 2)}, "T1", 0, ["T1", "A"]) == (1, 2)  # a prefix naming one channel still works
-    assert _fixed_pixel({"T": (1, 2)}, "T1", 0, ["T1", "T2"]) is None
-    assert _fixed_pixel({"2": (1, 2)}, "T2", 1, ["T1", "T2"]) == (1, 2)  # by number
+    # with only T10 chosen, the pixel given for T1 still means T1
+    result, _location, _series = tcmatch.analyse(samples, both, MatchOptions(spot=1, channels=("T10",),
+                                                                              pixels={"T1": (9, 12)}))
+    assert [(ch.name, ch.match.fixed) for ch in result.channels] == [("T10", False)]
+    assert resolve_pixels({"t1": (1, 2)}, ["T1", "T10"]) == {"T1": (1, 2)}  # any case
+    assert resolve_pixels({"T": (1, 2)}, ["T1", "A"]) == {"T1": (1, 2)}  # a start only one name has
+    assert resolve_pixels({"T": (1, 2)}, ["T1", "T2"]) == {}
+    assert resolve_pixels({"2": (1, 2)}, ["T1", "T2"]) == {"T2": (1, 2)}  # by number
+    assert resolve_pixels({"2": (5, 5), "t2": (1, 2)}, ["T1", "T2"]) == {"T2": (1, 2)}  # the name before a number
 
 
 def _cache_files(folder: Path, key: str, **meta) -> None:
@@ -170,13 +180,23 @@ def test_w6_statistics_of_another_recording_with_the_same_name_size_and_time_are
     assert _load_cache(tmp_path, "old", "bbb") is not None
 
 
-def test_w8_tc_readings_headed_as_fahrenheit_are_refused() -> None:
+def test_w8_tc_readings_headed_in_fahrenheit_or_kelvin_are_refused() -> None:
     from flir_player.tcdata import parse_rows
 
     body = [(float(i), 212.0 + i) for i in range(10)]
-    with pytest.raises(ValueError, match="°F"):
-        parse_rows([("Time [s]", "T1 (°F)")] + body)
-    assert parse_rows([("Time [s]", "TC (F)")] + body).values[0, 0] == 212.0  # (F) may be a position
+    for header in ("T1 (°F)", "T1 deg F", "T1 (kelvin)", "T1 [°K]", "T1 deg K"):
+        with pytest.raises(ValueError, match="°F or kelvin"):
+            parse_rows([("Time [s]", header)] + body)
+    for header in ("TC (F)", "TC K", "Type K TC"):  # a position, a type-K thermocouple
+        assert parse_rows([("Time [s]", header)] + body).values[0, 0] == 212.0
+
+
+def test_w2_a_mostly_blank_time_column_is_not_replaced_by_a_heating_tc() -> None:
+    from flir_player.tcdata import parse_rows
+
+    rows = [("Time [s]", "T1", "T2")] + [(0.0 if i == 0 else None, 100.1 + i, 20.0 + (i % 3)) for i in range(10)]
+    with pytest.raises(ValueError, match="time"):
+        parse_rows(rows)  # T1 rises, but the header says column 1 is the time
 
 
 def test_w9_a_fit_with_open_ended_windows_reopens() -> None:
@@ -196,12 +216,13 @@ def test_w9_a_fit_with_open_ended_windows_reopens() -> None:
 
 
 def test_w9_the_dialog_shows_open_window_ends_empty() -> None:
+    from flir_player.tc_dialog import windows_text
     from flir_player.tcdata import parse_windows
 
-    for text in ("50-", "-1150", "0-1150", "-20-30", "-"):
-        (a, b), = parse_windows(text)
-        shown = f"{a:g}-{b:g}".replace("-inf-", "-").replace("inf", "")  # as tc_dialog.saved_request writes it
-        assert parse_windows(shown) == ((a, b),)
+    for text in ("50-", "-1150", "0-1150", "-20-30", "-", "0-1150, 1300-"):
+        windows = parse_windows(text)
+        assert parse_windows(windows_text(windows)) == windows
+    assert windows_text(parse_windows("50-")) == "50-"
 
 
 def test_w10_no_tc_near_the_clocks_says_what_to_do() -> None:
@@ -221,6 +242,20 @@ def test_w10_no_tc_near_the_clocks_says_what_to_do() -> None:
                                                                                jump_hold_s=0))
     assert result.near_clocks and not result.channels[0].match.found
     assert any("No TC was found within 120 s" in w and "Anywhere in the recording" in w for w in result.warnings)
+
+
+def test_w6_new_statistics_record_the_recording_fingerprint(tmp_path) -> None:
+    from flir_player import tcmatch
+    from test_tcmatch import _FakeImager
+
+    frames = np.ones((20, 3, 4), np.float32)
+    t = np.arange(20) / 10.0
+    tcmatch._accumulate(_FakeImager(frames), np.arange(20), t, 1.0, (0, 0, 4, 3), None, lambda: False, tmp_path, "k",
+                        "fff")
+    with np.load(tmp_path / "k_meta.npz") as data:
+        assert str(data["fingerprint"]) == "fff"
+    assert tcmatch._load_cache(tmp_path, "k", "fff") is not None and tcmatch._load_cache(tmp_path, "k", "g") is None
+    assert not list(tmp_path.glob("*.partial.npz"))
 
 
 def test_w11_a_cut_off_cache_file_means_no_cache(tmp_path) -> None:
@@ -250,6 +285,7 @@ def test_w13_the_summary_gives_seconds_when_a_bin_is_longer_than_a_second() -> N
     assert events
     shown = [float(v) for v in re.findall(r"Event \d+-\d+ s[^(]*\(([\d.]+) s,", tcmatch.summary_text(result))]
     assert shown == [e.samples * 10.0 for e in events]
+    assert tcmatch._rule_note({"tc usable": 22}, 10.0) == "tc usable: 220 s"
 
 
 # --- workbook and zones (x) ---------------------------------------------------------------------------
@@ -322,6 +358,12 @@ def test_x5_a_saved_zone_count_beyond_the_dialog_is_refused(tmp_path) -> None:
     for count, gap in ((2 ** 40, 0), (201, 0), (2, 21)):
         with pytest.raises(ValueError, match="Zone group 1"):
             load_roi_set(saved(count, gap))
+    for size in ([640], [640, 0], [640, 480, 3]):  # a width and a height, or nothing
+        path = tmp_path / "sized.rois.json"
+        path.write_text(json.dumps({"format": ROI_SET_FORMAT, "version": 1, "size": size, "rois": []}),
+                        encoding="utf-8")
+        with pytest.raises(ValueError, match="image size"):
+            load_roi_set(path)
 
 
 def test_x6_a_roi_set_for_another_image_size_is_refused(tmp_path, monkeypatch) -> None:
@@ -359,13 +401,25 @@ def test_g1_a_recording_put_at_a_fitted_path_does_not_inherit_the_fit(tmp_path, 
     monkeypatch.setattr(mw, "SavedFitReader", Reader)
     key = str(recording)
     fake = NS(_tc_runs={key: {"output": "fit of A", "identity": mw._file_identity(recording)}},
-              _on_saved_tc_fit=None)
+              _ignition_frames={key: 4110}, _open_request_id=7, _on_saved_tc_fit=None)
     metadata = NS(path=recording, num_frames=1)
     mw.MainWindow._reopen_saved_tc_fit(fake, metadata)
     assert not started and fake._tc_runs[key]["output"] == "fit of A"  # the same file keeps its fit
     recording.write_bytes(b"B" * 12)  # another recording at the same path
     mw.MainWindow._reopen_saved_tc_fit(fake, metadata)
     assert started and key not in fake._tc_runs  # its own fit, if any, is read (and checked) from its folder
+    assert key not in fake._ignition_frames  # the old fit's time zero goes with it
+
+
+def test_g1_a_saved_fit_read_for_an_earlier_open_is_dropped(tmp_path) -> None:
+    from flir_player import main_window as mw
+
+    recording = tmp_path / "a.csq"
+    recording.write_bytes(b"B" * 12)
+    fake = NS(metadata=NS(path=recording), _tc_runs={}, _open_request_id=8,
+              _notify=lambda text: pytest.fail("an old read was used"))
+    mw.MainWindow._on_saved_tc_fit(fake, str(recording), object(), object(), "", 7, (10, 1))
+    assert fake._tc_runs == {}
 
 
 def test_g2_a_workbook_from_a_fit_saved_before_0_7_1_asks_first(tmp_path, monkeypatch) -> None:

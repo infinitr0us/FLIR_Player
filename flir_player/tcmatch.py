@@ -893,15 +893,14 @@ def locate(samples: Samples, grid: np.ndarray, channels: list[TcChannel], option
         if math.isfinite(refined):
             lag_bins, shared = refined_bins, refined
     x0, y0 = samples.origin
-    names = [ch.name for ch in channels]
     for c, (ch, match) in enumerate(zip(channels, matches)):
         if abort is not None and abort():
             raise JobCancelled("Cancelled")
-        if too_few[c] and _fixed_pixel(options.pixels, ch.name, ch.index, names) is None:
+        if too_few[c] and _fixed_pixel(options.pixels, ch.name) is None:
             continue
         rmap = _r_map(samples, lag_bins, grid_bins, ch.values, ch.locate_usable, min_samples=min_samples[c])
         match.r_map = rmap
-        fixed_pixel = _fixed_pixel(options.pixels, ch.name, ch.index, names)
+        fixed_pixel = _fixed_pixel(options.pixels, ch.name)
         if fixed_pixel is not None:
             row, col = fixed_pixel
             match.pixel, match.fixed = (int(row), int(col)), True
@@ -1012,18 +1011,26 @@ def _refine_lag(samples: Samples, b: int, lag_bins: int, lags_all: np.ndarray, w
     return int(local[best]), float(score[best])
 
 
-def _fixed_pixel(pixels: Mapping[str, tuple[int, int]], name: str, index: int, names: Sequence[str] = ()):
-    """The pixel given for a channel: by its exact name, then its number, then a prefix that names it alone
-    ("T1" must not also fix "T10")."""
-    for key, value in pixels.items():
-        if key == name or key == str(index + 1):
-            return value
-    for key, value in pixels.items():
-        folded = str(key).casefold()
-        if name.casefold().startswith(folded) and [n.casefold().startswith(folded) for n in names or (name,)].count(
-                True) == 1:
-            return value
-    return None
+def _fixed_pixel(pixels: Mapping[str, tuple[int, int]], name: str):
+    """The pixel given for a channel (``pixels`` keyed by the table's names, see ``resolve_pixels``)."""
+    return pixels.get(name)
+
+
+def resolve_pixels(pixels: Mapping[str, tuple[int, int]], names: Sequence[str]) -> dict[str, tuple[int, int]]:
+    """Given pixels keyed by the TC table's channel names. A key names a channel by its name (any case), then by
+    its number (1 = the first column read), then by a start that only that channel's name has, all against the
+    whole table, whichever channels are chosen ("T1" fixes T1 and never T10); a key naming none is dropped."""
+    out: dict[str, tuple[int, int]] = {}
+    folded = [n.casefold() for n in names]
+    for k, name in enumerate(names):
+        exact = [v for key, v in pixels.items() if str(key).casefold() == folded[k]]
+        number = [v for key, v in pixels.items() if str(key).strip() == str(k + 1)]
+        start = [v for key, v in pixels.items() if folded[k].startswith(str(key).casefold())
+                 and sum(n.startswith(str(key).casefold()) for n in folded) == 1]
+        found = exact or number or start
+        if found:
+            out[name] = found[0]
+    return out
 
 
 # --- spots, events and fits ---------------------------------------------------------------------
@@ -1415,6 +1422,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
     given = options  # recorded in the result as given (a given frame stays a frame when the fit is reopened)
     if options.lag_frame is not None:  # a frame is timed as the statistics are (by the clock on superframing)
         options = dataclass_replace(options, lag_s=samples.seconds_at(int(options.lag_frame)), lag_frame=None)
+    if options.pixels:
+        options = dataclass_replace(options, pixels=resolve_pixels(options.pixels, table.names))
     grid, channels = prepare_channels(table, options, samples.step)
     n_frames = int(samples.info.get("frames", samples.first_frame.max(initial=0) + 1))
     start = samples.info.get("clock_start")
@@ -1460,7 +1469,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
                             usable_bins=int(ch.usable.sum()))
         results.append(res)
         if not ch.searchable:
-            warnings.append(f"{ch.name}: too little usable, varying TC data ({int(ch.locate_usable.sum())} s); "
+            warnings.append(f"{ch.name}: too little usable, varying TC data "
+                            f"({int(ch.locate_usable.sum()) * samples.step:g} s); "
                             "not searched for.")
         if not match.found or match.pixel is None:
             continue
@@ -1523,7 +1533,8 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         if own:  # the median: one event spoiled by a flame or a contact change does not move it
             res.eps, res.eps_events = _spread3(own), len(own)
         if match.found and not res.events:
-            warnings.append(f"{ch.name}: no stretch passes the event rules ({_rule_note(res.rules, ch)}).")
+            warnings.append(f"{ch.name}: no stretch passes the event rules "
+                            f"({_rule_note(res.rules, samples.step)}).")
     pooled = None
     cross: list[dict] = []
     spread = consistent = overlapping = None
@@ -1652,10 +1663,11 @@ def _spread3(values: list[float]) -> tuple[float, float, float]:
     return float(min(finite)), float(np.median(finite)), float(max(finite))
 
 
-def _rule_note(counts: dict[str, int], channel: TcChannel) -> str:
+def _rule_note(counts: dict[str, int], step: float) -> str:
+    """Seconds passing each event rule (``counts`` are time bins of ``step`` s)."""
     if not counts:
         return "no data"
-    return ", ".join(f"{name}: {n} s" for name, n in counts.items())
+    return ", ".join(f"{name}: {n * step:g} s" for name, n in counts.items())
 
 
 def _options_dict(options: MatchOptions) -> dict:
@@ -2201,6 +2213,10 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
     stage("Matching the TCs to pixels and fitting the emissivity")
     result, location, series = analyse(samples, table, options, progress=progress, abort=abort)
     _check(abort)
+    # the parameters the fit used instead of the recording's own: a reflected temperature given for the fit (the
+    # CLI's --reflected) included, so the workbook and a reopened fit convert as the fit did
+    if options.reflected_c is not None:
+        parameters = sdk_values(samples.params.with_(reflected_k=result.reflected_c + KELVIN))
     output = RunOutput(result=result, table=table, parameters=dict(parameters) if parameters is not None else None,
                        tc_file=Path(tc_file))
     if out_dir is not None:
@@ -2235,13 +2251,9 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
                 grid, _channels = prepare_channels(table, options, samples.step)
                 save_figure(staged["figure"], result, location, series, samples, grid)
             if "workbook" in staged:
-                # the workbook converts with the parameters the fit used, a reflected temperature given for the
-                # fit included (the CLI's --reflected)
-                used = (sdk_values(samples.params.with_(reflected_k=result.reflected_c + KELVIN))
-                        if options.reflected_c is not None else parameters)
                 write_workbook(staged["workbook"], recording, result, table, abort=abort,
                                handles={Path(recording).resolve(): im} if im is not None else None,
-                               parameters=used)
+                               parameters=parameters)
                 say(f"Workbook: {files['workbook']}")
             job.commit()
         output.files.update(files)

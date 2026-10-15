@@ -1652,6 +1652,11 @@ class _Writer:
                 position += 1  # the wide chart takes the whole row
         tc = "TC Compare" in self.sheets
         for name, members in groups.items():
+            with_tc = [m for m in members if tc and self._has_tc(m)]
+            if len(members) + len(with_tc) > CHART_SERIES:  # one ROI name in very many recordings
+                members = members[:CHART_SERIES // 2]
+                with_tc = [m for m in with_tc if m in members]
+                name = f"{name} (first {len(members)} recordings)"
             chart = new_chart(name)
             for j, layout in enumerate(members):
                 col = layout.data_cols[layout.main]
@@ -1662,7 +1667,7 @@ class _Writer:
                 # the TC series (display unit) lives in hidden helper columns,
                 # which Excel leaves out of a chart unless told otherwise
                 chart.show_hidden_data()
-                for layout in (m for m in members if self._has_tc(m)):
+                for layout in with_tc:
                     cols = self.tc_cols[layout.number]
                     chart.add_series({"name": f"TC for {layout.title}",
                                       "categories": ["TC Compare", TC_FIRST + 1, TC_COLUMNS + 2,
