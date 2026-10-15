@@ -619,9 +619,9 @@ def _time_column(block: list[tuple], headers: list[tuple], width: int, requested
             continue
         # between its first and last time, (nearly) every row holds one; rows at the edges need not
         # (a summary row such as "Max" under the data)
+        headed = headed or _time_evidence(headers, c)  # even with too few times, or none, to be read
         values = [row[c] for row in block]
         ok = [_time_like(v) for v in values]
-        headed = headed or (any(ok) and _time_evidence(headers, c))  # even with too few times to be read
         if sum(ok) < 3:
             continue
         a, z = ok.index(True), len(ok) - 1 - ok[::-1].index(True)

@@ -140,6 +140,17 @@ def test_w4_a_reflected_temperature_given_for_the_fit_goes_into_its_workbook(tmp
     assert output.parameters["reflected_temp"] == pytest.approx(573.15)
     again = tcmatch.load_saved_run(tcmatch.saved_run(tmp_path / "out", recording))
     assert again.parameters["reflected_temp"] == pytest.approx(573.15) and again.parameters_known
+    # results written before this fix kept the parameters given (none, or the recording's 20 °C)
+    import json
+
+    data = json.loads((tmp_path / "out" / "result.json").read_text(encoding="utf-8"))
+    for before, known in ((None, False), ({**again.parameters, "reflected_temp": 293.15}, True)):
+        data["run"]["parameters"] = before
+        (tmp_path / "out" / "result.json").write_text(json.dumps(data), encoding="utf-8")
+        old = tcmatch.load_saved_run(tcmatch.saved_run(tmp_path / "out", recording))
+        assert old.parameters_known is known  # with none, a workbook asks first
+        if known:
+            assert old.parameters["reflected_temp"] == pytest.approx(573.15)
 
 
 def test_w5_a_pixel_given_for_t1_does_not_fix_t10() -> None:
@@ -161,6 +172,7 @@ def test_w5_a_pixel_given_for_t1_does_not_fix_t10() -> None:
     assert resolve_pixels({"T": (1, 2)}, ["T1", "T2"]) == {}
     assert resolve_pixels({"2": (1, 2)}, ["T1", "T2"]) == {"T2": (1, 2)}  # by number
     assert resolve_pixels({"2": (5, 5), "t2": (1, 2)}, ["T1", "T2"]) == {"T2": (1, 2)}  # the name before a number
+    assert resolve_pixels({"2": (9, 12)}, ["2", "1"]) == {"2": (9, 12)}  # a key names one TC only
 
 
 def _cache_files(folder: Path, key: str, **meta) -> None:
@@ -194,9 +206,10 @@ def test_w8_tc_readings_headed_in_fahrenheit_or_kelvin_are_refused() -> None:
 def test_w2_a_mostly_blank_time_column_is_not_replaced_by_a_heating_tc() -> None:
     from flir_player.tcdata import parse_rows
 
-    rows = [("Time [s]", "T1", "T2")] + [(0.0 if i == 0 else None, 100.1 + i, 20.0 + (i % 3)) for i in range(10)]
-    with pytest.raises(ValueError, match="time"):
-        parse_rows(rows)  # T1 rises, but the header says column 1 is the time
+    for first in (0.0, None):  # one time, or none at all
+        rows = [("Time [s]", "T1", "T2")] + [(first if i == 0 else None, 100.1 + i, 20.0 + (i % 3)) for i in range(10)]
+        with pytest.raises(ValueError, match="time"):
+            parse_rows(rows)  # T1 rises, but the header says column 1 is the time
 
 
 def test_w9_a_fit_with_open_ended_windows_reopens() -> None:

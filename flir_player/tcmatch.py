@@ -1022,14 +1022,30 @@ def resolve_pixels(pixels: Mapping[str, tuple[int, int]], names: Sequence[str]) 
     whole table, whichever channels are chosen ("T1" fixes T1 and never T10); a key naming none is dropped."""
     out: dict[str, tuple[int, int]] = {}
     folded = [n.casefold() for n in names]
-    for k, name in enumerate(names):
-        exact = [v for key, v in pixels.items() if str(key).casefold() == folded[k]]
-        number = [v for key, v in pixels.items() if str(key).strip() == str(k + 1)]
-        start = [v for key, v in pixels.items() if folded[k].startswith(str(key).casefold())
-                 and sum(n.startswith(str(key).casefold()) for n in folded) == 1]
-        found = exact or number or start
-        if found:
-            out[name] = found[0]
+    keys = [(str(key), value) for key, value in pixels.items()]
+
+    def by_name(key: str) -> int | None:
+        return folded.index(key.casefold()) if key.casefold() in folded else None
+
+    def by_number(key: str) -> int | None:
+        text = key.strip()
+        return int(text) - 1 if text.isdigit() and 1 <= int(text) <= len(names) else None
+
+    def by_start(key: str) -> int | None:
+        hits = [k for k, name in enumerate(folded) if name.startswith(key.casefold())]
+        return hits[0] if len(hits) == 1 else None
+
+    # each key names one channel, by the first way that works for it ("2" is the TC named 2 if there is one); a
+    # channel named by several keys takes the one found the strongest way
+    taken: set[str] = set()
+    for find in (by_name, by_number, by_start):
+        for key, value in keys:
+            if key in taken:
+                continue
+            k = find(key)
+            if k is not None:
+                taken.add(key)
+                out.setdefault(names[k], value)
     return out
 
 
@@ -2149,8 +2165,15 @@ def load_saved_run(saved: SavedRun) -> RunOutput:
     # only the files this run wrote: an earlier run's figure stays behind when a rerun draws none
     files = {key: saved.folder / name for key, name in names.items() if (saved.folder / name).is_file()
              and (saved.files is None or key in saved.files)}
-    return RunOutput(result=saved.result, table=table, files=files, parameters=saved.parameters, tc_file=tc_file,
-                     parameters_known=saved.run_info)
+    parameters, known = saved.parameters, saved.run_info
+    reflected = saved.options.reflected_c  # results from before 0.7.5 did not keep it with their parameters
+    if reflected is not None and known:
+        if parameters is not None:
+            parameters = {**parameters, "reflected_temp": float(reflected) + KELVIN}
+        else:
+            known = False  # only the recording can say the rest: ask before a workbook, as for older fits
+    return RunOutput(result=saved.result, table=table, files=files, parameters=parameters, tc_file=tc_file,
+                     parameters_known=known)
 
 
 def run(recording: str | Path, tc_file: str | Path, options: MatchOptions, *, out_dir: str | Path | None = None,
