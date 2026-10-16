@@ -41,6 +41,9 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 
 ### Workbook
 
+- TC Compare can be filled directly from a TC file without fitting emissivity
+  first. The camera and logger clocks place time 0, and T1, T2 and T3 start
+  paired with cell zones 3, 6 and 9. The time and pairs remain editable.
 - The Excel export refuses a recording that cycles through several presets
   (superframing), whose rows would mix the presets.
 - The Emissivity Match leaves out the rows where a zone has clipped pixels

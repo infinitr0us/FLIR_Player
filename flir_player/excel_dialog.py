@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -36,10 +38,62 @@ from .export_dialogs import _path_row, confirm_replace
 from .geometry import roi_coordinates
 from .jobs import unique_destination
 from .models import RoiShape, VideoMetadata
+from .settings import app_settings
 from .widgets import ChevronComboBox, FramelessDialog, MessageDialog
 
 _SHEETS = (("tc", "TC Compare"), ("summary", "Summary"), ("charts", "Charts"),
            ("roimap", "ROI map"), ("validation", "Validation (vs SDK)"))
+_TC_FILE_KEY = "excel/tc_file"
+_TC_PAIRS_KEY = "excel/tc_pairs"
+
+
+def _duplicate_names(names) -> list[str]:
+    names = tuple(names)
+    return sorted({name for name in names if names.count(name) > 1})
+
+
+def parse_tc_pairs(text: str, tc_names, roi_names) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Parse exact, case-sensitive TC = ROI names; return all errors for the status line."""
+    roi_names = tuple(roi_names)
+    pairs, errors = {}, []
+    seen_tc, seen_roi = set(), set()
+    for item in re.split(r"[,;]", text):
+        if not item.strip():
+            continue
+        parts = [part.strip() for part in item.split("=")]
+        if len(parts) != 2 or not all(parts):
+            errors.append(f"Use TC name = ROI name for {item.strip()!r}.")
+            continue
+        tc, roi = parts
+        if tc not in tc_names:
+            errors.append(f"Unknown TC: {tc}.")
+        if roi not in roi_names:
+            errors.append(f"Unknown ROI: {roi}.")
+        if tc in seen_tc:
+            errors.append(f"TC {tc} is paired twice.")
+        if roi in seen_roi:
+            errors.append(f"ROI {roi} is paired twice.")
+        seen_tc.add(tc)
+        seen_roi.add(roi)
+        pairs[tc] = roi
+    repeated = _duplicate_names(roi_names)
+    if repeated:
+        errors.append(f"More than one ROI is named {', '.join(repeated)}: give them different names.")
+    if not pairs and not errors:
+        errors.append("Enter at least one pair, such as T1 = Cell 3.")
+    if len(pairs) > 10:
+        errors.append("TC Compare holds at most 10 TC columns; pair no more than 10 TCs.")
+    return pairs, tuple(errors)
+
+
+def _default_tc_pairs(tc_names, roi_names) -> str:
+    """The lab's top-face TCs, by cell number, only where the zone name is unambiguous."""
+    pairs = []
+    for tc, number in (("T1", 3), ("T2", 6), ("T3", 9)):
+        matches = [name for name in roi_names if re.fullmatch(rf".+ {number}", name)]
+        if tc in tc_names and len(matches) == 1:
+            pairs.append(f"{tc} = {matches[0]}")
+    return ", ".join(pairs)
 
 
 def _panel(title: str) -> tuple[QFrame, QVBoxLayout]:
@@ -67,6 +121,15 @@ class ExcelExportDialog(FramelessDialog):
         self._others: list[dict] = []  # added recordings: path, label, rois, ignition
         self._replace: list[str] = []
         self._confirmed: list[str] = []
+        self._tc_table = None
+        self._tc_clock = None
+        self._tc_request = 0
+        self._tc_read_path = ""
+        self._tc_read_sheet = None
+        self._tc_reading = False
+        self._tc_error = "Choose the logger's export of the TC readings."
+        self._tc_auto_pairs = ""
+        self._tc_cached = None
         layout = self.body
         # Panels scroll on small screens; output, estimate and buttons stay put.
         scroll = QScrollArea()
@@ -230,22 +293,48 @@ class ExcelExportDialog(FramelessDialog):
         box.addWidget(self.sidecar_check)
         panels.addWidget(frame)
 
-        # thermocouples from this session's TC fit
+        # thermocouples from a fit or directly from the logger file
         frame, box = _panel("Thermocouples")
-        self.tc_check = QCheckBox("Fill TC Compare from the last TC fit")
+        self.tc_check = QCheckBox("Fill TC Compare")
         self.tc_check.setToolTip(
-            "The logger data on TC Compare at the fitted time offset, each TC paired with the smallest ROI holding "
-            "its pixel (e.g. its cell zone), and Use = 1 on the seconds the fit used (no flames on the TC, IR in "
-            "range). One emissivity then drives every ROI (no per-ROI values).")
+            "Fill the logger data and pair TCs with zones. From a fit, Use = 1 marks the seconds the fit used. "
+            "From a file, it marks valid TC readings at least 50 °C with no flame jump. "
+            "One emissivity drives every ROI.")
+        self.tc_source_combo = ChevronComboBox()
+        if tc_run is not None:
+            self.tc_source_combo.addItem("From the last TC fit", "fit")
+        self.tc_source_combo.addItem("From a TC file, timed by the clocks", "file")
+        self.tc_file_box = QWidget()
+        tc_form = QFormLayout(self.tc_file_box)
+        tc_form.setContentsMargins(0, 0, 0, 0)
+        row, self.tc_file_edit, tc_browse = _path_row("Choose the TC file")
+        saved_path = app_settings().value(_TC_FILE_KEY, "", type=str)
+        fit_path = getattr(tc_run, "tc_file", None)
+        self.tc_file_edit.setText(str(fit_path) if fit_path else
+                                  saved_path if saved_path and Path(saved_path).is_file() else "")
+        tc_browse.clicked.connect(self._browse_tc)
+        tc_form.addRow("TC file", row)
+        self.tc_sheet_combo = ChevronComboBox()
+        self.tc_sheet_combo.setEnabled(False)
+        tc_form.addRow("Sheet", self.tc_sheet_combo)
+        self.tc_pairs_edit = QLineEdit()
+        self.tc_pairs_edit.setPlaceholderText("T1 = Cell 3, T2 = Cell 6, T3 = Cell 9")
+        self.tc_pairs_edit.setToolTip("TC name = ROI name, separated by commas or semicolons. "
+                                     "Use the exact names in the TC file and ROI list, including capitals.")
+        tc_form.addRow("TCs and zones", self.tc_pairs_edit)
         self.tc_label = QLabel()
         self.tc_label.setObjectName("FieldLabel")
         self.tc_label.setWordWrap(True)
         box.addWidget(self.tc_check)
+        box.addWidget(self.tc_source_combo)
+        box.addWidget(self.tc_file_box)
         box.addWidget(self.tc_label)
         panels.addWidget(frame)
         self._tc_pairing = self._pair_tcs()
-        self.tc_check.setChecked(self._tc_pairing is not None and bool(self._tc_pairing.pairs))
-        if self.tc_check.isChecked() and not self._tc_usable():
+        use_fit = tc_run is not None and not self._tc_usable()
+        self.tc_source_combo.setCurrentIndex(self.tc_source_combo.findData("fit" if use_fit else "file"))
+        self.tc_check.setChecked(True)
+        if use_fit:
             self._time_from_fit()
         panels.addStretch(1)
         layout.addWidget(scroll, 1)
@@ -283,7 +372,12 @@ class ExcelExportDialog(FramelessDialog):
         self.sampling_combo.currentIndexChanged.connect(self._update)
         for check in self.sheet_checks.values():
             check.toggled.connect(self._update)
-        self._update()
+        self.tc_source_combo.currentIndexChanged.connect(self._tc_source_changed)
+        self.tc_file_edit.textChanged.connect(self._tc_path_changed)
+        self.tc_file_edit.editingFinished.connect(self._tc_file_edited)
+        self.tc_sheet_combo.currentTextChanged.connect(lambda sheet: self._load_tc(sheet=sheet))
+        self.tc_pairs_edit.textChanged.connect(self._update)
+        self._tc_source_changed()
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry().height() if screen is not None else 900
         fixed = sum(self.body.itemAt(i).sizeHint().height() for i in range(self.body.count())
@@ -357,6 +451,122 @@ class ExcelExportDialog(FramelessDialog):
         del self._others[row - 1]
         self._update()
 
+    # --- TC file -------------------------------------------------------------------------
+
+    def _tc_source_changed(self) -> None:
+        if self.tc_source_combo.currentData() == "file" and not self._tc_read_path:
+            self._load_tc(sheet=None)
+        else:
+            self._update()
+
+    def _browse_tc(self) -> None:
+        from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES
+
+        start = self.tc_file_edit.text().strip() or str(app_settings().value("tcmatch/last_dir", "", type=str)
+                                                       or self.metadata.path.parent)
+        patterns = " ".join(f"*{suffix}" for suffix in WORKBOOK_SUFFIXES + TEXT_SUFFIXES)
+        path, _ = QFileDialog.getOpenFileName(self, "Choose the TC file", start,
+                                              f"TC logger data ({patterns});;All files (*.*)")
+        if path:
+            self.tc_file_edit.setText(path)
+            self._load_tc(sheet=None)
+
+    def _tc_path_changed(self) -> None:
+        # Invalidate immediately, including while typing: a previous read must never land on this path.
+        self._tc_request += 1
+        self._tc_table = self._tc_clock = self._tc_cached = None
+        self._tc_reading = False
+        self._tc_read_path = ""
+        self._tc_error = "Choose the logger's export of the TC readings."
+        self.tc_sheet_combo.blockSignals(True)
+        self.tc_sheet_combo.clear()
+        self.tc_sheet_combo.blockSignals(False)
+        self._update()
+
+    def _tc_file_edited(self) -> None:
+        if self.tc_file_edit.text().strip() != self._tc_read_path:
+            self._load_tc(sheet=None)
+
+    def _load_tc(self, sheet: str | None) -> None:
+        # Imported here because tc_dialog also uses this module's panel helper.
+        from .tc_dialog import _TableReader, _keep_until_done
+
+        self._tc_request += 1
+        self._tc_read_path = self.tc_file_edit.text().strip()
+        self._tc_read_sheet = sheet
+        self._tc_table = self._tc_clock = self._tc_cached = None
+        path = Path(self._tc_read_path).expanduser() if self._tc_read_path else None
+        self._tc_reading = path is not None and path.is_file()
+        self._tc_error = ("Reading the TC file…" if self._tc_reading else "No such file." if path is not None
+                          else "Choose the logger's export of the TC readings.")
+        self._update()
+        if self._tc_reading:
+            reader = _TableReader(self._tc_request, path, sheet)
+            reader.read.connect(self._tc_loaded)
+            _keep_until_done(reader)
+            reader.start()
+
+    def _tc_loaded(self, request: int, names, table, error: str) -> None:
+        if request != self._tc_request:
+            return
+        from .tcdata import suggest_sheet
+        from .tcmatch import clock_estimate
+
+        self._tc_reading = False
+        self._tc_table = table
+        self._tc_error = f"Could not read TC data: {error}" if table is None else ""
+        sheets = list(names or [])
+        selected = table.sheet if table is not None and table.sheet else self._tc_read_sheet or suggest_sheet(sheets)
+        self.tc_sheet_combo.blockSignals(True)
+        self.tc_sheet_combo.clear()
+        self.tc_sheet_combo.addItems(sheets)
+        if selected in sheets:
+            self.tc_sheet_combo.setCurrentText(selected)
+        self.tc_sheet_combo.blockSignals(False)
+        if table is not None:
+            self._tc_clock = clock_estimate(table.clock_zero, self.metadata.start_time, table.times,
+                                            self.metadata.duration_seconds, logger_note=table.clock_note)
+            roi_names = tuple(roi.name for roi in self.rois)
+            # Keep text edited in this dialog, including errors the user still needs to fix.
+            if self.tc_pairs_edit.text() == self._tc_auto_pairs:
+                saved = app_settings().value(_TC_PAIRS_KEY, "", type=str)
+                _pairs, errors = parse_tc_pairs(saved, table.names, roi_names)
+                self._tc_auto_pairs = saved if not errors else _default_tc_pairs(table.names, roi_names)
+                self.tc_pairs_edit.setText(self._tc_auto_pairs)
+            if (self._tc_clock is not None and self.tc_source_combo.currentData() == "file"
+                    and self.tc_check.isChecked() and not self.metadata.presets
+                    and self.time_base_combo.currentData() == "frames" and self.metadata.nominal_fps > 0):
+                fps = self.metadata.nominal_fps
+                frame = min(max(round(self._tc_clock.lag_s * fps), 0), self.metadata.num_frames - 1)
+                self._time_from_logger(table, self._tc_clock.lag_s, fps, frame)
+        self._update()
+
+    def _file_pairs(self):
+        return parse_tc_pairs(self.tc_pairs_edit.text(), self._tc_table.names,
+                              (roi.name for roi in self.rois))
+
+    def _file_clock_text(self) -> str:
+        if self._tc_table is None:
+            return ""
+        clock = self._tc_clock
+        if clock is None:
+            why = ("the TC file does not give the logger's clock" if self._tc_table.clock_zero is None
+                   else "the recording has no clock" if self.metadata.start_time is None
+                   else "the clocks put the logger's data outside this recording")
+            return f"Clocks: {why}. Time 0 at the ignition frame is taken as logger time 0."
+        fps = self.metadata.nominal_fps if not self.metadata.presets else 0.0
+        minutes, seconds = divmod(round(abs(clock.lag_s)), 60)
+        sign = "minus " if clock.lag_s < 0 else ""
+        frame_text = f"frame {round(clock.lag_s * fps) + 1:,} (" if fps > 0 else ""
+        text = (f"Clocks: logger time 0 at {frame_text}{sign}{minutes} min {seconds} s into the recording"
+                + (")." if fps > 0 else "."))
+        if fps > 0:
+            ignition = self.ignition_spin.value()
+            logger = (ignition - 1) / fps - clock.lag_s
+            text += (" Time 0 is logger time 0." if abs(logger) <= 0.5 / fps + 1e-9 else
+                     f" Time 0 (frame {ignition:,}) is logger time {logger:,.1f} s.")
+        return text
+
     # --- options -------------------------------------------------------------------------
 
     def _pair_tcs(self):
@@ -384,9 +594,12 @@ class ExcelExportDialog(FramelessDialog):
         """
         result, table = self.tc_run.result, self.tc_run.table
         frame = self._fit_origin()
+        self._time_from_logger(table, result.lag_s, result.fps, frame)
+
+    def _time_from_logger(self, table, lag_s: float, fps: float, frame: int) -> None:
         self.ignition_spin.setValue(frame + 1)
-        offset = float(result.lag_s - frame / result.fps)  # workbook time = logger time + offset
-        first, last = -frame / result.fps, (self.metadata.num_frames - 1 - frame) / result.fps
+        offset = float(lag_s - frame / fps)  # workbook time = logger time + offset
+        first, last = -frame / fps, (self.metadata.num_frames - 1 - frame) / fps
         times = table.times[np.isfinite(table.times)]
         if not times.size:
             return
@@ -400,21 +613,35 @@ class ExcelExportDialog(FramelessDialog):
         self.end_spin.setValue(end)
 
     def _tc_usable(self) -> str:
-        """Why the TC fit cannot fill TC Compare now ("" when it can)."""
-        if self.tc_run is None:
-            return "No TC fit of this recording in this session (Measurement → Fit Emissivity from TCs…)."
-        if self.tc_run.result.preset is not None:
-            return "The TC fit used one preset of a superframing recording, which the workbook cannot separate yet."
+        """Why the selected source cannot fill TC Compare now ("" when it can)."""
+        from_file = self.tc_source_combo.currentData() == "file"
+        if self.metadata.presets or (self.tc_run is not None and self.tc_run.result.preset is not None):
+            return "The workbook cannot separate the presets of a superframing recording yet."
         if not self.sheet_checks["tc"].isChecked():
             return "Tick the TC Compare sheet to fill it."
         if self.time_base_combo.currentData() != "frames":
-            return "The TC fit's time offset is on the frame-number time base; choose that time base."
-        if not self._tc_pairing.pairs:
-            return "No TC pixel of the last fit lies in an ROI."
-        if self._tc_pairing.duplicates:
-            return (f"More than one ROI is named {', '.join(self._tc_pairing.duplicates)}: the workbook pairs ROIs "
-                    "and TCs by name, so give them different names (e.g. split again with other names).")
-        paired = set(self._tc_pairing.pairs.values())
+            return "The TC time offset is on the frame-number time base; choose that time base."
+        if from_file:
+            repeated = _duplicate_names(roi.name for roi in self.rois)
+            if repeated and self._tc_table is None:
+                return f"More than one ROI is named {', '.join(repeated)}: give them different names."
+            if self._tc_table is None:
+                return self._tc_error
+            if not math.isfinite(self.metadata.nominal_fps) or self.metadata.nominal_fps <= 0:
+                return "The recording has no frame rate to place the TC readings."
+            pairs, errors = self._file_pairs()
+            if errors:
+                return " ".join(errors)
+        else:
+            if self.tc_run is None:
+                return "No TC fit of this recording in this session (Measurement → Fit Emissivity from TCs…)."
+            if not self._tc_pairing.pairs:
+                return "No TC pixel of the last fit lies in an ROI."
+            if self._tc_pairing.duplicates:
+                return (f"More than one ROI is named {', '.join(self._tc_pairing.duplicates)}: the workbook pairs ROIs "
+                        "and TCs by name, so give them different names (e.g. split again with other names).")
+            pairs = self._tc_pairing.pairs
+        paired = set(pairs.values())
         for other in self._others:  # the pairing applies by name to added recordings too
             names = [roi.name for roi in other["rois"]]
             repeated = sorted(name for name in paired if names.count(name) > 1)
@@ -424,10 +651,20 @@ class ExcelExportDialog(FramelessDialog):
         return ""
 
     def tc_prefill(self):
-        """The TC Compare contents from the last fit for the open recording's ROIs, or None."""
+        """The TC Compare contents for the open recording's ROIs, or None."""
         if not self.tc_check.isChecked() or self._tc_usable():
             return None
-        from .tcmatch import tc_prefill
+        from .tcmatch import clock_prefill, tc_prefill
+
+        if self.tc_source_combo.currentData() == "file":
+            pairs, _errors = self._file_pairs()
+            fps = self.metadata.nominal_fps
+            frame = self.ignition_spin.value() - 1
+            lag = self._tc_clock.lag_s if self._tc_clock is not None else frame / fps
+            key = (self._tc_request, tuple(pairs.items()), lag, fps, frame)
+            if self._tc_cached is None or self._tc_cached[0] != key:
+                self._tc_cached = (key, clock_prefill(self._tc_table, lag_s=lag, fps=fps, frame=frame, pairs=pairs))
+            return self._tc_cached[1]
 
         return tc_prefill(self.tc_run.result, self.tc_run.table, rois=self.rois,
                           frame=self.ignition_spin.value() - 1, size=(self.metadata.width, self.metadata.height))
@@ -454,8 +691,30 @@ class ExcelExportDialog(FramelessDialog):
         self.end_spin.setEnabled(self.end_check.isChecked())
         self.step_spin.setEnabled(self.sampling_combo.currentData() == "seconds")
         reason = self._tc_usable()
-        self.tc_check.setEnabled(not reason)
-        if reason:
+        from_file = self.tc_source_combo.currentData() == "file"
+        self.tc_file_box.setVisible(from_file)
+        self.tc_sheet_combo.setEnabled(not self._tc_reading and self.tc_sheet_combo.count() > 1)
+        self.tc_check.setEnabled(not reason or (from_file and self._tc_reading))
+        if from_file:
+            parts = []
+            if self._tc_table is not None:
+                pairs, errors = self._file_pairs()
+                if not errors:
+                    parts.append("Pairs: " + " · ".join(f"{tc} -> {roi}" for tc, roi in pairs.items()) + ".")
+                parts.append(self._file_clock_text())
+            if reason:
+                parts.append(reason)
+                if not self._tc_reading:
+                    parts.append("TC Compare will not be filled.")
+            elif not self.tc_check.isChecked():
+                parts.append("Unticked: paste the logger data on TC Compare yourself.")
+            if "A700" in self.metadata.camera_model:
+                parts.append("The A700 clock can run slow. The TC and zone curves on TC Compare show any shift; "
+                             "time 0 can be moved by hand.")
+            self.tc_label.setText(" ".join(parts))
+            self.tc_label.setToolTip(self._tc_clock.note if self._tc_clock is not None else
+                                     self._tc_table.clock_note if self._tc_table is not None else "")
+        elif reason:
             self.tc_label.setText(reason)
         elif self.tc_check.isChecked():
             result = self.tc_run.result
@@ -497,6 +756,8 @@ class ExcelExportDialog(FramelessDialog):
         if not self.rois:
             text = "Draw at least one ROI on the open recording first."
         self.estimate_label.setText(text)
+        if from_file and self._tc_reading and self.tc_check.isChecked() and self.sheet_checks["tc"].isChecked():
+            valid = False
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
 
     def _browse(self) -> None:
@@ -511,11 +772,31 @@ class ExcelExportDialog(FramelessDialog):
         return dest if dest.suffix.lower() == ".xlsx" else dest.with_suffix(".xlsx")
 
     def accept(self) -> None:
+        from .jobs import aliases
+
+        if self.tc_source_combo.currentData() == "file":
+            self._tc_file_edited()
+        if not self.button_box.button(QDialogButtonBox.StandardButton.Ok).isEnabled():
+            return
+        tc_path = (self.tc_file_edit.text().strip() if self.tc_source_combo.currentData() == "file"
+                   else getattr(self.tc_run, "tc_file", None))
+        if tc_path and aliases(self._dest(), Path(tc_path).expanduser()):
+            MessageDialog.warning(self, "Choose workbook file", "That is the TC file. Choose another name for the workbook.")
+            return
         replace = confirm_replace(self, [self._dest()], self._confirmed)
         if replace is None:
             return
         self._replace = [str(path) for path in replace]
+        if self.tc_source_combo.currentData() == "file" and self.tc_prefill() is not None:
+            settings = app_settings()
+            settings.setValue(_TC_FILE_KEY, str(Path(self._tc_read_path).expanduser().resolve()))
+            settings.setValue(_TC_PAIRS_KEY, self.tc_pairs_edit.text().strip())
         super().accept()
+
+    def done(self, result: int) -> None:
+        self._tc_request += 1  # a reader may outlive the dialog, but must not change a closed dialog's choices
+        self._tc_reading = False
+        super().done(result)
 
     def parameters(self) -> dict:
         labels = [self.table.item(r, 0).text().strip() for r in range(self.table.rowCount())]
