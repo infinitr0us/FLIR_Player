@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-16
+
+Cell zones that follow a battery module as the camera sees it, and the zone
+workbook without a TC fit, both asked for by the fire-safety engineers on 16
+October; with the fixes from a review of everything added since 0.5.2.
 
 ### Cell zones that follow the module as the camera sees it
 
@@ -100,6 +104,8 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 - ROI sets with more zones or a wider gap than the split dialog allows are
   refused, and a set saved for another image size is refused with both sizes
   named.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.7.4...v0.8.0)
 
 ## 0.7.4 — 2026-10-14
 
