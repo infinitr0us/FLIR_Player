@@ -108,6 +108,7 @@ def _build_unit_specs() -> tuple[_UnitSpec, ...]:
 
 UNIT_SPECS: tuple[_UnitSpec, ...] = _build_unit_specs()
 _SPECS_BY_KEY = {spec.option.key: spec for spec in UNIT_SPECS}
+_APP_MEASURED = frozenset({"quad"})  # ROI kinds the SDK cannot hold: their statistics come from the app
 
 
 def _position(point: Any) -> tuple[int, int] | None:
@@ -677,10 +678,11 @@ class FlirVideoSource:
         if self._processing.is_active:
             shapes = tuple(shape for _, shape, _ in self._roi_handles)
             return roi_stats_app(data, shapes)
-        sdk_stats = self._roi_stats()
-        lines = {s.id: s for s in roi_stats_app(data, tuple(
-            shape for _, shape, _ in self._roi_handles if shape.kind == "line"))}
-        return tuple(lines.get(stats.id, stats) for stats in sdk_stats)
+        sdk_stats = {stats.id: stats for stats in self._roi_stats()}
+        app = {s.id: s for s in roi_stats_app(data, tuple(
+            shape for _, shape, _ in self._roi_handles if shape.kind == "line" or shape.kind in _APP_MEASURED))}
+        return tuple(app[roi_id] if roi_id in app else sdk_stats[roi_id]
+                     for roi_id, _shape, _handle in self._roi_handles if roi_id in app or roi_id in sdk_stats)
 
     def _clip_mask(self, shape: tuple[int, ...]) -> np.ndarray | None:
         """Boolean mask of pixels the SDK clamped to its clip range.
@@ -855,12 +857,17 @@ class FlirVideoSource:
         if self._im is None:
             raise RuntimeError("No FLIR recording is open")
         for _, _, handle in self._roi_handles:
+            if handle is None:
+                continue
             try:
                 self._im.rois.remove(handle)
             except Exception:
                 pass
         self._roi_handles = []
         for shape in shapes:
+            if shape.kind in _APP_MEASURED:  # the SDK has no four-sided ROI: measured by the app
+                self._roi_handles.append((shape.id, shape, None))
+                continue
             handle = self._add_roi(shape)
             if handle is not None:
                 self._roi_handles.append((shape.id, shape, handle))
@@ -898,6 +905,8 @@ class FlirVideoSource:
     def _roi_stats(self) -> tuple[RoiStats, ...]:
         stats: list[RoiStats] = []
         for roi_id, shape, handle in self._roi_handles:
+            if handle is None:
+                continue
             stats.append(
                 RoiStats(
                     id=roi_id,

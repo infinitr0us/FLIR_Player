@@ -49,7 +49,8 @@ from .extract import ExtractDialog
 from .tc_dialog import SavedFitReader, TcCalibrationDialog, TcResultsDialog, results_folder, saved_request
 from .tcmatch import roi_shapes, workbook_origin
 from .zone_dialog import ZoneSplitDialog
-from .zones import ZoneSpec, normalized_box
+from .zones import (ZONE_KIND, ZoneSpec, corner_divider, move_divider, normalized_box, split_box,
+                    translate_spec)
 from .geometry import roi_coordinates
 from .settings import app_settings
 from .models import (
@@ -168,6 +169,7 @@ class MainWindow(QMainWindow):
         self._zone_groups: list[dict] = []  # zones split from one box: ids, ZoneSpec, the box's name
         # count, end, gap, names last used; the end as seen on screen (the view may be turned)
         self._zone_defaults = ZoneSpec(box=((0.0, 0.0), (1.0, 1.0)))
+        self._zone_drag_state: tuple | None = None  # (group, spec, shapes) of the zone drag under way
         self._extract_progress: ProgressDialog | None = None
         self._export_progress: ProgressDialog | None = None
         self.show_clipping = True
@@ -370,6 +372,8 @@ class MainWindow(QMainWindow):
         self.canvas.roi_drawn.connect(self._add_roi)
         self.canvas.roi_selected.connect(self._select_roi)
         self.canvas.roi_moved.connect(self._replace_roi)
+        self.canvas.rois_moved.connect(self._replace_rois)
+        self.canvas.set_drag_hook(self._zone_drag)
         self.canvas.roi_delete_requested.connect(self._delete_roi)
         self.color_scale.isotherm_dragged.connect(self._isotherm_dragged)
         self.analysis_toolbar.tool_changed.connect(self.canvas.set_roi_tool)
@@ -763,6 +767,54 @@ class MainWindow(QMainWindow):
                 break
         self._push_rois()
 
+    def _replace_rois(self, shapes) -> None:
+        """Several ROIs changed by one drag: the zones of a split after a divider or the whole split moved."""
+        state, self._zone_drag_state = self._zone_drag_state, None
+        by_id = {shape.id: shape for shape in shapes}
+        if not all(self._covers_pixels(shape.kind, shape.points) for shape in shapes):
+            self.canvas.set_rois(self._rois, self._selected_roi_id)  # snap back
+            return
+        if state is not None and any(state[0] is group for group in self._zone_groups) and set(state[2]) == set(by_id):
+            state[0]["spec"] = state[1]
+        for index, existing in enumerate(self._rois):
+            if existing.id in by_id:
+                self._rois[index] = by_id[existing.id]
+                self._temporal.pop(existing.id, None)
+        self.bottom_panel.temporal.setToolTip("History cleared for the edited ROIs")
+        self.bottom_panel.temporal.history_note.setText("Edited ROI history cleared")
+        self._push_rois()
+
+    def _zone_drag(self, shape: RoiShape, handle: str, image_pos, start_pos) -> dict | None:
+        """The canvas's drag hook for cell zones: a zone's corner moves that divider's end along the row (the
+        zones on both sides follow), its body moves every zone of the split by whole pixels. None for any other
+        ROI (dragged as usual). A drag that would leave a zone without width or pixels keeps the last good state."""
+        if shape.kind != ZONE_KIND or self.metadata is None:
+            return None
+        group = self._zone_group_of(shape.id)
+        if group is None or shape.id not in group["ids"]:
+            return None
+        spec = group["spec"]
+        current = {roi.id: roi for roi in self._rois}
+        try:
+            if handle == "body":
+                spec = translate_spec(spec, round(image_pos[0] - start_pos[0]), round(image_pos[1] - start_pos[1]))
+            elif handle in ("c0", "c1", "c2", "c3"):
+                divider, edge, offset = corner_divider(spec, group["ids"].index(shape.id) + 1, int(handle[1]))
+                along = image_pos[0] if spec.start in ("right", "left") else image_pos[1]
+                spec = move_divider(spec, divider, edge, round(along) + offset)  # the corner on a pixel boundary
+            else:
+                return None
+            zones = split_box(spec, self.metadata.width, self.metadata.height)
+        except ValueError:
+            state = self._zone_drag_state
+            if state is not None and state[0] is group:
+                return state[2]
+            return {roi_id: current[roi_id] for roi_id in group["ids"] if roi_id in current}
+        moved = {roi_id: RoiShape(roi_id, ZONE_KIND, points, current[roi_id].name)
+                 for roi_id, (_name, points) in zip(group["ids"], zones) if roi_id in current}
+        self._zone_drag_state = (group, spec, moved)
+        return moved
+
     def _delete_roi(self, roi_id: int | None) -> None:
         if roi_id is None:
             return
@@ -817,9 +869,10 @@ class MainWindow(QMainWindow):
         if group is not None:
             spec, replaced, box_name = group["spec"], set(group["ids"]), group["name"]
         elif selected is not None and selected.kind == "rect":
-            d = self._zone_defaults
+            d = self._zone_defaults  # the last split's settings, except its hand-moved dividers
             spec = ZoneSpec(box=normalized_box(selected.points), count=d.count,
-                            start=self.orientation.recording_end(d.start), gap=d.gap, prefix=d.prefix)
+                            start=self.orientation.recording_end(d.start), gap=d.gap, prefix=d.prefix, lean=d.lean,
+                            distances=d.distances)
             replaced, box_name = {selected.id}, selected.name
         else:
             self._notify("Select a box ROI to split into zones (or a zone to re-split)")
@@ -830,7 +883,7 @@ class MainWindow(QMainWindow):
         base = max([shape.id for shape in self._rois] + [self._roi_next_id]) + 1
 
         def preview(zones) -> None:
-            shapes = [RoiShape(base + k, "rect", points, name) for k, (name, points) in enumerate(zones)]
+            shapes = [RoiShape(base + k, ZONE_KIND, points, name) for k, (name, points) in enumerate(zones)]
             self.canvas.set_rois(others + shapes, None)
 
         dialog = ZoneSplitDialog(spec, width, height, tc_pixels=self._tc_pixels(), regroup=group is not None,
@@ -840,8 +893,9 @@ class MainWindow(QMainWindow):
         code = dialog.exec()
         if code == ZoneSplitDialog.DialogCode.Accepted and dialog.zones():
             new_spec = dialog.spec()
-            self._zone_defaults = dataclass_replace(new_spec, start=self.orientation.shown_end(new_spec.start))
-            zones = [RoiShape(self._roi_next_id + k, "rect", points, name)
+            self._zone_defaults = dataclass_replace(new_spec, start=self.orientation.shown_end(new_spec.start),
+                                                    moved=())
+            zones = [RoiShape(self._roi_next_id + k, ZONE_KIND, points, name)
                      for k, (name, points) in enumerate(dialog.zones())]
             self._roi_next_id += len(zones)
             self._replace_with(replaced, zones)

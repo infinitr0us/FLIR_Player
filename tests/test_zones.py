@@ -14,7 +14,7 @@ W, H = 640, 480
 
 
 def _shapes(zones):
-    return [RoiShape(id=k + 1, kind="rect", points=points, name=name) for k, (name, points) in enumerate(zones)]
+    return [RoiShape(id=k + 1, kind="quad", points=points, name=name) for k, (name, points) in enumerate(zones)]
 
 
 def _columns(shape):
@@ -90,7 +90,7 @@ def test_a_zone_outside_the_image_is_refused() -> None:
 
 def test_prefix_is_tidied_and_single_zone_keeps_the_box() -> None:
     zones = split_box(ZoneSpec(box=((5, 5), (25, 9)), count=1, prefix="  Module   side "))
-    assert zones == [("Module side 1", ((5.0, 5.0), (25.0, 9.0)))]
+    assert zones == [("Module side 1", ((5.0, 5.0), (25.0, 5.0), (25.0, 9.0), (5.0, 9.0)))]
     assert split_box(ZoneSpec(box=((5, 5), (25, 9)), count=2, prefix=" "))[0][0] == "Zone 1"
 
 

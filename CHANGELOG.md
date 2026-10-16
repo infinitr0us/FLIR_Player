@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Cell zones that follow the module as the camera sees it
+
+- Zones are four-sided. On a module at a slant (*Rows at the last column*)
+  their upper and lower edges run straight along it instead of stepping zone by
+  zone.
+- *Divider lean* in the split window: the dividers between cells lean by that
+  many pixels across the band, as on a module seen at an angle (on the 1006a
+  T650 the cell dividers lean about 3 px across the 17 px top face).
+- *Camera distance* at zone 1's end and at the far end: the zones narrow
+  towards the farther end as a perspective view shows them (a straight row
+  whose depth grows along it).
+- Drag a zone's corner to move that divider along the row: the zones on both
+  sides follow and the gap between them stays. Drag a zone to move every zone of
+  the split. Re-splitting keeps dividers moved by hand while the number of
+  zones is unchanged; ROI sets save the lean, the distances and the moved
+  dividers (sets without them stay readable by 0.7.x).
+- Zone edges are computed in exact fractions: an edge that fell exactly on a
+  pixel boundary could land a pixel early before.
+- The workbook's Settings sheet lists zones as "Zone"; their statistics in the
+  player come from the app (the SDK has no four-sided ROI), with the same pixels
+  as everywhere else. An upright zone covers exactly the pixels of the box with
+  its corners.
+- Grabbing a corner where two ROIs' handles meet takes the selected ROI's.
+
+### Review fixes
+
 Fixes from a review of everything added since 0.5.2 (the TC fit, the
 workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 

@@ -52,7 +52,7 @@ def test_split_dialog_offers_join_only_for_a_split(qapp) -> None:
 
 
 def test_roi_sets_keep_zone_groups(tmp_path) -> None:
-    zones = [RoiShape(k + 2, "rect", points, name)
+    zones = [RoiShape(k + 2, "quad", points, name)
              for k, (name, points) in enumerate(split_box(ZoneSpec(box=BOX, count=3, gap=0)))]
     spot = RoiShape(1, "cursor", ((10.5, 10.5),), "Spot")
     group = ZoneGroup(rois=(1, 2, 3), spec=ZoneSpec(box=BOX, count=3, gap=0), name="Top slice")
@@ -166,7 +166,7 @@ def test_exported_images_and_roi_maps_follow_the_same_rule() -> None:
     assert _fitting_label(draw, zone, (0, 0), (9, 8)) is None
     assert _fitting_label(draw, zone, (0, 0), (27, 24)) == "12"
     assert _fitting_label(draw, RoiShape(2, "rect", ((0, 0), (9, 8)), "Hot spot"), (0, 0), (9, 8)) == "Hot spot"
-    zones = [RoiShape(k + 1, "rect", p, n) for k, (n, p) in enumerate(split_box(ZoneSpec(box=BOX), 640, 480))]
+    zones = [RoiShape(k + 1, "quad", p, n) for k, (n, p) in enumerate(split_box(ZoneSpec(box=BOX), 640, 480))]
     assert map_scale(zones, 640) == 3
     assert map_scale([RoiShape(1, "rect", ((0, 0), (100, 50)), "Big")], 640) == 1
     assert map_scale(zones, 1280) == 1  # never wider than 2000 px

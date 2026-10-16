@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib import font_manager
 
+from .geometry import quad_label_width
 from .models import ROI_COLORS, RoiShape, RoiStats
 from .orientation import Orientation
 from .render import format_tick, legend_colors
@@ -117,6 +118,12 @@ def _draw_rois(
             draw.line((cx, cy - 8, cx, cy + 8), fill=color, width=2)
             draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), outline=color, width=1)
             anchor = (cx - 10, cy - 12)
+        elif shape.kind == "quad" and len(shape.points) == 4:
+            corners = [_flip_point(*point, width, height, orientation) for point in shape.points]
+            draw.line([*corners, corners[0]], fill=color, width=2, joint="curve")
+            first = (min(x for x, _y in corners), min(y for _x, y in corners))
+            second = (max(x for x, _y in corners), max(y for _x, y in corners))
+            anchor = (first[0], first[1] - 4)
         elif len(shape.points) == 2:
             first = _flip_point(*shape.points[0], width, height, orientation)
             second = _flip_point(*shape.points[1], width, height, orientation)
@@ -137,7 +144,10 @@ def _draw_rois(
         else:
             continue
         if with_names:
-            text = _fitting_label(draw, shape, first, second) if shape.kind in ("rect", "ellipse") else shape.name
+            if shape.kind == "quad":  # the room of its upper side, not of the box around a leaning zone
+                first, second = (0.0, 0.0), (quad_label_width(corners), 0.0)
+            text = (_fitting_label(draw, shape, first, second) if shape.kind in ("rect", "ellipse", "quad")
+                    else shape.name)
             if text is not None:
                 _draw_label(draw, text, anchor, anchor="ls", size=12, outline=color)
 

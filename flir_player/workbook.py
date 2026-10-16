@@ -571,7 +571,7 @@ class _Writer:
             src, name = layout.src, layout.name
             layout.settings_row = r
             roi = layout.roi
-            kinds = {"cursor": "Spot", "rect": "Box", "ellipse": "Ellipse", "line": "Line"}
+            kinds = {"cursor": "Spot", "rect": "Box", "ellipse": "Ellipse", "line": "Line", "quad": "Zone"}
             put(r, 0, layout.number, self.f_int)
             put(r, 1, layout.source.label)
             put(r, 2, roi.shape.name)
@@ -939,7 +939,7 @@ class _Writer:
         self.tc_layouts = [layout for layout in self.layouts if self._has_tc(layout)]
         self._refs["MATCH_FROM"], self._refs["MATCH_TO"] = _abs(MATCH, 8, 1), _abs(MATCH, 9, 1)
         if self._tc_only_paired and len(self.tc_layouts) < len(self.layouts):
-            ws.write(5, 3, "Only the ROIs the TC fit paired with a TC are compared here.", self.f_note)
+            ws.write(5, 3, "Only the ROIs paired with a TC are compared here.", self.f_note)
         ws.write(6, 0, "Use (yellow, 1 or 0) picks each ROI's rows for the Emissivity Match; Fit row shows the "
                        "rows it counts (also IR and TC present, IR in the camera's calibrated range, inside its "
                        "window).", self.f_note)

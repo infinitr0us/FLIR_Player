@@ -1,18 +1,26 @@
 # SPDX-FileCopyrightText: 2026 Yuchuan Li <Yuchuan.Li@outlook.com>
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Cell zones: one box split into equal boxes, and which zone each TC sits in (Qt-free).
+"""Cell zones: one box split into a row of four-sided zones, and which zone each TC sits in (Qt-free).
 
-A battery module seen from the side is a row of cells. Splitting a box drawn over the row into
-equal boxes gives one zone per cell, numbered from the chosen end (the heater end on the fire
-tests). Equal widths assume the camera faces the row square on. A row that runs at a slant in the
-picture (a camera looking along the module from above) is followed by giving its rows at the box's
-last column as well: each zone keeps the box's columns for its cell and takes the row's rows at its
-own centre, so the zones step along the slant and stay plain boxes.
+A battery module seen from the side is a row of cells. Splitting a box drawn over the row gives one
+zone per cell, numbered from the chosen end (the heater end on the fire tests). The box's columns
+give the row's length and its rows the band's rows at its first column; a row that runs at a slant
+in the picture also gets the band's rows at the box's last column, and the band's edges run straight
+between the two. The dividers between cells cross the band upright, or lean by a set number of
+pixels where the camera sees the module at an angle (the "twist" of the 3D view). Cells are equal in
+width, or narrow towards the far end when the camera's distance to each end of the row is given (a
+perspective view). Single dividers can be moved by hand afterwards.
+
+Zones are quads ("quad" ROIs): corners on pixel boundaries, (low-side first-edge, high-side
+first-edge, high-side second-edge, low-side second-edge) where "low" is the box's left (top) end
+and the first edge is the band's top (left, for a split along the rows). An upright zone covers the
+same pixels as the box with its corners. Positions are computed in exact fractions, rounded half up.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Mapping, Sequence
 
 from .geometry import roi_coordinates
@@ -20,11 +28,13 @@ from .geometry import roi_coordinates
 ENDS = ("right", "left", "top", "bottom")  # where zone 1 is
 MAX_ZONES = 200  # the split dialog's limits, also for zone groups read from a saved set
 MAX_GAP = 20
+MAX_LEAN = 200  # pixels a divider may lean across the band
+ZONE_KIND = "quad"
 
 
 @dataclass(frozen=True, slots=True)
 class ZoneSpec:
-    """How a box was split; kept so the zones can be re-split or joined back."""
+    """How a box was split; kept so the zones can be re-split, adjusted or joined back."""
 
     box: tuple[tuple[float, float], tuple[float, float]]  # (left, top), (right, bottom)
     count: int = 18
@@ -34,6 +44,15 @@ class ZoneSpec:
     # the zones' rows (top, bottom) at the box's last column, or their columns (left, right) at its last
     # row for a split along the rows; end exclusive like ``box``. None: the box's own (no slant)
     far: tuple[float, float] | None = None
+    # pixels a divider's end on the band's second edge (bottom; right for a split along the rows) lies along
+    # the row from its end on the first edge (top; left): positive towards the box's right (bottom) end
+    lean: int = 0
+    # the camera's distance to zone 1's end of the row and to the far end (any one unit): cells then narrow
+    # towards the farther end as a perspective view shows them. None: equal widths
+    distances: tuple[float, float] | None = None
+    # dividers moved by hand: (index from the box's left (top) end, 0..count, position on the first edge, on
+    # the second edge), positions along the row in pixel-boundary coordinates of the divider's middle line
+    moved: tuple[tuple[int, float, float], ...] = ()
 
 
 def normalized_box(points) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -66,68 +85,137 @@ def normalized_far(spec: ZoneSpec) -> tuple[int, int]:
 
 
 def _spans(low: int, high: int, count: int, gap: int) -> tuple[list[int], list[int]]:
-    """(starts, ends) of ``count`` zones over pixels low..high-1, ascending, end exclusive.
-
-    Inner boundary j: the lower zone ends at ends[j], the upper one starts ``gap`` later (the gap centred
-    on the boundary); the box's ends lose half a gap too (the module's ends are mixed pixels as well), so
-    every zone is as wide, to a pixel.
-    """
+    """(starts, ends) of ``count`` equal zones over pixels low..high-1, ascending, end exclusive (upright,
+    no perspective: the shortest box the zones fit in, for the error message)."""
     step = (high - low) / count
     ends = [math.floor(low + j * step - gap / 2 + 0.5) for j in range(1, count)]
     return [low + gap // 2] + [end + gap for end in ends], ends + [high - gap // 2]
 
 
-def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = None
-              ) -> list[tuple[str, tuple[tuple[float, float], tuple[float, float]]]]:
-    """(name, box corners) of each zone, zone 1 at ``spec.start``.
+@dataclass(frozen=True, slots=True)
+class _Band:
+    along_x: bool  # zones side by side along x (zone 1 at the right or left end)
+    low: int  # the box's first and end-exclusive last pixel along the row
+    high: int
+    near: tuple[int, int]  # the band's first and second edge across the row at ``low``
+    far: tuple[int, int]  # ... at ``high``
 
-    Zone edges lie on pixel boundaries (box coverage would otherwise round ties apart).
-    ``spec.gap`` whole pixel columns (rows, for a vertical split) are left out at each inner
-    boundary, centred on it, so the mixed pixels where two cells meet belong to no zone; the box's
-    ends lose half a gap (rounded down) each. Zone sizes differ by at most one pixel. With ``spec.far`` (rounded
-    to whole pixels like the box's corners), the zones' rows (columns) run in a straight line from
-    the box's at its first column (row) to ``spec.far`` at its last, each zone taking them at its
-    centre, rounded half up. Raises
-    ValueError when the box is too small for the zones, or, given the image size, when a zone
-    covers no pixel.
-    """
+    def edge(self, which: int, along: int) -> int:
+        """The band's edge ``which`` (0 first, 1 second) across the row at ``along``, rounded half up."""
+        n, f = self.near[which], self.far[which]
+        if n == f:
+            return n
+        value = n + Fraction((f - n) * (along - self.low), self.high - self.low)
+        return math.floor(value + Fraction(1, 2))
+
+    def point(self, along: int, across: int) -> tuple[float, float]:
+        return (float(along), float(across)) if self.along_x else (float(across), float(along))
+
+
+def _band(spec: ZoneSpec) -> _Band:
     if spec.start not in ENDS:
         raise ValueError(f"Zone 1 must be at one of: {', '.join(ENDS)}")
     if not (isinstance(spec.count, int) and spec.count >= 1):
         raise ValueError("The number of zones must be a whole number from 1")
     if not (isinstance(spec.gap, int) and spec.gap >= 0):
         raise ValueError("The gap between zones must be a whole number of pixels, not negative")
+    if not (isinstance(spec.lean, int) and abs(spec.lean) <= MAX_LEAN):
+        raise ValueError(f"The lean must be a whole number of pixels from -{MAX_LEAN} to {MAX_LEAN}")
     (left, top), (right, bottom) = normalized_box(spec.box)
     if right <= left or bottom <= top:
         raise ValueError("The box covers no pixel")
     along_x = spec.start in ("right", "left")
     low, high = (int(left), int(right)) if along_x else (int(top), int(bottom))
-    near = (int(top), int(bottom)) if along_x else (int(left), int(right))  # across, at the first column (row)
+    near = (int(top), int(bottom)) if along_x else (int(left), int(right))
     far = normalized_far(spec) if spec.far is not None else near
-    starts, ends = _spans(low, high, spec.count, spec.gap)
-    if any(end <= start for start, end in zip(starts, ends)):
-        shortest = next((n for n in range(high - low + 1, spec.count * (spec.gap + 2) + 2)
-                         if all(e > a for a, e in zip(*_spans(0, n, spec.count, spec.gap)))),
-                        spec.count * (spec.gap + 1))
-        raise ValueError(f"{spec.count} zones with a {spec.gap} px gap need a box at least "
-                         f"{shortest} px long; this one is {high - low} px")
-    ascending = list(zip(starts, ends))
-    if spec.start in ("right", "bottom"):
-        ascending.reverse()
+    return _Band(along_x, low, high, near, far)
+
+
+def perspective_ratio(spec: ZoneSpec) -> Fraction | None:
+    """Far end's distance over zone 1's end's (``spec.distances``), or None for equal widths.
+
+    Raises ValueError when the distances are not two positive finite numbers."""
+    if spec.distances is None:
+        return None
+    try:
+        first, last = (float(v) for v in spec.distances)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The camera distances must be two numbers") from exc
+    if not (math.isfinite(first) and math.isfinite(last) and first > 0 and last > 0):
+        raise ValueError("The camera distances must be positive numbers")
+    return Fraction(last) / Fraction(first)
+
+
+def divider_positions(spec: ZoneSpec) -> list[tuple[Fraction, Fraction]]:
+    """Each divider's middle line, from the box's low end (index 0) to its high end (``spec.count``): its
+    position along the row on the band's first and second edge, in pixel-boundary coordinates.
+
+    Dividers split the row's length equally, or in perspective (``spec.distances``): a point a fraction u of
+    the row's length from zone 1's end shows at u (1 + k) / (1 + k u) of its length in the picture, k = far
+    distance / near distance - 1 (a straight row at depths growing linearly along it). Each leans by
+    ``spec.lean`` about the band's middle; dividers moved by hand (``spec.moved``) keep their own positions.
+    """
+    band = _band(spec)
+    ratio = perspective_ratio(spec)
+    k = ratio - 1 if ratio is not None else Fraction(0)
+    length = band.high - band.low
+    half_lean = Fraction(spec.lean, 2)
+    from_high = spec.start in ("right", "bottom")  # zone 1 at the box's high end
+    positions: list[tuple[Fraction, Fraction]] = [(Fraction(0), Fraction(0))] * (spec.count + 1)
+    for j in range(spec.count + 1):  # j-th divider counted from zone 1's end
+        u = Fraction(j, spec.count)
+        shown = u * (1 + k) / (1 + k * u)
+        middle = band.high - shown * length if from_high else band.low + shown * length
+        index = spec.count - j if from_high else j
+        positions[index] = (middle - half_lean, middle + half_lean)
+    for index, first, second in spec.moved:
+        if 0 <= index <= spec.count:
+            positions[index] = (Fraction(first), Fraction(second))
+    return positions
+
+
+def _zone_ends(positions, index: int, edge: int, count: int, gap: int) -> tuple[int, int]:
+    """(first pixel, end) along the row of the zone between dividers ``index`` and ``index + 1`` (from the
+    box's low end) on band edge ``edge``: ``gap`` pixels are left out at each inner divider, centred on it,
+    and the row's ends lose half a gap (rounded down)."""
+    half = Fraction(1, 2)
+    low, high = positions[index][edge], positions[index + 1][edge]
+    start = math.floor(low + half) + gap // 2 if index == 0 else math.floor(low - Fraction(gap, 2) + half) + gap
+    end = math.floor(high + half) - gap // 2 if index + 1 == count else math.floor(high - Fraction(gap, 2) + half)
+    return start, end
+
+
+def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = None
+              ) -> list[tuple[str, tuple[tuple[float, float], ...]]]:
+    """(name, quad corners) of each zone, zone 1 at ``spec.start`` (``ZONE_KIND`` ROIs).
+
+    Corners lie on pixel boundaries: along the row where each divider meets the band's edges (``gap`` whole
+    pixels left out at each inner divider, centred on it; the row's ends lose half a gap, rounded down), and
+    across it on the band's straight edges, rounded half up. Raises ValueError when a zone would be less than
+    a pixel wide on either edge or, given the image size, would cover no pixel.
+    """
+    band = _band(spec)
+    positions = divider_positions(spec)
+    count, gap = spec.count, spec.gap
+    ends = [[_zone_ends(positions, i, edge, count, gap) for edge in (0, 1)] for i in range(count)]
+    narrow = next((i for i, pair in enumerate(ends) if any(b <= a for a, b in pair)), None)
+    if narrow is not None:
+        if spec.distances is None and not spec.moved:
+            shortest = next((n for n in range(band.high - band.low + 1, count * (gap + 2) + 2 + abs(spec.lean))
+                             if all(e > a for a, e in zip(*_spans(0, n, count, gap)))), count * (gap + 1))
+            raise ValueError(f"{count} zones with a {gap} px gap need a box at least "
+                             f"{shortest} px long; this one is {band.high - band.low} px")
+        number = count - narrow if spec.start in ("right", "bottom") else narrow + 1
+        raise ValueError(f"{' '.join(spec.prefix.split()) or 'Zone'} {number} would be less than a pixel wide: "
+                         "move its dividers apart, or use fewer zones or a smaller gap")
+    order = range(count - 1, -1, -1) if spec.start in ("right", "bottom") else range(count)
     prefix = " ".join(spec.prefix.split()) or "Zone"
     zones = []
-    for k, (lo, hi) in enumerate(ascending):
-        a, b = near
-        if far != near:
-            # across the split at this zone's centre, n + (f - n) * (lo + hi - 2 low) / (2 (high - low)),
-            # rounded half up in whole numbers: a band of constant height keeps its height in every zone
-            # (floats can land a hair below a .5), and one a pixel or more tall at both ends covers a pixel
-            den = 2 * (high - low)
-            t = lo + hi - 2 * low
-            a, b = ((2 * (n * den + (f - n) * t) + den) // (2 * den) for n, f in zip(near, far))
-        lo, hi, a, b = float(lo), float(hi), float(a), float(b)
-        points = ((lo, a), (hi, b)) if along_x else ((a, lo), (b, hi))
-        zones.append((f"{prefix} {k + 1}", points))
+    for number, i in enumerate(order, start=1):
+        (a0, b0), (a1, b1) = ends[i]
+        corners = (band.point(a0, band.edge(0, a0)), band.point(b0, band.edge(0, b0)),
+                   band.point(b1, band.edge(1, b1)), band.point(a1, band.edge(1, a1)))
+        zones.append((f"{prefix} {number}", corners))
     if width is not None and height is not None:
         for name, points in zones:
             if not _covers(points, height, width):
@@ -135,8 +223,51 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     return zones
 
 
+# --- adjusting zones by hand ------------------------------------------------------------------
+
+
+def zone_index(spec: ZoneSpec, number: int) -> int:
+    """The position from the box's low end (0..count-1) of zone ``number`` (1 = zone 1)."""
+    return spec.count - number if spec.start in ("right", "bottom") else number - 1
+
+
+def corner_divider(spec: ZoneSpec, number: int, corner: int) -> tuple[int, int, Fraction]:
+    """(divider index, band edge, offset) for corner ``corner`` (0-3, as ``split_box`` orders them) of zone
+    ``number``: the divider that corner sits on, and what to add to a position for that corner to get the
+    divider's middle line (half a gap, as ``_zone_ends`` leaves it out)."""
+    index = zone_index(spec, number)
+    high_side = corner in (1, 2)
+    divider = index + 1 if high_side else index
+    edge = 0 if corner in (0, 1) else 1
+    outer = divider in (0, spec.count)
+    half_gap = Fraction(spec.gap // 2) if outer else Fraction(spec.gap, 2)
+    return divider, edge, half_gap if high_side else -half_gap
+
+
+def move_divider(spec: ZoneSpec, divider: int, edge: int, position) -> ZoneSpec:
+    """``spec`` with one end of divider ``divider`` (index from the box's low end) at ``position`` along the
+    row; its other end stays where it is. Raises ValueError for a divider index the spec does not have."""
+    if not 0 <= divider <= spec.count or edge not in (0, 1):
+        raise ValueError("No such divider")
+    positions = divider_positions(spec)
+    ends = list(positions[divider])
+    ends[edge] = Fraction(position)
+    kept = tuple(m for m in spec.moved if m[0] != divider)
+    moved = tuple(sorted(kept + ((divider, float(ends[0]), float(ends[1])),)))
+    return replace(spec, moved=moved)
+
+
+def translate_spec(spec: ZoneSpec, dx: int, dy: int) -> ZoneSpec:
+    """``spec`` moved by whole pixels (``dx`` columns, ``dy`` rows): box, slant and moved dividers alike."""
+    (x0, y0), (x1, y1) = spec.box
+    along, across = (dx, dy) if spec.start in ("right", "left") else (dy, dx)
+    far = None if spec.far is None else (spec.far[0] + across, spec.far[1] + across)
+    moved = tuple((index, first + along, second + along) for index, first, second in spec.moved)
+    return replace(spec, box=((x0 + dx, y0 + dy), (x1 + dx, y1 + dy)), far=far, moved=moved)
+
+
 def _covers(points, height: int, width: int) -> bool:
-    probe = _Probe("rect", tuple(points))
+    probe = _Probe(ZONE_KIND if len(points) == 4 else "rect", tuple(points))
     return roi_coordinates(probe, height, width)[0].size > 0
 
 

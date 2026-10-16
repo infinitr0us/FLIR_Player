@@ -23,6 +23,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QTextOption,
 )
 from PySide6.QtWidgets import (
@@ -63,7 +64,7 @@ from PySide6.QtWidgets import (
 
 from .settings import app_settings
 from .fff import describe_parameters
-from .geometry import area_extent, pixel_index
+from .geometry import area_extent, pixel_index, quad_label_width
 from .models import ROI_COLORS, ROI_KIND_LABELS, CadenceInfo, UnitOption, VideoMetadata
 from .orientation import Orientation
 from .zones import short_label
@@ -593,6 +594,7 @@ class ThermalCanvas(QWidget):
     roi_drawn = Signal(str, object)
     roi_selected = Signal(object)
     roi_moved = Signal(object)
+    rois_moved = Signal(object)  # several ROIs changed by one drag (the drag hook's result)
     roi_delete_requested = Signal(object)
 
     EMPTY_HINT = "Drop a recording onto the window or press Ctrl+O to browse"
@@ -616,6 +618,10 @@ class ThermalCanvas(QWidget):
         self._draft: tuple[str, tuple[float, float], tuple[float, float]] | None = None
         self._drag: dict | None = None
         self._drag_shape = None
+        # (shape, handle, image position, start position) -> {id: shape} of every ROI a drag moves, or None for
+        # a plain one-ROI drag; set by the window for cell zones (a divider moves two zones, a body all of them)
+        self._drag_hook = None
+        self._drag_overrides: dict = {}
         self._show_markers = False
         self._marker_image: tuple = (None, None)
         self._marker_rois: tuple = ()
@@ -807,6 +813,7 @@ class ThermalCanvas(QWidget):
         self._draft = None
         self._drag = None
         self._drag_shape = None
+        self._drag_overrides = {}
         self._zoom = None
         self._pan = QPointF(0, 0)
         self._pan_drag = None
@@ -820,6 +827,11 @@ class ThermalCanvas(QWidget):
         self._rois = list(rois)
         self._selected_roi = selected_id
         self.update()
+
+    def set_drag_hook(self, hook) -> None:
+        """``hook(shape, handle, image_pos, start_pos)`` -> {id: shape} for drags that move several ROIs
+        (shown live, sent as ``rois_moved`` on release), or None to drag the one ROI as usual."""
+        self._drag_hook = hook
 
     def set_roi_tool(self, tool: str) -> None:
         # The cursor readout stays live in every tool: while placing an ROI is
@@ -1143,6 +1155,12 @@ class ThermalCanvas(QWidget):
         if kind == "cursor" and len(points) == 1:
             x, y = pixel_index(kind, *points[0], width, height)
             return f"x {x}  y {y}  ·  {format_value(float(self._raw[y, x]), self._suffix)}"
+        if kind == "quad":
+            extent = area_extent(kind, points, height, width)
+            if extent is None:
+                return "no pixels"
+            x_min, x_max, y_min, y_max, count = extent
+            return f"x {x_min}–{x_max}  y {y_min}–{y_max}  ·  {count} pixels"
         if len(points) != 2:
             return ""
         (x0, y0), (x1, y1) = (pixel_index(kind, x, y, width, height) for x, y in points)
@@ -1236,7 +1254,9 @@ class ThermalCanvas(QWidget):
     def _paint_rois(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for shape in self._rois:
-            if self._drag_shape is not None and shape.id == self._drag["id"]:
+            if shape.id in self._drag_overrides:
+                shape = self._drag_overrides[shape.id]
+            elif self._drag_shape is not None and shape.id == self._drag["id"]:
                 shape = self._drag_shape
             selected = shape.id == self._selected_roi
             color = QColor(ROI_COLORS[shape.id % len(ROI_COLORS)])
@@ -1280,6 +1300,9 @@ class ThermalCanvas(QWidget):
             )
             painter.drawEllipse(center, 3, 3)
             return
+        if kind == "quad" and len(points) == 4:
+            painter.drawPolygon(QPolygonF([self._image_to_widget(*point) for point in points]))
+            return
         if len(points) != 2:
             return
         first = self._image_to_widget(*points[0])
@@ -1316,11 +1339,17 @@ class ThermalCanvas(QWidget):
         ("Cell 7" → "7", so cell zones stay readable), or none until zoomed in. Other names and
         the selected ROI keep their full label."""
         short = short_label(shape.name)
-        if selected or short is None or shape.kind not in ("rect", "ellipse") or len(shape.points) != 2:
+        if selected or short is None or shape.kind not in ("rect", "ellipse", "quad"):
             return shape.name
-        first = self._image_to_widget(*shape.points[0])
-        second = self._image_to_widget(*shape.points[1])
-        width = abs(second.x() - first.x())
+        if shape.kind == "quad" and len(shape.points) == 4:
+            corners = [self._image_to_widget(*point) for point in shape.points]
+            width = quad_label_width([(c.x(), c.y()) for c in corners])
+        elif len(shape.points) == 2:
+            first = self._image_to_widget(*shape.points[0])
+            second = self._image_to_widget(*shape.points[1])
+            width = abs(second.x() - first.x())
+        else:
+            return shape.name
         if metrics.horizontalAdvance(shape.name) + 12 <= width:
             return shape.name
         return short if metrics.horizontalAdvance(short) + 12 <= width + 2 else None
@@ -1329,6 +1358,8 @@ class ThermalCanvas(QWidget):
         if shape.kind == "cursor" and len(shape.points) == 1:
             point = self._image_to_widget(*shape.points[0])
             return QPointF(point.x() - 8, point.y() - 10)
+        if shape.kind == "quad" and len(shape.points) == 4:
+            return QPolygonF([self._image_to_widget(*point) for point in shape.points]).boundingRect().topLeft()
         if len(shape.points) == 2:
             first = self._image_to_widget(*shape.points[0])
             second = self._image_to_widget(*shape.points[1])
@@ -1339,6 +1370,8 @@ class ThermalCanvas(QWidget):
     # --- hit testing ----------------------------------------------------------
 
     def _handles_for(self, shape) -> list[tuple[str, QPointF]]:
+        if shape.kind == "quad" and len(shape.points) == 4:
+            return [(f"c{k}", self._image_to_widget(*point)) for k, point in enumerate(shape.points)]
         if len(shape.points) != 2 or shape.kind == "cursor":
             return []
         first = self._image_to_widget(*shape.points[0])
@@ -1354,10 +1387,9 @@ class ThermalCanvas(QWidget):
         ]
 
     def _hit_roi(self, wpos) -> tuple[int, str] | None:
-        ordered = sorted(
-            self._rois, key=lambda shape: shape.id != self._selected_roi
-        )
-        for shape in reversed(ordered):
+        # the selected ROI's handles (the ones drawn) first: neighbouring zones' corners lie a gap apart
+        ordered = sorted(reversed(self._rois), key=lambda shape: shape.id != self._selected_roi)
+        for shape in ordered:
             for handle, handle_pos in self._handles_for(shape):
                 if (handle_pos - wpos).manhattanLength() <= _HANDLE_HIT_PX * 2 and (
                     abs(handle_pos.x() - wpos.x()) <= _HANDLE_HIT_PX
@@ -1375,6 +1407,9 @@ class ThermalCanvas(QWidget):
             return (
                 abs(center.x() - wpos.x()) <= 10 and abs(center.y() - wpos.y()) <= 10
             )
+        if shape.kind == "quad" and len(shape.points) == 4:
+            polygon = QPolygonF([self._image_to_widget(*point) for point in shape.points])
+            return polygon.containsPoint(QPointF(wpos), Qt.FillRule.OddEvenFill)
         if len(shape.points) != 2:
             return False
         first = self._image_to_widget(*shape.points[0])
@@ -1470,7 +1505,13 @@ class ThermalCanvas(QWidget):
             kind, anchor, _ = self._draft
             self._draft = (kind, anchor, self._draft_point(kind, wpos))
         elif self._drag is not None and self._drag_shape is not None:
-            self._drag_shape = self._dragged_shape(self._widget_to_image(wpos), self._pixel_center_at(wpos))
+            image_pos = self._widget_to_image(wpos)
+            self._drag_shape = self._dragged_shape(image_pos, self._pixel_center_at(wpos))
+            if self._drag_hook is not None:
+                moved = self._drag_hook(self._drag["orig"], self._drag["handle"], image_pos, self._drag["start"])
+                self._drag_overrides = dict(moved) if moved is not None else {}
+                if self._drag["id"] in self._drag_overrides:
+                    self._drag_shape = self._drag_overrides[self._drag["id"]]
         else:
             self._update_hover_cursor(wpos)
         self._track_pointer(wpos)
@@ -1496,6 +1537,10 @@ class ThermalCanvas(QWidget):
         "sw": Qt.CursorShape.SizeBDiagCursor,
         "p0": Qt.CursorShape.CrossCursor,
         "p1": Qt.CursorShape.CrossCursor,
+        "c0": Qt.CursorShape.CrossCursor,  # quad corners (a zone's: one end of a divider)
+        "c1": Qt.CursorShape.CrossCursor,
+        "c2": Qt.CursorShape.CrossCursor,
+        "c3": Qt.CursorShape.CrossCursor,
     }
 
     def _update_hover_cursor(self, wpos) -> None:
@@ -1579,9 +1624,16 @@ class ThermalCanvas(QWidget):
         if self._drag is not None:
             moved = self._drag_shape
             original = self._drag["orig"]
+            overrides = self._drag_overrides
             self._drag = None
             self._drag_shape = None
-            if moved is not None and moved.points != original.points:
+            self._drag_overrides = {}
+            if overrides:
+                current = {shape.id: shape for shape in self._rois}
+                if any(current.get(roi_id) is None or current[roi_id].points != shape.points
+                       for roi_id, shape in overrides.items()):
+                    self.rois_moved.emit(tuple(overrides.values()))
+            elif moved is not None and moved.points != original.points:
                 self.roi_moved.emit(moved)
             self.update()
             return
@@ -1602,6 +1654,10 @@ class ThermalCanvas(QWidget):
             dx, dy = self._clamped_delta(original.points, dx, dy, 0.5 if pixel_points else 0.0)
             points = tuple((x + dx, y + dy) for x, y in original.points)
             return replace(original, points=points)
+        if drag["handle"] in {"c0", "c1", "c2", "c3"} and len(original.points) == 4:
+            points = list(original.points)
+            points[int(drag["handle"][1])] = image_pos
+            return replace(original, points=tuple(points))
         if drag["handle"] in {"p0", "p1"} and len(original.points) == 2:
             index = 0 if drag["handle"] == "p0" else 1
             points = list(original.points)
@@ -1654,6 +1710,7 @@ class ThermalCanvas(QWidget):
         self._draft = None
         self._drag = None
         self._drag_shape = None
+        self._drag_overrides = {}
         self.update()
 
     def keyPressEvent(self, event) -> None:

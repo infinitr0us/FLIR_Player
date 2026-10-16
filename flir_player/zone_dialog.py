@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Yuchuan Li <Yuchuan.Li@outlook.com>
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Split a box ROI into equal cell zones, previewed on the image while the dialog is open."""
+"""Split a box ROI into cell zones, previewed on the image while the dialog is open."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -8,7 +8,9 @@ from typing import Collection, Mapping
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QGridLayout,
     QLabel,
     QLineEdit,
@@ -19,14 +21,15 @@ from PySide6.QtWidgets import (
 from .models import RoiShape
 from .orientation import Orientation
 from .widgets import ChevronComboBox, FramelessDialog
-from .zones import (ENDS, MAX_GAP, MAX_ZONES, ZoneSpec, far_label, normalized_box, normalized_far, pair_tcs,
-                    split_box)
+from .zones import (ENDS, MAX_GAP, MAX_LEAN, MAX_ZONES, ZONE_KIND, ZoneSpec, far_label, normalized_box,
+                    normalized_far, pair_tcs, perspective_ratio, split_box)
 
 END_LABELS = {"right": "Right end", "left": "Left end", "top": "Top end", "bottom": "Bottom end"}
 
 
 class ZoneSplitDialog(FramelessDialog):
-    """Number of zones, where zone 1 is, the gap between zones, names and the box edges.
+    """Number of zones, where zone 1 is, the gap between zones, names, the box edges, the slant, the
+    dividers' lean and the camera's distance to each end (perspective).
 
     ``preview`` carries the zones as (name, corners) pairs on every valid change, or an empty
     list when the settings cannot be split; ``tc_pixels`` (TC → (row, col)) from a TC fit of the
@@ -47,10 +50,11 @@ class ZoneSplitDialog(FramelessDialog):
         self._tc_pixels = dict(tc_pixels or {})
         self._taken = set(taken)  # names of the other ROIs: zones must not repeat them
         self._zones: list = []
-        intro = QLabel("Equal zones along the box, one per cell. Zone 1 is at the end you choose (the heater end "
-                       "on the fire tests). The gap leaves out the mixed pixels where two cells meet. If the module "
-                       "runs at a slant in the picture, give its rows at the box's last column too: the zones then "
-                       "step along it.")
+        intro = QLabel("One zone per cell along the box. Zone 1 is at the end you choose (the heater end on the "
+                       "fire tests). The gap leaves out the mixed pixels where two cells meet. If the module runs at "
+                       "a slant in the picture, give its rows at the box's last column too. If the cells' dividers "
+                       "lean in the picture, set the lean; if one end of the module is farther from the camera, give "
+                       "both distances. Afterwards a divider can be dragged by a zone's corner.")
         intro.setObjectName("FieldLabel")
         intro.setWordWrap(True)
         self.body.addWidget(intro)
@@ -95,21 +99,54 @@ class ZoneSplitDialog(FramelessDialog):
                             "Otherwise each zone takes the module's rows (columns) at its centre, so the zones "
                             "step along a module that runs at a slant in the picture.")
         self.far_label = QLabel()
+        self.lean_spin = QSpinBox()
+        self.lean_spin.setRange(-MAX_LEAN, MAX_LEAN)
+        self.lean_spin.setSuffix(" px")
+        self.lean_spin.setValue(spec.lean if isinstance(spec.lean, int) and abs(spec.lean) <= MAX_LEAN else 0)
+        self.lean_spin.setToolTip("How far each divider's end on the band's lower edge (right edge, for zones along "
+                                  "the rows) lies along the zones from its end on the upper (left) edge, in pixels. "
+                                  "Positive: towards the box's right (bottom) end. Match it by eye to the cell "
+                                  "edges in the preview.")
+        self.near_distance = self._distance_spin()
+        self.far_distance = self._distance_spin()
+        if spec.distances is not None:
+            try:
+                perspective_ratio(spec)
+                self.near_distance.setValue(float(spec.distances[0]))
+                self.far_distance.setValue(float(spec.distances[1]))
+            except ValueError:
+                pass
+        for spin in (self.near_distance, self.far_distance):
+            spin.setToolTip("The camera's distance to each end of the module, in any one unit (metres, say). With "
+                            "both given, cells narrow towards the farther end as the camera sees them; empty: "
+                            "equal widths.")
+        self._moved = tuple(spec.moved)
+        self._moved_count = spec.count
+        self.keep_moved = QCheckBox()
+        self.keep_moved.setChecked(bool(self._moved))
+        self.keep_moved.setVisible(bool(self._moved))
         rows = (("Zones", self.count_spin), ("Zone 1 at the", self.start_combo), ("Gap between zones", self.gap_spin),
                 ("Names", self.prefix_edit))
         for r, (label, widget) in enumerate(rows):
             grid.addWidget(QLabel(label), r, 0)
             grid.addWidget(widget, r, 1, 1, 3)
-        edge_rows = (("Columns", self.x0, self.x1), ("Rows", self.y0, self.y1), (self.far_label, self.f0, self.f1))
-        for r, (label, first, last) in enumerate(edge_rows, start=len(rows)):
+        edge_rows = (("Columns", self.x0, self.x1, "to"), ("Rows", self.y0, self.y1, "to"),
+                     (self.far_label, self.f0, self.f1, "to"),
+                     ("Camera distance", self.near_distance, self.far_distance, "and"))
+        for r, (label, first, last, between) in enumerate(edge_rows, start=len(rows)):
             grid.addWidget(label if isinstance(label, QLabel) else QLabel(label), r, 0)
             grid.addWidget(first, r, 1)
-            grid.addWidget(QLabel("to"), r, 2)
+            grid.addWidget(QLabel(between), r, 2)
             grid.addWidget(last, r, 3)
+        r = len(rows) + len(edge_rows)
+        grid.addWidget(QLabel("Divider lean"), r, 0)
+        grid.addWidget(self.lean_spin, r, 1)
+        grid.addWidget(self.keep_moved, r + 1, 0, 1, 4)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         self.body.addLayout(grid)
-        edges = QLabel("Columns and rows are the box's first and last pixels, as the image readout shows them.")
+        edges = QLabel("Columns and rows are the box's first and last pixels, as the image readout shows them. "
+                       "Camera distances: at zone 1's end, then at the far end.")
         edges.setObjectName("FieldLabel")
         edges.setWordWrap(True)
         self.body.addWidget(edges)
@@ -137,13 +174,24 @@ class ZoneSplitDialog(FramelessDialog):
             self.button_box.addButton(join, QDialogButtonBox.ButtonRole.ResetRole)
         self.body.addWidget(self.button_box)
 
-        for spin in (self.count_spin, self.gap_spin, self.x0, self.x1, self.y0, self.y1):
+        for spin in (self.count_spin, self.gap_spin, self.x0, self.x1, self.y0, self.y1, self.lean_spin,
+                     self.near_distance, self.far_distance):
             spin.valueChanged.connect(self._update)
+        self.keep_moved.toggled.connect(self._update)
         for spin in (self.f0, self.f1):
             spin.valueChanged.connect(self._far_edited)
         self.start_combo.currentIndexChanged.connect(self._update)
         self.prefix_edit.textChanged.connect(self._update)
         self._sync_far()
+
+    @staticmethod
+    def _distance_spin() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 10000.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.1)
+        spin.setSpecialValueText("not set")  # 0: no perspective
+        return spin
 
     @staticmethod
     def _spin(low: int, high: int, value: int) -> QSpinBox:
@@ -159,9 +207,16 @@ class ZoneSplitDialog(FramelessDialog):
         near = (float(top), float(bottom + 1)) if start in ("right", "left") else (float(left), float(right + 1))
         a, b = sorted((self.f0.value(), self.f1.value()))
         far = (float(a), float(b + 1))
+        first, last = self.near_distance.value(), self.far_distance.value()
+        distances = (first, last) if first > 0 or last > 0 else None
         return ZoneSpec(box=((float(left), float(top)), (float(right + 1), float(bottom + 1))),
                         count=self.count_spin.value(), start=start, gap=self.gap_spin.value(),
-                        prefix=self.prefix_edit.text(), far=None if far == near else far)
+                        prefix=self.prefix_edit.text(), far=None if far == near else far, lean=self.lean_spin.value(),
+                        distances=distances, moved=self._moved if self._keeps_moved() else ())
+
+    def _keeps_moved(self) -> bool:
+        """Dividers moved by hand stay only while the number of zones is the one they were moved in."""
+        return bool(self._moved) and self.keep_moved.isChecked() and self.count_spin.value() == self._moved_count
 
     def _far_edited(self) -> None:
         self._linked = False
@@ -194,9 +249,19 @@ class ZoneSplitDialog(FramelessDialog):
 
     def _update(self) -> None:
         self._sync_far()
+        if self._moved:
+            same = self.count_spin.value() == self._moved_count
+            self.keep_moved.setEnabled(same)
+            count = len(self._moved)
+            self.keep_moved.setText(
+                f"Keep the {count} divider{'s' if count != 1 else ''} moved by hand" if same else
+                f"The {count} divider{'s' if count != 1 else ''} moved by hand cannot be kept with another number "
+                "of zones")
         spec = self.spec()
         ok = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
         try:
+            if spec.distances is not None and min(spec.distances) <= 0:
+                raise ValueError("Give the camera's distance at both ends, or at neither (equal widths)")
             self._zones = split_box(spec, self._width, self._height)
             clash = [name for name, _points in self._zones if name in self._taken]
             if clash:
@@ -214,8 +279,10 @@ class ZoneSplitDialog(FramelessDialog):
         (left, top), (right, bottom) = spec.box
         along = spec.start in ("right", "left")
         length = (right - left) if along else (bottom - top)
-        widths = [(p[1][0] - p[0][0]) if along else (p[1][1] - p[0][1]) for _name, p in self._zones]
-        heights = [(p[1][1] - p[0][1]) if along else (p[1][0] - p[0][0]) for _name, p in self._zones]
+        a, c = (0, 1) if along else (1, 0)  # along the zones, across them
+        # a zone's size where the band's middle line crosses it: the mean of its two edges
+        widths = [round(((p[1][a] - p[0][a]) + (p[2][a] - p[3][a])) / 2, 1) for _name, p in self._zones]
+        heights = [round(((p[3][c] - p[0][c]) + (p[2][c] - p[1][c])) / 2, 1) for _name, p in self._zones]
 
         def span(values) -> str:
             return f"{min(values):g}" if min(values) == max(values) else f"{min(values):g}-{max(values):g}"
@@ -227,11 +294,18 @@ class ZoneSplitDialog(FramelessDialog):
             ends = (left, right - 1) if along else (top, bottom - 1)
             kind, at = ("Rows", "column") if along else ("Columns", "row")
             text += (f" {kind} {near[0]:g}-{near[1] - 1:g} at {at} {ends[0]:g}, "
-                     f"{spec.far[0]:g}-{spec.far[1] - 1:g} at {at} {ends[1]:g}: the zones step along the slant.")
+                     f"{spec.far[0]:g}-{spec.far[1] - 1:g} at {at} {ends[1]:g}: the zones follow the slant.")
+        if spec.lean:
+            text += f" Dividers lean {abs(spec.lean)} px across the band."
+        if spec.distances is not None:
+            text += (f" Zone 1's end {spec.distances[0]:g}, the far end {spec.distances[1]:g} from the camera: "
+                     "the zones narrow towards the farther end.")
+        if spec.moved:
+            text += f" {len(spec.moved)} divider{'s' if len(spec.moved) != 1 else ''} moved by hand."
         self.info_label.setStyleSheet("")
         self.info_label.setText(text)
         if self._tc_pixels:
-            shapes = [RoiShape(k + 1, "rect", points, name) for k, (name, points) in enumerate(self._zones)]
+            shapes = [RoiShape(k + 1, ZONE_KIND, points, name) for k, (name, points) in enumerate(self._zones)]
             pairing = pair_tcs(self._tc_pixels, shapes, self._height, self._width)
             self.tc_label.setText("TC pixels from the last fit: " + pairing.describe() + ".")
         ok.setEnabled(True)

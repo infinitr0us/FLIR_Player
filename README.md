@@ -96,8 +96,10 @@ all decoding work off the GUI thread.
   finds each thermocouple's pixel and the logger's time offset, fits the
   emissivity per TC where IR and TC can be compared, and hands the result to
   the player (ROIs, ignition frame, emissivity) or to an Excel workbook.
-- Cell zones: split a box drawn over a battery module into equal zones, one per
-  cell (18 by default, numbered from the heater end), and find one emissivity
+- Cell zones: split a box drawn over a battery module into zones, one per cell
+  (18 by default, numbered from the heater end), that follow a slanted module,
+  dividers that lean in the picture and the camera's distance to each end
+  (perspective), with dividers that can be dragged; and find one emissivity
   for all of them in the workbook: an Emissivity Match sheet gives the error
   between the zones and their thermocouples for every emissivity between two
   limits (0.90 to 0.98 to start).
@@ -418,8 +420,16 @@ For a battery module seen from the side:
    6 and 9. If the module runs at a slant in the picture (a camera looking
    along it from above), draw the box over the row of cells at its left end and
    type the row's first and last pixel rows at the box's last column under
-   *Rows at the last column*: each zone then takes the rows at its own centre,
-   so the zones step along the slant.
+   *Rows at the last column*: the zones' upper and lower edges then run
+   straight along the slant. Zones are four-sided: if the dividers between cells
+   lean in the picture (the module seen at an angle), set *Divider lean*, the
+   pixels a divider's lower end lies along the row from its upper end (watch the
+   preview); if one end of the module is farther from the camera, give both
+   *Camera distance* values (zone 1's end, then the far end, in any one unit)
+   and the zones narrow towards the farther end. After the split, drag a zone's
+   corner to move that divider along the row (the zones on both sides follow),
+   or drag a zone to move all of them; re-splitting keeps dividers moved by hand
+   while the number of zones stays the same.
 3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
    ticked: each TC is paired with its zone, the logger data sit at the fitted
    time offset, and Use = 1 marks the seconds the fit used (no flames on the TC,

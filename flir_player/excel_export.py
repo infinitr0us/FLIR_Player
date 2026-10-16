@@ -50,13 +50,14 @@ from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, count_status
 from .fff import saved_object_parameters
 from .sdktime import TimestampRepair, recording_rate, superframing
-from .zones import ENDS as ZONE_ENDS, MAX_GAP, MAX_ZONES, ZoneSpec
+from .zones import ENDS as ZONE_ENDS, MAX_GAP, MAX_LEAN, MAX_ZONES, ZoneSpec
 
 ROI_SET_FORMAT = "flir-player-roi-set"
 EXCEL_COLUMNS = 16_384
 AREA_STATS = ("mean", "max", "min")
 EXTRA_STATS = ("median", "p95")
-ROI_KINDS = ("cursor", "rect", "ellipse", "line")
+ROI_KINDS = ("cursor", "rect", "ellipse", "line", "quad")
+ROI_POINTS = {"cursor": 1, "quad": 4}  # points per kind; the others take 2
 
 
 # --- ROI sets -----------------------------------------------------------------------
@@ -65,7 +66,7 @@ ROI_KINDS = ("cursor", "rect", "ellipse", "line")
 @dataclass(frozen=True, slots=True)
 class ZoneGroup:
     """Zones split from one box (``zones.split_box``): their positions in the ROI set, how they
-    were split, and the box's name, so the player can re-split them or join them back."""
+    were split, and the box's name, so the player can re-split, adjust or join them back."""
 
     rois: tuple[int, ...]
     spec: ZoneSpec
@@ -102,9 +103,34 @@ def save_roi_set(path: str | Path, roi_set: RoiSet) -> None:
         payload["zone_groups"] = [{"rois": list(group.rois), "name": group.name,
                                    "box": [list(corner) for corner in group.spec.box], "count": group.spec.count,
                                    "start": group.spec.start, "gap": group.spec.gap, "prefix": group.spec.prefix,
-                                   **({"far": list(group.spec.far)} if group.spec.far is not None else {})}
+                                   **_zone_extras(group.spec)}
                                   for group in roi_set.zone_groups]
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _zone_extras(spec: ZoneSpec) -> dict:
+    """A zone group's optional settings, written only when set (sets stay readable by 0.7.x when unused)."""
+    extras: dict = {}
+    if spec.far is not None:
+        extras["far"] = list(spec.far)
+    if spec.lean:
+        extras["lean"] = spec.lean
+    if spec.distances is not None:
+        extras["distances"] = [float(v) for v in spec.distances]
+    if spec.moved:
+        extras["moved"] = [[int(index), float(first), float(second)] for index, first, second in spec.moved]
+    return extras
+
+
+def _numbers(value, count: int) -> tuple[float, ...]:
+    """``count`` finite JSON numbers (not booleans) as floats; ValueError otherwise."""
+    if not (isinstance(value, list) and len(value) == count
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+        raise ValueError("not numbers")
+    numbers = tuple(float(v) for v in value)
+    if not all(math.isfinite(v) for v in numbers):
+        raise ValueError("not finite")
+    return numbers
 
 
 def load_roi_set(path: str | Path) -> RoiSet:
@@ -124,7 +150,7 @@ def load_roi_set(path: str | Path) -> RoiSet:
             label = str(item.get("name") or f"ROI {number}")
         except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"ROI {number} in {name} is not valid") from exc
-        if (kind not in ROI_KINDS or len(points) != (1 if kind == "cursor" else 2)
+        if (kind not in ROI_KINDS or len(points) != ROI_POINTS.get(kind, 2)
                 or not all(math.isfinite(v) for point in points for v in point)):
             raise ValueError(f"ROI {number} in {name} is not valid")
         # names are shown on one line (readout badge, workbook headers)
@@ -144,8 +170,23 @@ def load_roi_set(path: str | Path) -> RoiSet:
                         and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in far)):
                     raise ValueError("far")
                 far = tuple(sorted(float(v) for v in far))
+            lean = item.get("lean", 0)  # 0.8.0 on: dividers leaning across the band
+            if isinstance(lean, bool) or not isinstance(lean, int) or abs(lean) > MAX_LEAN:
+                raise ValueError("lean")
+            distances = item.get("distances")  # 0.8.0 on: perspective widths
+            if distances is not None:
+                distances = _numbers(distances, 2)
+                if min(distances) <= 0:
+                    raise ValueError("distances")
+            moved = []  # 0.8.0 on: dividers moved by hand
+            for entry in item.get("moved") or []:
+                if not (isinstance(entry, list) and len(entry) == 3 and isinstance(entry[0], int)
+                        and not isinstance(entry[0], bool)):
+                    raise ValueError("moved")
+                moved.append((entry[0], *_numbers(entry[1:], 2)))
             spec = ZoneSpec(box=((x0, y0), (x1, y1)), count=int(item["count"]), start=str(item["start"]),
-                            gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")), far=far)
+                            gap=int(item["gap"]), prefix=str(item.get("prefix", "Cell")), far=far, lean=lean,
+                            distances=distances, moved=tuple(sorted(moved)))
             label = str(item.get("name") or "Box")
         except (TypeError, KeyError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"Zone group {number} in {name} is not valid") from exc
@@ -153,7 +194,9 @@ def load_roi_set(path: str | Path) -> RoiSet:
                 or spec.start not in ZONE_ENDS or not 1 <= spec.count <= MAX_ZONES or not 0 <= spec.gap <= MAX_GAP
                 or not all(math.isfinite(v) for v in (x0, y0, x1, y1))
                 or (far is not None and (len(far) != 2 or not all(math.isfinite(v) for v in far)
-                                         or far[1] <= far[0]))):
+                                         or far[1] <= far[0]))
+                or len({index for index, _a, _b in spec.moved}) != len(spec.moved)
+                or not all(0 <= index <= spec.count for index, _a, _b in spec.moved)):
             raise ValueError(f"Zone group {number} in {name} is not valid")
         groups.append(ZoneGroup(rois=members, spec=spec, name=label))
     try:
@@ -662,6 +705,8 @@ def map_scale(rois, width: int, narrowest: float = 24.0, max_width: int = 2000) 
     (room for a zone number), at most 3× and ``max_width`` px."""
     widths = [abs(shape.points[1][0] - shape.points[0][0]) for shape in rois
               if shape.kind in ("rect", "ellipse") and len(shape.points) == 2]
+    widths += [max(x for x, _y in shape.points) - min(x for x, _y in shape.points) for shape in rois
+               if shape.kind == "quad" and len(shape.points) == 4]
     widths = [w for w in widths if w > 0]
     if not widths or min(widths) >= narrowest:
         return 1

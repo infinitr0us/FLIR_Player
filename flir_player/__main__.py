@@ -86,14 +86,14 @@ def main(argv: list[str] | None = None) -> int:
 
             from .excel_export import ExportOptions
             from .models import RoiShape
-            from .zones import ZoneSpec, split_box
+            from .zones import ZONE_KIND, ZoneSpec, split_box
 
             metadata = window.metadata
             dest = Path(tempfile.gettempdir()) / "flir-smoke-export.xlsx"
             dest.unlink(missing_ok=True)
             x, y = metadata.width // 2, metadata.height // 2
             spot = RoiShape(1, "cursor", ((x + 0.5, y + 0.5),), "Smoke")
-            zones = [RoiShape(k + 2, "rect", points, name) for k, (name, points) in enumerate(
+            zones = [RoiShape(k + 2, ZONE_KIND, points, name) for k, (name, points) in enumerate(
                 split_box(ZoneSpec(box=((x - 12, y - 4), (x + 12, y + 4)), count=3), metadata.width, metadata.height))]
             window.decoder.export_finished.connect(
                 lambda ok, _message: exercise_tc() if ok and dest.is_file() else finish(6))

@@ -25,7 +25,7 @@ FAR = (358.0, 375.0)
 
 
 def _shapes(zones):
-    return [RoiShape(id=k + 1, kind="rect", points=points, name=name) for k, (name, points) in enumerate(zones)]
+    return [RoiShape(id=k + 1, kind="quad", points=points, name=name) for k, (name, points) in enumerate(zones)]
 
 
 def _cells(shape):
@@ -33,22 +33,24 @@ def _cells(shape):
     return sorted(set(xs.tolist())), sorted(set(ys.tolist()))
 
 
-def test_t1_zones_step_along_the_slant_and_keep_the_upright_split_columns() -> None:
+def test_t1_zones_follow_the_slant_and_keep_the_upright_split_columns() -> None:
+    # 0.8.0: the band's edges run straight from the box's rows to the slant's (0.7.4 stepped them zone by zone)
     flat = _shapes(split_box(ZoneSpec(box=BOX), W, H))
     slanted = _shapes(split_box(ZoneSpec(box=BOX, far=FAR), W, H))
     assert [s.name for s in slanted] == [f"Cell {k}" for k in range(1, 19)]
-    tops = []
+    tops = {}
     for f, s in zip(flat, slanted):
         f_cols, _f_rows = _cells(f)
-        s_cols, s_rows = _cells(s)
+        s_cols, _s_rows = _cells(s)
         assert s_cols == f_cols  # the cells along the module are the same
-        assert len(s_rows) == 17  # the band keeps its height
-        tops.append(s_rows[0])
-    # cell 1 (heater end, right) is highest; every step towards the far end goes down by 1-3 rows
-    assert tops == sorted(tops)
-    steps = [b - a for a, b in zip(tops, tops[1:])]
-    assert all(1 <= d <= 3 for d in steps), steps
-    assert 358 <= tops[0] <= 360 and 386 <= tops[-1] <= 388
+        ys, xs = roi_coordinates(s, H, W)
+        for column in set(xs.tolist()):
+            rows = sorted(ys[xs == column].tolist())
+            assert len(rows) == 17 and rows == list(range(rows[0], rows[0] + 17))  # the band keeps its height
+            tops[column] = rows[0]
+    # the band's top runs straight from row 388 at column 160 to 358 at the box's end (column 432)
+    for column, top in tops.items():
+        assert abs(top - (388 + (358 - 388) * (column + 0.5 - 160) / 272)) <= 1.0, (column, top)
     # T2's pixel from the fit (row 382, column 349) lands in cell 6; the upright box's cell 6 misses it
     assert pair_tcs({"T2": (382, 349)}, slanted, H, W).pairs == {"T2": "Cell 6"}
     assert pair_tcs({"T2": (382, 349)}, flat, H, W).outside == ["T2"]
@@ -109,7 +111,7 @@ def test_t6_the_dialog_follows_the_box_until_the_slant_is_set(qapp) -> None:
     assert "T2 → Cell 6" in dialog.tc_label.text()
     info = dialog.info_label.text()
     assert "18 zones of 14-15 × 17 pixels" in info
-    assert "Rows 388-404 at column 160, 358-374 at column 431" in info and "step along the slant" in info
+    assert "Rows 388-404 at column 160, 358-374 at column 431" in info and "follow the slant" in info
     dialog.y1.setValue(406)  # set by hand: the slant row stays where it was
     assert dialog.spec().far == FAR
     # turning the split to run along the rows: the slant row now gives columns and follows the box again
@@ -131,7 +133,7 @@ def test_t7_resplitting_shows_the_saved_slant(qapp) -> None:
 
 def test_t8_roi_sets_keep_the_slant_and_older_sets_have_none(tmp_path) -> None:
     spec = ZoneSpec(box=BOX, count=3, gap=0, far=FAR)
-    zones = [RoiShape(k + 1, "rect", points, name) for k, (name, points) in enumerate(split_box(spec))]
+    zones = [RoiShape(k + 1, "quad", points, name) for k, (name, points) in enumerate(split_box(spec))]
     path = tmp_path / "a.rois.json"
     save_roi_set(path, RoiSet(rois=tuple(zones), zone_groups=(ZoneGroup(rois=(0, 1, 2), spec=spec, name="Box 1"),)))
     assert load_roi_set(path).zone_groups[0].spec == spec
@@ -209,15 +211,18 @@ def test_t9_split_with_a_slant_resplit_join_and_reload_in_the_player(qapp, tmp_p
 
 
 def test_r1_a_band_of_constant_height_keeps_it_at_exact_half_ties() -> None:
-    # cell 13 spans columns 147-157: its rows are exactly 19.5-36.5, rounded half up to 20-36 (floats gave 19-36)
+    # every corner rounds half up in exact fractions: the band's two edges stay 17 rows apart at each corner
+    # (cell 13's corners at columns 147 and 158: rows 50 - 44 * 147 / 220 = 20.6 -> 21, 50 - 44 * 158 / 220 = 18.4 -> 18)
     zones = dict(split_box(ZoneSpec(box=((0, 50), (220, 67)), count=18, gap=1, start="left", far=(6, 23))))
-    assert zones["Cell 13"] == ((147.0, 20.0), (158.0, 37.0))
-    assert {b[1] - a[1] for a, b in zones.values()} == {17.0}
+    assert zones["Cell 13"] == ((147.0, 21.0), (158.0, 18.0), (158.0, 35.0), (147.0, 38.0))
+    assert {p[3][1] - p[0][1] for p in zones.values()} | {p[2][1] - p[1][1] for p in zones.values()} == {17.0}
     shapes = _shapes(split_box(ZoneSpec(box=((0, 50), (220, 67)), count=18, gap=1, start="left", far=(6, 23))))
-    assert "Cell 13" not in pair_tcs({"X": (19, 150)}, shapes, H, W).pairs.values()
-    # negative rows: a one-row band stays one row in every zone
+    for shape in shapes:  # and every column of every zone holds 17 rows
+        ys, xs = roi_coordinates(shape, 400, 400)
+        assert {int((xs == c).sum()) for c in set(xs.tolist())} == {17}, shape.name
+    # negative rows: a one-row band stays one row at every corner
     thin = split_box(ZoneSpec(box=((0, -64), (5, -63)), count=4, gap=0, start="left", far=(-19, -18)))
-    assert all(b[1] - a[1] == 1.0 for _n, (a, b) in thin)
+    assert all(p[3][1] - p[0][1] == 1.0 and p[2][1] - p[1][1] == 1.0 for _n, p in thin)
 
 
 def test_r2_the_slant_rounds_like_the_box_corners() -> None:
@@ -258,7 +263,7 @@ def test_r5_a_saved_fractional_box_with_an_equal_slant_reopens_flat(qapp, box, f
 @pytest.mark.parametrize("bad", ["12", {"358": None, "375": "x"}, [False, True], [358, None], "358,375"])
 def test_r4_a_slant_that_is_not_two_numbers_is_refused(tmp_path, bad) -> None:
     spec = ZoneSpec(box=BOX, count=3, gap=0, far=FAR)
-    zones = [RoiShape(k + 1, "rect", points, name) for k, (name, points) in enumerate(split_box(spec))]
+    zones = [RoiShape(k + 1, "quad", points, name) for k, (name, points) in enumerate(split_box(spec))]
     path = tmp_path / "a.rois.json"
     save_roi_set(path, RoiSet(rois=tuple(zones), zone_groups=(ZoneGroup(rois=(0, 1, 2), spec=spec),)))
     payload = json.loads(path.read_text(encoding="utf-8"))

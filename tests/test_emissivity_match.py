@@ -272,7 +272,7 @@ def test_a_paired_workbook_compares_only_its_pairs(tmp_path) -> None:
     match = _Match(_write(tmp_path, source, prefill), 1)
     assert set(match.pairs) == {"Cell 3"}
     tc = openpyxl.load_workbook(tmp_path / "zones.xlsx")["TC Compare"]
-    assert "Only the ROIs the TC fit paired" in str(tc["D6"].value)
+    assert "Only the ROIs paired with a TC" in str(tc["D6"].value)
 
 
 def test_estimate_counts_the_new_columns() -> None:
