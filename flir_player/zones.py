@@ -23,7 +23,9 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Mapping, Sequence
 
-from .geometry import roi_coordinates
+import numpy as np
+
+from .geometry import _quad_coordinates, quad_corners, roi_coordinates
 
 ENDS = ("right", "left", "top", "bottom")  # where zone 1 is
 MAX_ZONES = 200  # the split dialog's limits, also for zone groups read from a saved set
@@ -216,11 +218,43 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
         corners = (band.point(a0, band.edge(0, a0)), band.point(b0, band.edge(0, b0)),
                    band.point(b1, band.edge(1, b1)), band.point(a1, band.edge(1, a1)))
         zones.append((f"{prefix} {number}", corners))
+    shared = _shared_pixel(zones)
+    if shared is not None:
+        raise ValueError(f"{shared[0]} and {shared[1]} would share pixels: the dividers lean too far for so thin a "
+                         "band; use a smaller lean, a wider gap or a taller box")
     if width is not None and height is not None:
         for name, points in zones:
             if not _covers(points, height, width):
                 raise ValueError(f"{name} would cover no pixel; use a longer box, fewer zones or a smaller gap")
     return zones
+
+
+def _shared_pixel(zones) -> tuple[str, str] | None:
+    """The first two zones holding a common pixel, or None. Corners rounded to whole pixels can let neighbours
+    overlap where the dividers lean much more than the band is tall; such a split is refused."""
+    corners = [quad_corners(points) for _name, points in zones]
+    if any(c is None for c in corners):
+        return None
+    left = min(x for c in corners for x, _y in c)
+    top = min(y for c in corners for _x, y in c)
+    width = max(x for c in corners for x, _y in c) - left
+    height = max(y for c in corners for _x, y in c) - top
+    if width <= 0 or height <= 0:
+        return None
+    owner = np.full((height, width), -1, dtype=np.int32)
+    for k, c in enumerate(corners):
+        ys, xs = _quad_coordinates(tuple((x - left, y - top) for x, y in c), height, width)
+        taken = owner[ys, xs]
+        if (taken >= 0).any():
+            return zones[int(taken[taken >= 0][0])][0], zones[k][0]
+        owner[ys, xs] = k
+    return None
+
+
+def zone_names(spec: ZoneSpec) -> list[str]:
+    """The zones' names in zone order (zone 1 first), as ``split_box`` gives them."""
+    prefix = " ".join(spec.prefix.split()) or "Zone"
+    return [f"{prefix} {number}" for number in range(1, spec.count + 1)]
 
 
 # --- adjusting zones by hand ------------------------------------------------------------------
@@ -244,13 +278,22 @@ def corner_divider(spec: ZoneSpec, number: int, corner: int) -> tuple[int, int, 
     return divider, edge, half_gap if high_side else -half_gap
 
 
+def _kept_position(spec: ZoneSpec, divider: int, position: Fraction) -> Fraction:
+    """A divider end's position on the half-pixel grid that gives the same zone corners as ``position`` (so it
+    survives a float round trip): the inner dividers' gap is centred on them, the outer ones lose gap // 2."""
+    half = Fraction(1, 2)
+    if divider in (0, spec.count):
+        return Fraction(math.floor(position + half))
+    return math.floor(position - Fraction(spec.gap, 2) + half) + Fraction(spec.gap, 2)
+
+
 def move_divider(spec: ZoneSpec, divider: int, edge: int, position) -> ZoneSpec:
     """``spec`` with one end of divider ``divider`` (index from the box's low end) at ``position`` along the
-    row; its other end stays where it is. Raises ValueError for a divider index the spec does not have."""
+    row; its other end keeps the corners it gives now. Raises ValueError for a divider index the spec lacks."""
     if not 0 <= divider <= spec.count or edge not in (0, 1):
         raise ValueError("No such divider")
     positions = divider_positions(spec)
-    ends = list(positions[divider])
+    ends = [_kept_position(spec, divider, value) for value in positions[divider]]
     ends[edge] = Fraction(position)
     kept = tuple(m for m in spec.moved if m[0] != divider)
     moved = tuple(sorted(kept + ((divider, float(ends[0]), float(ends[1])),)))

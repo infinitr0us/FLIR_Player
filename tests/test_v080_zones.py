@@ -317,3 +317,128 @@ def test_m1_zones_are_quads_and_drag_by_divider_or_as_a_whole(qapp, tmp_path, mo
     finally:
         window.close()
         qapp.processEvents()
+
+
+# --- the 0.8.0 review (Codex, 16 October 2026) -----------------------------------------------------
+
+
+def test_r1_a_lean_much_steeper_than_the_band_is_refused_rather_than_overlapping() -> None:
+    spec = ZoneSpec(box=((30, 30), (77, 34)), count=3, start="left", gap=1, far=(18, 23), lean=25)
+    with pytest.raises(ValueError, match="would share pixels"):
+        split_box(spec, 120, 100)
+    # the 1006a geometry with any sensible lean keeps every pixel in one zone
+    for lean in range(-8, 9):
+        zones = _shapes(split_box(ZoneSpec(box=BOX, far=FAR, lean=lean), W, H))
+        pixels = [p for z in zones for p in zip(*[a.tolist() for a in roi_coordinates(z, H, W)])]
+        assert len(pixels) == len(set(pixels)), lean
+
+
+def test_r2_moving_one_divider_end_keeps_the_other_end_exactly() -> None:
+    spec = ZoneSpec(box=((10, 10), (79, 30)), count=18, start="left", gap=1, lean=3, distances=(3.0, 3.3))
+    before = dict(split_box(spec))
+    divider, edge, offset = corner_divider(spec, 4, 1)  # Cell 4's upper corner on its far side
+    assert before["Cell 4"][1][0] == 24.0
+    after = dict(split_box(move_divider(spec, divider, edge, 25 + offset)))
+    assert after["Cell 4"][1][0] == 25.0 and after["Cell 4"][2] == before["Cell 4"][2]  # the lower end stays
+    assert after["Cell 5"][3] == before["Cell 5"][3]
+    # repeated moves of other dividers never drift the ones already moved
+    spec2 = move_divider(spec, divider, edge, 25 + offset)
+    for d in (2, 7, 11):
+        spec2 = move_divider(spec2, d, 1, divider_positions(spec2)[d][1] + 1)
+    assert dict(split_box(spec2))["Cell 4"][1:3] == after["Cell 4"][1:3]
+
+
+def test_r3_absurd_coordinates_cover_nothing_instead_of_overflowing() -> None:
+    big = 10 ** 10
+    assert _pixels("quad", ((-big, -big), (big, -big), (big, big), (-big, big)), 10, 10) == set()
+    assert area_extent("quad", ((-big, -big), (big, -big), (big, big), (-big, big)), 10, 10) is None
+
+
+def test_r4_label_room_of_a_zone_leaning_more_than_it_is_wide() -> None:
+    from flir_player.geometry import quad_label_width
+
+    assert quad_label_width(((0, 0), (10, 0), (40, 4), (30, 4))) == 10  # not the 30 px of its lean
+    assert quad_label_width(((0, 0), (10, 0), (10, 40), (0, 40))) == 10
+    assert quad_label_width(((0, 0), (0, 10), (40, 10), (40, 0))) == 40  # a zone of a split along the rows
+
+
+@pytest.mark.skipif(not (SAMPLES / "2.seq").exists(), reason="needs local/data/2.seq")
+def test_r5_zones_left_after_a_delete_and_reload_keep_their_own_places(qapp, tmp_path, monkeypatch) -> None:
+    from conftest import wait_until
+
+    from flir_player import main_window as mw
+    from flir_player.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        window.open_path(SAMPLES / "2.seq")
+        assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy, timeout=20)
+        window._add_roi("rect", ((20.0, 20.0), (110.0, 60.0)))
+
+        def accept(self):
+            self.show()
+            self.count_spin.setValue(3)
+            self.start_combo.setCurrentIndex(self.start_combo.findData("left"))
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(ZoneSplitDialog, "exec", accept)
+        window._split_zones()
+        before = {roi.name: roi.points for roi in window._rois}
+        window._delete_roi(next(roi.id for roi in window._rois if roi.name == "Cell 1"))
+        path = tmp_path / "set.rois.json"
+        monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(path), "")))
+        monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(path), "")))
+        window._save_roi_set()
+        window._load_roi_set()
+        cell2 = next(roi for roi in window._rois if roi.name == "Cell 2")
+        moved = window._zone_drag(cell2, "body", (11.0, 0.0), (10.0, 0.0))
+        shapes = {shape.name: shape.points for shape in moved.values()}
+        assert set(shapes) == {"Cell 2", "Cell 3"}
+        for name in shapes:
+            assert shapes[name] == tuple((x + 1, y) for x, y in before[name])
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+@pytest.mark.skipif(not (SAMPLES / "2.seq").exists(), reason="needs local/data/2.seq")
+def test_r6_a_cancelled_preview_never_comes_back(qapp, monkeypatch) -> None:
+    from conftest import wait_until
+
+    from flir_player.main_window import MainWindow
+
+    window = MainWindow()
+    window.show()
+    try:
+        window.open_path(SAMPLES / "2.seq")
+        assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy, timeout=20)
+        window._add_roi("rect", ((40.0, 200.0), (220.0, 216.0)))
+
+        def accept(self):
+            self.show()
+            self.count_spin.setValue(9)
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(ZoneSplitDialog, "exec", accept)
+        window._split_zones()
+        zones = list(window._rois)
+        canvas = window.canvas
+        canvas.repaint()
+        window._select_roi(zones[3].id)
+        corner = zones[3].points[0]
+        grab = canvas._image_to_widget(*corner)
+        canvas.mousePressEvent(_mouse(QMouseEvent.Type.MouseButtonPress, grab))
+        canvas.mouseMoveEvent(_mouse(QMouseEvent.Type.MouseMove, canvas._image_to_widget(corner[0] - 3, corner[1])))
+        assert canvas._drag_overrides
+        canvas.cancel_gesture()  # Esc
+        assert [z.points for z in window._rois] == [z.points for z in zones]
+        # a second drag straight onto the next divider (invalid) must not bring the cancelled one back
+        canvas.mousePressEvent(_mouse(QMouseEvent.Type.MouseButtonPress, grab))
+        far = canvas._image_to_widget(zones[3].points[1][0] + 4, corner[1])
+        canvas.mouseMoveEvent(_mouse(QMouseEvent.Type.MouseMove, far))
+        canvas.mouseReleaseEvent(_mouse(QMouseEvent.Type.MouseButtonRelease, far, buttons=Qt.MouseButton.NoButton))
+        assert [z.points for z in window._rois] == [z.points for z in zones]
+        assert window._zone_groups[0]["spec"].moved == ()
+    finally:
+        window.close()
+        qapp.processEvents()

@@ -17,7 +17,10 @@
   sides follow and the gap between them stays. Drag a zone to move every zone of
   the split. Re-splitting keeps dividers moved by hand while the number of
   zones is unchanged; ROI sets save the lean, the distances and the moved
-  dividers (sets without them stay readable by 0.7.x).
+  dividers. A set with zones needs 0.8.0 or later to open (zones are a new
+  ROI kind).
+- A split whose dividers lean much further than the band is tall, so that
+  neighbouring zones would share pixels, is refused with a note.
 - Zone edges are computed in exact fractions: an edge that fell exactly on a
   pixel boundary could land a pixel early before.
 - The workbook's Settings sheet lists zones as "Zone"; their statistics in the
@@ -36,7 +39,9 @@
   zones*, editable); Use = 1 marks valid TC readings of at least 50 °C with no
   flame jump on the TC. Time 0 stays editable, and A700 recordings get a note
   that their clock can run slow. The recording's TC file and the pairs are
-  remembered on Export. The workbook cannot be saved over the TC file.
+  remembered on Export. The workbook cannot be saved over the TC file. TC
+  names that differ only in capitals are refused (the workbook's lookup cannot
+  tell them apart).
 
 ### Review fixes
 

@@ -50,7 +50,7 @@ from .tc_dialog import SavedFitReader, TcCalibrationDialog, TcResultsDialog, res
 from .tcmatch import roi_shapes, workbook_origin
 from .zone_dialog import ZoneSplitDialog
 from .zones import (ZONE_KIND, ZoneSpec, corner_divider, move_divider, normalized_box, split_box,
-                    translate_spec)
+                    translate_spec, zone_names)
 from .geometry import roi_coordinates
 from .settings import app_settings
 from .models import (
@@ -169,7 +169,7 @@ class MainWindow(QMainWindow):
         self._zone_groups: list[dict] = []  # zones split from one box: ids, ZoneSpec, the box's name
         # count, end, gap, names last used; the end as seen on screen (the view may be turned)
         self._zone_defaults = ZoneSpec(box=((0.0, 0.0), (1.0, 1.0)))
-        self._zone_drag_state: tuple | None = None  # (group, spec, shapes) of the zone drag under way
+        self._zone_drag_state: tuple | None = None  # (gesture, group, spec, shapes) of the zone drag under way
         self._extract_progress: ProgressDialog | None = None
         self._export_progress: ProgressDialog | None = None
         self.show_clipping = True
@@ -774,8 +774,9 @@ class MainWindow(QMainWindow):
         if not all(self._covers_pixels(shape.kind, shape.points) for shape in shapes):
             self.canvas.set_rois(self._rois, self._selected_roi_id)  # snap back
             return
-        if state is not None and any(state[0] is group for group in self._zone_groups) and set(state[2]) == set(by_id):
-            state[0]["spec"] = state[1]
+        if (state is not None and any(state[1] is group for group in self._zone_groups)
+                and {k: s.points for k, s in state[3].items()} == {k: s.points for k, s in by_id.items()}):
+            state[1]["spec"] = state[2]
         for index, existing in enumerate(self._rois):
             if existing.id in by_id:
                 self._rois[index] = by_id[existing.id]
@@ -784,7 +785,7 @@ class MainWindow(QMainWindow):
         self.bottom_panel.temporal.history_note.setText("Edited ROI history cleared")
         self._push_rois()
 
-    def _zone_drag(self, shape: RoiShape, handle: str, image_pos, start_pos) -> dict | None:
+    def _zone_drag(self, shape: RoiShape, handle: str, image_pos, start_pos, serial: int = 0) -> dict | None:
         """The canvas's drag hook for cell zones: a zone's corner moves that divider's end along the row (the
         zones on both sides follow), its body moves every zone of the split by whole pixels. None for any other
         ROI (dragged as usual). A drag that would leave a zone without width or pixels keeps the last good state."""
@@ -794,12 +795,17 @@ class MainWindow(QMainWindow):
         if group is None or shape.id not in group["ids"]:
             return None
         spec = group["spec"]
+        names = zone_names(spec)  # zones are known by name: a saved set keeps only the zones that are left
+        if shape.name not in names:
+            return None
+        gesture = (serial, shape.id, handle)
         current = {roi.id: roi for roi in self._rois}
+        members = {current[roi_id].name: roi_id for roi_id in group["ids"] if roi_id in current}
         try:
             if handle == "body":
                 spec = translate_spec(spec, round(image_pos[0] - start_pos[0]), round(image_pos[1] - start_pos[1]))
             elif handle in ("c0", "c1", "c2", "c3"):
-                divider, edge, offset = corner_divider(spec, group["ids"].index(shape.id) + 1, int(handle[1]))
+                divider, edge, offset = corner_divider(spec, names.index(shape.name) + 1, int(handle[1]))
                 along = image_pos[0] if spec.start in ("right", "left") else image_pos[1]
                 spec = move_divider(spec, divider, edge, round(along) + offset)  # the corner on a pixel boundary
             else:
@@ -807,12 +813,12 @@ class MainWindow(QMainWindow):
             zones = split_box(spec, self.metadata.width, self.metadata.height)
         except ValueError:
             state = self._zone_drag_state
-            if state is not None and state[0] is group:
-                return state[2]
-            return {roi_id: current[roi_id] for roi_id in group["ids"] if roi_id in current}
-        moved = {roi_id: RoiShape(roi_id, ZONE_KIND, points, current[roi_id].name)
-                 for roi_id, (_name, points) in zip(group["ids"], zones) if roi_id in current}
-        self._zone_drag_state = (group, spec, moved)
+            if state is not None and state[0] == gesture and state[1] is group:
+                return state[3]  # the last good position of this drag
+            return {roi_id: current[roi_id] for roi_id in members.values()}
+        moved = {members[name]: RoiShape(members[name], ZONE_KIND, points, name)
+                 for name, points in zones if name in members}
+        self._zone_drag_state = (gesture, group, spec, moved)
         return moved
 
     def _delete_roi(self, roi_id: int | None) -> None:

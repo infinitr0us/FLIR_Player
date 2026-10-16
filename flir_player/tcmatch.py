@@ -1884,9 +1884,15 @@ def clock_prefill(table: TcTable, *, lag_s: float, fps: float, frame: int,
         raise ValueError("A paired TC name is not in the TC file")
     if len(set(pairs.values())) != len(pairs):
         raise ValueError("An ROI is paired with more than one TC")
+    if len({name.casefold() for name in pairs}) != len(pairs):  # the workbook's MATCH ignores capitals
+        raise ValueError("Paired TC names that differ only in capitals cannot be told apart in the workbook")
     options = options or MatchOptions()
     offset = float(lag_s - frame / fps)
-    names = (tuple(pairs) + tuple(name for name in table.names if name not in pairs))[:10]
+    names = list(pairs)
+    for name in table.names:  # the other TCs, while the sheet has room, leaving out names alike but for capitals
+        if len(names) < 10 and name.casefold() not in {n.casefold() for n in names}:
+            names.append(name)
+    names = tuple(names)
     columns = tuple(tuple(float(v) for v in table.values[:, table.names.index(name)]) for name in names)
     roi_use = []
     if pairs:

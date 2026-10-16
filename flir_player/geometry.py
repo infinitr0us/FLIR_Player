@@ -70,8 +70,8 @@ def area_extent(kind: str, points, height: int, width: int):
     building them, for readouts that follow the pointer while a large ellipse
     is drawn (a full-frame ellipse takes ~30 ms through ``roi_coordinates``).
     """
-    if kind == "quad":  # zones are small; the exact pixels are cheap
-        ys, xs = _quad_coordinates(points, height, width) if width >= 1 and height >= 1 else ((), ())
+    if kind == "quad":  # the exact pixels, from the coverage cache (readouts ask for them on every move)
+        ys, xs = roi_coordinates(_Points("quad", tuple(points)), height, width)
         if not len(ys):
             return None
         return (int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max()), int(len(ys)))
@@ -108,16 +108,19 @@ def area_extent(kind: str, points, height: int, width: int):
             int((x_max - x_min + 1).sum()))
 
 
+MAX_QUAD_COORDINATE = 10_000_000  # far beyond any image; keeps the exact int64 arithmetic from overflowing
+
+
 def quad_corners(points) -> tuple[tuple[int, int], ...] | None:
     """A quad's corners on pixel boundaries (rounded as box corners, not clamped), or None when it is
-    not four finite points."""
+    not four finite points within +-``MAX_QUAD_COORDINATE`` (such a quad covers nothing)."""
     if len(points) != 4:
         return None
     try:
         values = [(float(x), float(y)) for x, y in points]
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(v) for point in values for v in point):
+    if not all(math.isfinite(v) and abs(v) <= MAX_QUAD_COORDINATE for point in values for v in point):
         return None
     return tuple((int(round(x)), int(round(y))) for x, y in values)
 
@@ -126,9 +129,20 @@ def quad_label_width(corners) -> float:
     """Room for a quad's label as drawn (``corners`` in screen coordinates): the shorter of the two opposite sides
     that run more across the screen, measured across it, so a leaning zone's label does not reach its neighbour."""
     p = [(float(x), float(y)) for x, y in corners]
-    along = (abs(p[1][0] - p[0][0]), abs(p[2][0] - p[3][0]))
-    across = (abs(p[3][0] - p[0][0]), abs(p[2][0] - p[1][0]))
-    return min(along) if sum(along) >= sum(across) else min(across)
+    pairs = (((p[0], p[1]), (p[3], p[2])), ((p[0], p[3]), (p[1], p[2])))
+
+    def steepness(pair) -> float:  # the steeper side of the pair, as rise over run on the screen
+        return max(abs(b[1] - a[1]) / max(abs(b[0] - a[0]), 1e-9) for a, b in pair)
+
+    flatter = min(pairs, key=steepness)  # the sides a label sits along
+    return min(abs(b[0] - a[0]) for a, b in flatter)
+
+
+class _Points:  # the fields roi_coordinates reads, for a kind and points without a shape
+    __slots__ = ("kind", "points")
+
+    def __init__(self, kind: str, points: tuple) -> None:
+        self.kind, self.points = kind, points
 
 
 def _cross(o, a, b) -> int:

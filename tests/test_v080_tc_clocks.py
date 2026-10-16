@@ -87,9 +87,14 @@ def test_clock_prefill_keeps_exact_case_sensitive_columns():
     data = table(("t1", "T1"))
     data.values[:, 0] = 20
     filled = tcmatch.clock_prefill(data, lag_s=0, fps=10, frame=0, pairs={"T1": "Cell 3"})
-    assert filled.names == ("T1", "t1")
+    # the workbook finds columns with Excel's MATCH, which ignores capitals: "t1" stays off the sheet
+    assert filled.names == ("T1",)
     assert filled.columns[0] == tuple(data.values[:, 1])
     assert filled.roi_use == (("Cell 3", ((-0.5, 39.5),)),)
+    with pytest.raises(ValueError, match="capitals"):
+        tcmatch.clock_prefill(data, lag_s=0, fps=10, frame=0, pairs={"T1": "Cell 3", "t1": "Cell 6"})
+    _pairs, errors = excel_dialog.parse_tc_pairs("T1 = Cell 3, t1 = Cell 6", ("t1", "T1"), ("Cell 3", "Cell 6"))
+    assert any("capitals" in e for e in errors)
 
 
 @pytest.mark.parametrize("text", ["T1 = Cell 3, T2 = Cell 6", "  T1  =  Cell 3 ; T2=Cell 6  "])

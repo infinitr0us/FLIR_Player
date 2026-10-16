@@ -44,7 +44,7 @@ from .calibration import (
     set_unit_safely,
     write_parameters,
 )
-from .geometry import roi_coordinates
+from .geometry import quad_label_width, roi_coordinates
 from .jobs import JobCancelled, OutputTransaction
 from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, count_status
@@ -109,7 +109,7 @@ def save_roi_set(path: str | Path, roi_set: RoiSet) -> None:
 
 
 def _zone_extras(spec: ZoneSpec) -> dict:
-    """A zone group's optional settings, written only when set (sets stay readable by 0.7.x when unused)."""
+    """A zone group's optional settings, written only when set."""
     extras: dict = {}
     if spec.far is not None:
         extras["far"] = list(spec.far)
@@ -255,6 +255,11 @@ class TcPrefill:
             raise ValueError("Every TC column needs one value per logger time")
         if len(self.times) > capacity:
             raise ValueError(f"{len(self.times):,} logger rows exceed the TC sheet's {capacity:,}")
+        folded = [name.casefold() for name in self.names]
+        alike = sorted({name for name, key in zip(self.names, folded) if folded.count(key) > 1})
+        if alike:  # the workbook finds a TC's column with Excel's MATCH, which ignores capitals
+            raise ValueError(f"TC names that differ only in capitals cannot be told apart in the workbook: "
+                             f"{', '.join(alike)}")
         unknown = {tc for _roi, tc in self.roi_tc} - set(self.names)
         if unknown:
             raise ValueError(f"No TC column named {', '.join(sorted(unknown))}")
@@ -705,8 +710,7 @@ def map_scale(rois, width: int, narrowest: float = 24.0, max_width: int = 2000) 
     (room for a zone number), at most 3× and ``max_width`` px."""
     widths = [abs(shape.points[1][0] - shape.points[0][0]) for shape in rois
               if shape.kind in ("rect", "ellipse") and len(shape.points) == 2]
-    widths += [max(x for x, _y in shape.points) - min(x for x, _y in shape.points) for shape in rois
-               if shape.kind == "quad" and len(shape.points) == 4]
+    widths += [quad_label_width(shape.points) for shape in rois if shape.kind == "quad" and len(shape.points) == 4]
     widths = [w for w in widths if w > 0]
     if not widths or min(widths) >= narrowest:
         return 1

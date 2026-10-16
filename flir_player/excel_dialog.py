@@ -107,6 +107,10 @@ def parse_tc_pairs(text: str, tc_names, roi_names) -> tuple[dict[str, str], tupl
         seen_tc.add(tc)
         seen_roi.add(roi)
         pairs[tc] = roi
+    folded = [tc.casefold() for tc in pairs]
+    alike = sorted({tc for tc in pairs if folded.count(tc.casefold()) > 1})
+    if alike:
+        errors.append(f"TCs {', '.join(alike)} differ only in capitals, which the workbook cannot tell apart.")
     repeated = _duplicate_names(roi_names)
     if repeated:
         errors.append(f"More than one ROI is named {', '.join(repeated)}: give them different names.")

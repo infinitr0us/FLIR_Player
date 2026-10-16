@@ -618,9 +618,10 @@ class ThermalCanvas(QWidget):
         self._draft: tuple[str, tuple[float, float], tuple[float, float]] | None = None
         self._drag: dict | None = None
         self._drag_shape = None
-        # (shape, handle, image position, start position) -> {id: shape} of every ROI a drag moves, or None for
-        # a plain one-ROI drag; set by the window for cell zones (a divider moves two zones, a body all of them)
+        # (shape, handle, image position, start position, drag number) -> {id: shape} of every ROI a drag moves,
+        # or None for a plain one-ROI drag; set by the window for cell zones (a divider moves two zones, a body all)
         self._drag_hook = None
+        self._drag_serial = 0  # counts drags, so a hook can tell one drag from the next
         self._drag_overrides: dict = {}
         self._show_markers = False
         self._marker_image: tuple = (None, None)
@@ -826,11 +827,13 @@ class ThermalCanvas(QWidget):
     def set_rois(self, rois: list, selected_id: int | None) -> None:
         self._rois = list(rois)
         self._selected_roi = selected_id
+        self._drag_overrides = {}  # a drag's live preview belongs to the list it started on
         self.update()
 
     def set_drag_hook(self, hook) -> None:
-        """``hook(shape, handle, image_pos, start_pos)`` -> {id: shape} for drags that move several ROIs
-        (shown live, sent as ``rois_moved`` on release), or None to drag the one ROI as usual."""
+        """``hook(shape, handle, image_pos, start_pos, serial)`` -> {id: shape} for drags that move several ROIs
+        (shown live, sent as ``rois_moved`` on release), or None to drag the one ROI as usual. ``serial`` is new
+        for every drag."""
         self._drag_hook = hook
 
     def set_roi_tool(self, tool: str) -> None:
@@ -1453,6 +1456,7 @@ class ThermalCanvas(QWidget):
                     self._selected_roi = roi_id
                     self.roi_selected.emit(roi_id)
                 shape = next(s for s in self._rois if s.id == roi_id)
+                self._drag_serial += 1
                 self._drag = {
                     "id": roi_id,
                     "handle": handle,
@@ -1508,7 +1512,8 @@ class ThermalCanvas(QWidget):
             image_pos = self._widget_to_image(wpos)
             self._drag_shape = self._dragged_shape(image_pos, self._pixel_center_at(wpos))
             if self._drag_hook is not None:
-                moved = self._drag_hook(self._drag["orig"], self._drag["handle"], image_pos, self._drag["start"])
+                moved = self._drag_hook(self._drag["orig"], self._drag["handle"], image_pos, self._drag["start"],
+                                        self._drag_serial)
                 self._drag_overrides = dict(moved) if moved is not None else {}
                 if self._drag["id"] in self._drag_overrides:
                     self._drag_shape = self._drag_overrides[self._drag["id"]]
