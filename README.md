@@ -430,8 +430,8 @@ For a battery module seen from the side:
    corner to move that divider along the row (the zones on both sides follow),
    or drag a zone to move all of them; re-splitting keeps dividers moved by hand
    while the number of zones stays the same.
-3. *Export → Excel workbook…* with *Fill TC Compare from the last TC fit*
-   ticked: each TC is paired with its zone, the logger data sit at the fitted
+3. *Export → Excel workbook…* with *Fill TC Compare* ticked and *From the
+   last TC fit* selected: each TC is paired with its zone, the logger data sit at the fitted
    time offset, and Use = 1 marks the seconds the fit used (no flames on the TC,
    IR in range). Time 0 starts at logger time 0 and the range at the logger's
    first to last second, so the workbook's seconds are the TC file's. Only the
@@ -445,10 +445,21 @@ a lower emissivity than at its own few pixels. To match at the TC itself, press 
 each TC then pairs with its small box (the smallest ROI holding the pixel), and
 the zones report every cell at the matched emissivity.
 
-Without a TC fit, paste the logger data on TC Compare and pick each zone's TC
-on Settings; the ignition frame must then be logger time 0. Equal zone widths
-assume the cells look equally wide in the picture (no strong perspective along
-the module). TCs on the top face can read the
+Without a TC fit, choose *From a TC file, timed by the clocks* under
+*Fill TC Compare*, then choose the logger file and sheet. The camera and
+logger clocks place time 0 and set the range to the logger's span inside the
+recording. If either clock is missing or the clocks put the log outside the
+recording, the dialog says why and takes the ignition frame you set as logger
+time 0. T1, T2 and T3 start paired with cells 3, 6 and 9 counted from the
+heater end, using the zones' names. Edit *TCs and zones* to change those pairs;
+unknown or repeated names must be corrected before TC Compare can be filled.
+Use = 1 marks valid TC readings at least 50 °C with no flame jump on the TC;
+no TC pixel or emissivity fit is needed. Check the TC and zone curves for a
+time shift, especially with the A700's slow clock; time 0 remains editable.
+The recording's TC file and the pairs are remembered when you press Export.
+You can still untick *Fill TC Compare* and paste the logger data yourself.
+
+Without *Camera distance*, zones are equally wide along the module. TCs on the top face can read the
 jet flames and run hotter than the surface the camera sees, which pulls the
 best value toward the lower limit; the sheet says so.
 

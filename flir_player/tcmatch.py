@@ -1866,6 +1866,48 @@ def tc_prefill(result: MatchResult, table: TcTable, *, rois: Sequence[RoiShape] 
                      roi_use=tuple(roi_use), match_exclude=tuple(exclude))
 
 
+def clock_prefill(table: TcTable, *, lag_s: float, fps: float, frame: int,
+                  pairs: Mapping[str, str], options: MatchOptions | None = None):
+    """TC Compare without a fit. ``pairs`` maps exact TC names to ROI names.
+
+    Workbook time = logger time + lag_s - frame / fps. Use marks whole logger
+    bins passing the TC-only validity, flame and minimum-temperature rules;
+    no IR measurements or fitted emissivities are involved.
+    """
+    from .excel_export import TcPrefill
+
+    if not math.isfinite(fps) or fps <= 0 or not math.isfinite(lag_s):
+        raise ValueError("TC timing needs a positive frame rate and a finite time offset")
+    if len(pairs) > 10:
+        raise ValueError("TC Compare holds at most 10 TC columns; pair no more than 10 TCs")
+    if any(name not in table.names for name in pairs):
+        raise ValueError("A paired TC name is not in the TC file")
+    if len(set(pairs.values())) != len(pairs):
+        raise ValueError("An ROI is paired with more than one TC")
+    options = options or MatchOptions()
+    offset = float(lag_s - frame / fps)
+    names = (tuple(pairs) + tuple(name for name in table.names if name not in pairs))[:10]
+    columns = tuple(tuple(float(v) for v in table.values[:, table.names.index(name)]) for name in names)
+    roi_use = []
+    if pairs:
+        # Numbered keys select exact columns even when channel names differ only in case.
+        chosen = dataclass_replace(options, channels=tuple(str(table.names.index(name) + 1) for name in pairs))
+        step = table.interval
+        grid, channels = prepare_channels(table, chosen, step)
+        half = step / 2
+        for channel in channels:
+            used = channel.usable & (channel.values >= options.tc_min_c)
+            if channel.calm is not None:
+                used &= channel.calm
+            runs = tuple((float(grid[a] - half + offset), float(grid[b] + half + offset))
+                         for a, b in _runs(used, gap=0))
+            roi_use.append((pairs[channel.name], runs))
+    window = max((run for _roi, runs in roi_use for run in runs), key=lambda run: run[1] - run[0], default=None)
+    return TcPrefill(times=tuple(float(t) for t in table.times), columns=columns, names=names,
+                     roi_tc=tuple((roi, tc) for tc, roi in pairs.items()), offset_s=offset,
+                     roi_use=tuple(roi_use), window=window)
+
+
 def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult, table: TcTable, *,
                    progress: Progress | None = None, abort: Abort | None = None, handles: dict | None = None,
                    parameters: dict | None = None, replace=(), tool_version: str = "",

@@ -26,12 +26,24 @@
   its corners.
 - Grabbing a corner where two ROIs' handles meet takes the selected ROI's.
 
+### TC Compare without a TC fit
+
+- The Excel export can fill TC Compare straight from the test's TC file
+  (*Fill TC Compare* > *From a TC file, timed by the clocks*), so the zone part
+  of the procedure works without running *Fit Emissivity from TCs* first. The
+  camera and logger clocks place logger time 0 and set the range to the
+  logger's span; T1, T2 and T3 start paired with zones 3, 6 and 9 (*TCs and
+  zones*, editable); Use = 1 marks valid TC readings of at least 50 °C with no
+  flame jump on the TC. Time 0 stays editable, and A700 recordings get a note
+  that their clock can run slow. The recording's TC file and the pairs are
+  remembered on Export. The workbook cannot be saved over the TC file.
+
 ### Review fixes
 
 Fixes from a review of everything added since 0.5.2 (the TC fit, the
 workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
 
-### TC fit
+#### TC fit
 
 - An emissivity that leaves some seconds of an event without any temperature
   (with a high reflected temperature) no longer wins on the seconds it can
@@ -65,7 +77,7 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
   run's figure; a workbook from a fit saved before 0.7.1 (which did not record
   its object parameters) asks first.
 
-### Workbook
+#### Workbook
 
 - The Excel export refuses a recording that cycles through several presets
   (superframing), whose rows would mix the presets.
@@ -75,7 +87,7 @@ workbook's Emissivity Match, cell zones, the clocks and the player's dialogs).
   series); the Match, matching-emissivity and per-name charts say when they
   show only the first ones.
 
-### Cell zones and ROI sets
+#### Cell zones and ROI sets
 
 - With a gap between zones, the box's ends lose half a gap as well, so every
   zone is as wide (the end zones were wider by half a gap); the shortest box
