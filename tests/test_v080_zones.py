@@ -442,3 +442,57 @@ def test_r6_a_cancelled_preview_never_comes_back(qapp, monkeypatch) -> None:
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_r7_the_overlap_check_looks_only_at_pixels_that_can_be_measured() -> None:
+    # one zone cannot overlap anything; a huge box is checked only inside the image (no 16 TB array)
+    huge = ZoneSpec(box=((-1_000_000, -1_000_000), (1_000_000, 1_000_000)), count=1, start="left", gap=0)
+    assert len(split_box(huge, 10, 10)) == 1
+    two = ZoneSpec(box=((0, -1_000_000), (10, 1_000_000)), count=2, start="left", gap=0, lean=1)
+    assert len(split_box(two, 10, 10)) == 2
+
+
+def test_r8_a_requested_divider_position_lands_on_the_grid_that_survives_saving() -> None:
+    spec = ZoneSpec(box=((10, 10), (14, 25)), count=2, start="left", gap=0, lean=3, distances=(0.1, 0.3))
+    before = dict(split_box(spec))
+    same = move_divider(spec, 1, 0, divider_positions(spec)[1][0])  # the position it has: nothing moves
+    assert dict(split_box(same)) == before
+
+
+@pytest.mark.skipif(not (SAMPLES / "2.seq").exists(), reason="needs local/data/2.seq")
+def test_r9_a_new_roi_list_during_a_drag_ends_it_without_moving_a_zone_alone(qapp, monkeypatch) -> None:
+    from conftest import wait_until
+
+    from flir_player.main_window import MainWindow
+
+    window = MainWindow()
+    window.show()
+    try:
+        window.open_path(SAMPLES / "2.seq")
+        assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy, timeout=20)
+        window._add_roi("rect", ((20.0, 20.0), (110.0, 60.0)))
+
+        def accept(self):
+            self.show()
+            self.count_spin.setValue(3)
+            self.start_combo.setCurrentIndex(self.start_combo.findData("left"))
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(ZoneSplitDialog, "exec", accept)
+        window._split_zones()
+        zones = list(window._rois)
+        canvas = window.canvas
+        canvas.repaint()
+        window._select_roi(zones[0].id)
+        corner = zones[0].points[1]  # Cell 1's top corner towards Cell 2
+        grab = canvas._image_to_widget(*corner)
+        canvas.mousePressEvent(_mouse(QMouseEvent.Type.MouseButtonPress, grab))
+        moved_to = canvas._image_to_widget(corner[0] + 5, corner[1])
+        canvas.mouseMoveEvent(_mouse(QMouseEvent.Type.MouseMove, moved_to))
+        canvas.set_rois(zones, zones[0].id)  # the window replaces the list mid-drag
+        canvas.mouseReleaseEvent(_mouse(QMouseEvent.Type.MouseButtonRelease, moved_to, buttons=Qt.MouseButton.NoButton))
+        assert [z.points for z in window._rois] == [z.points for z in zones]
+        assert window._zone_groups[0]["spec"].moved == ()
+    finally:
+        window.close()
+        qapp.processEvents()

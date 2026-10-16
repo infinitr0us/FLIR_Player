@@ -144,6 +144,10 @@ class ZoneSplitDialog(FramelessDialog):
         grid.addWidget(self.keep_moved, r + 1, 0, 1, 4)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
+        # the labels keep their room: the slant row's label changes with the split's direction
+        metrics = self.far_label.fontMetrics()
+        grid.setColumnMinimumWidth(0, max(metrics.horizontalAdvance(text) for text in (
+            far_label("right").capitalize(), far_label("top").capitalize(), "Camera distance", "Gap between zones")) + 8)
         self.body.addLayout(grid)
         edges = QLabel("Columns and rows are the box's first and last pixels, as the image readout shows them. "
                        "Camera distances: at zone 1's end, then at the far end.")

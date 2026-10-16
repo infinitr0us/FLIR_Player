@@ -827,7 +827,11 @@ class ThermalCanvas(QWidget):
     def set_rois(self, rois: list, selected_id: int | None) -> None:
         self._rois = list(rois)
         self._selected_roi = selected_id
-        self._drag_overrides = {}  # a drag's live preview belongs to the list it started on
+        if self._drag is not None:  # a drag belongs to the list it started on: a new list ends it unapplied
+            self._drag = None
+            self._drag_shape = None
+            self._drag_serial += 1
+        self._drag_overrides = {}
         self.update()
 
     def set_drag_hook(self, hook) -> None:

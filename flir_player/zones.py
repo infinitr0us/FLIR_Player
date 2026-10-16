@@ -218,7 +218,7 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
         corners = (band.point(a0, band.edge(0, a0)), band.point(b0, band.edge(0, b0)),
                    band.point(b1, band.edge(1, b1)), band.point(a1, band.edge(1, a1)))
         zones.append((f"{prefix} {number}", corners))
-    shared = _shared_pixel(zones)
+    shared = _shared_pixel(zones, width, height)
     if shared is not None:
         raise ValueError(f"{shared[0]} and {shared[1]} would share pixels: the dividers lean too far for so thin a "
                          "band; use a smaller lean, a wider gap or a taller box")
@@ -229,17 +229,25 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     return zones
 
 
-def _shared_pixel(zones) -> tuple[str, str] | None:
-    """The first two zones holding a common pixel, or None. Corners rounded to whole pixels can let neighbours
-    overlap where the dividers lean much more than the band is tall; such a split is refused."""
+_CHECK_PIXELS = 16_000_000  # without an image size, larger splits are not checked (no image is that big)
+
+
+def _shared_pixel(zones, image_width: int | None = None, image_height: int | None = None) -> tuple[str, str] | None:
+    """The first two zones holding a common pixel (of the image, when its size is given), or None. Corners rounded
+    to whole pixels can let neighbours overlap where the dividers lean much more than the band is tall; such a split
+    is refused."""
     corners = [quad_corners(points) for _name, points in zones]
-    if any(c is None for c in corners):
+    if len(corners) < 2 or any(c is None for c in corners):
         return None
     left = min(x for c in corners for x, _y in c)
     top = min(y for c in corners for _x, y in c)
-    width = max(x for c in corners for x, _y in c) - left
-    height = max(y for c in corners for _x, y in c) - top
-    if width <= 0 or height <= 0:
+    right = max(x for c in corners for x, _y in c)
+    bottom = max(y for c in corners for _x, y in c)
+    if image_width is not None and image_height is not None:  # only pixels the zones can measure
+        left, top = max(left, 0), max(top, 0)
+        right, bottom = min(right, image_width), min(bottom, image_height)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0 or width * height > _CHECK_PIXELS:
         return None
     owner = np.full((height, width), -1, dtype=np.int32)
     for k, c in enumerate(corners):
@@ -294,7 +302,7 @@ def move_divider(spec: ZoneSpec, divider: int, edge: int, position) -> ZoneSpec:
         raise ValueError("No such divider")
     positions = divider_positions(spec)
     ends = [_kept_position(spec, divider, value) for value in positions[divider]]
-    ends[edge] = Fraction(position)
+    ends[edge] = _kept_position(spec, divider, Fraction(position))  # on the same grid, so floats keep it
     kept = tuple(m for m in spec.moved if m[0] != divider)
     moved = tuple(sorted(kept + ((divider, float(ends[0]), float(ends[1])),)))
     return replace(spec, moved=moved)

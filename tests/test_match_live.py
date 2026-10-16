@@ -20,6 +20,8 @@ openpyxl = pytest.importorskip("openpyxl")
 
 from test_emissivity_match import TRUE_EPS, _prefill, _write, _zone_source  # noqa: E402
 
+from flir_player.excel_export import TcPrefill  # noqa: E402
+
 XL_NA = -2146826246
 
 
@@ -209,3 +211,26 @@ def test_excel_leaves_out_the_rows_where_a_zone_clips(excel, tmp_path) -> None:
     finally:
         book.Close(False)
         plain.Close(False)
+
+
+def test_excel_finds_tc_names_with_wildcard_characters_literally(excel, tmp_path) -> None:
+    # 0.8.0 review: MATCH reads ? and * as wildcards, so "T?" found "T1" after Excel recalculated
+    source, temps = _zone_source()
+    names = list(temps)
+    prefill = TcPrefill(times=tuple(float(t) for t in range(len(temps[names[0]]))),
+                        columns=(tuple(float(v) for v in temps[names[2]]), tuple(float(v) + 100 for v in temps[names[5]])),
+                        names=("T1", "T?"), roi_tc=((names[2], "T1"), (names[5], "T?")))
+    path = _write(tmp_path, source, prefill)
+    formulas = openpyxl.load_workbook(path)["Settings"]
+    cached = openpyxl.load_workbook(path, data_only=True)["Settings"]
+    cells = [cell.coordinate for row in formulas.iter_rows() for cell in row
+             if isinstance(cell.value, str) and "MATCH(SUBSTITUTE" in cell.value]
+    assert len(cells) == 2  # the ROIs with a TC
+    book = _open(excel, path)
+    try:
+        sheet = book.Worksheets("Settings")
+        for coordinate in cells:
+            _same(sheet.Range(coordinate).Value, cached[coordinate].value)
+        assert sorted(v for v in (cached[c].value for c in cells) if v not in ("", None)) == [1, 2]
+    finally:
+        book.Close(False)

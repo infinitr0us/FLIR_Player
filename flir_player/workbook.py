@@ -615,7 +615,9 @@ class _Writer:
                          f"+(1-{src}_TAU)*{s_expr(f'{src}_TATM')})/{src}_TAU"), cached=cached["c"])
             put(r, col["SREFL"], None, self.f_calc, formula=f"={s_expr(f'J{R}')}", cached=cached["srefl"])
             put(r, col["TCCOL"], None, self.f_calc,
-                formula=(f"=IF(H{R}=\"\",\"\",IFERROR(MATCH(H{R},'TC Compare'!$B${TC_FIRST + 1}:"
+                # the name as text, not a pattern: MATCH reads ? and * as wildcards (~ escapes them)
+                formula=(f"=IF(H{R}=\"\",\"\",IFERROR(MATCH(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(H{R},\"~\",\"~~\"),"
+                         f"\"*\",\"~*\"),\"?\",\"~?\"),'TC Compare'!$B${TC_FIRST + 1}:"
                          f"${xl_col_to_name(TC_COLUMNS)}${TC_FIRST + 1},0),\"\"))"
                          if has_tc else '=""'),
                 cached=self._tc_names.index(mapped) + 1 if mapped else "")
