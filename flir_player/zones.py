@@ -229,33 +229,39 @@ def split_box(spec: ZoneSpec, width: int | None = None, height: int | None = Non
     return zones
 
 
-_CHECK_PIXELS = 16_000_000  # without an image size, larger splits are not checked (no image is that big)
+_CHECK_PIXELS = 16_000_000  # without an image size, a larger overlap between two zones' boxes is refused unchecked
 
 
 def _shared_pixel(zones, image_width: int | None = None, image_height: int | None = None) -> tuple[str, str] | None:
     """The first two zones holding a common pixel (of the image, when its size is given), or None. Corners rounded
     to whole pixels can let neighbours overlap where the dividers lean much more than the band is tall; such a split
-    is refused."""
+    is refused. Only zones whose boxes meet are compared, over the part where they meet, so the work stays within
+    the zones' own size whatever the image's."""
     corners = [quad_corners(points) for _name, points in zones]
     if len(corners) < 2 or any(c is None for c in corners):
         return None
-    left = min(x for c in corners for x, _y in c)
-    top = min(y for c in corners for _x, y in c)
-    right = max(x for c in corners for x, _y in c)
-    bottom = max(y for c in corners for _x, y in c)
-    if image_width is not None and image_height is not None:  # only pixels the zones can measure
-        left, top = max(left, 0), max(top, 0)
-        right, bottom = min(right, image_width), min(bottom, image_height)
-    width, height = right - left, bottom - top
-    if width <= 0 or height <= 0 or width * height > _CHECK_PIXELS:
-        return None
-    owner = np.full((height, width), -1, dtype=np.int32)
-    for k, c in enumerate(corners):
-        ys, xs = _quad_coordinates(tuple((x - left, y - top) for x, y in c), height, width)
-        taken = owner[ys, xs]
-        if (taken >= 0).any():
-            return zones[int(taken[taken >= 0][0])][0], zones[k][0]
-        owner[ys, xs] = k
+    boxes = []
+    for c in corners:
+        left, top = min(x for x, _y in c), min(y for _x, y in c)
+        right, bottom = max(x for x, _y in c), max(y for _x, y in c)
+        if image_width is not None and image_height is not None:  # only pixels the zones can measure
+            left, top, right, bottom = max(left, 0), max(top, 0), min(right, image_width), min(bottom, image_height)
+        boxes.append((left, top, right, bottom))
+    for i in range(len(corners)):
+        for j in range(i + 1, len(corners)):
+            left, top = max(boxes[i][0], boxes[j][0]), max(boxes[i][1], boxes[j][1])
+            right, bottom = min(boxes[i][2], boxes[j][2]), min(boxes[i][3], boxes[j][3])
+            width, height = right - left, bottom - top
+            if width <= 0 or height <= 0:
+                continue
+            if image_width is None and width * height > _CHECK_PIXELS:
+                raise ValueError("The zones are too large to check for shared pixels; give the image size")
+            first = _quad_coordinates(tuple((x - left, y - top) for x, y in corners[i]), height, width)
+            mask = np.zeros((height, width), dtype=bool)
+            mask[first] = True
+            ys, xs = _quad_coordinates(tuple((x - left, y - top) for x, y in corners[j]), height, width)
+            if mask[ys, xs].any():
+                return zones[i][0], zones[j][0]
     return None
 
 

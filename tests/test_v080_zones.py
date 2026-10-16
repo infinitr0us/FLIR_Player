@@ -496,3 +496,13 @@ def test_r9_a_new_roi_list_during_a_drag_ends_it_without_moving_a_zone_alone(qap
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_r10_the_overlap_check_works_on_any_image_size() -> None:
+    # a large image no longer skips the check (16 M pixel guard of round two)
+    seed = ZoneSpec(((30, 30), (77, 34)), count=3, start="left", gap=1, far=(18, 23), lean=25)
+    moved = tuple((i, float(a), float(b)) for i, (a, b) in enumerate(divider_positions(seed)))
+    spec = ZoneSpec(((30, 2230), (8030, 2234)), count=200, start="left", gap=1, far=(187, 362), lean=25,
+                    moved=moved)
+    with pytest.raises(ValueError, match="would share pixels"):
+        split_box(spec, 8100, 2300)
