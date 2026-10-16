@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
@@ -43,8 +44,38 @@ from .widgets import ChevronComboBox, FramelessDialog, MessageDialog
 
 _SHEETS = (("tc", "TC Compare"), ("summary", "Summary"), ("charts", "Charts"),
            ("roimap", "ROI map"), ("validation", "Validation (vs SDK)"))
-_TC_FILE_KEY = "excel/tc_file"
+_TC_FILE_KEY = "excel/tc_files"  # JSON: recording -> its TC file (a file of another test must not time this one)
+_TC_FILES_KEPT = 50
 _TC_PAIRS_KEY = "excel/tc_pairs"
+
+
+def _tc_files() -> dict[str, str]:
+    try:
+        files = json.loads(app_settings().value(_TC_FILE_KEY, "", type=str) or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in files.items()} if isinstance(files, dict) else {}
+
+
+def _recording_key(recording) -> str:
+    try:
+        return str(Path(recording).expanduser().resolve())
+    except OSError:
+        return str(recording)
+
+
+def remembered_tc_file(recording) -> str:
+    """The TC file last exported with ``recording``, if it still exists ("" otherwise)."""
+    path = _tc_files().get(_recording_key(recording), "")
+    return path if path and Path(path).is_file() else ""
+
+
+def remember_tc_file(recording, tc_file) -> None:
+    files = _tc_files()
+    key = _recording_key(recording)
+    files.pop(key, None)
+    files[key] = str(tc_file)
+    app_settings().setValue(_TC_FILE_KEY, json.dumps(dict(list(files.items())[-_TC_FILES_KEPT:])))
 
 
 def _duplicate_names(names) -> list[str]:
@@ -86,11 +117,15 @@ def parse_tc_pairs(text: str, tc_names, roi_names) -> tuple[dict[str, str], tupl
     return pairs, tuple(errors)
 
 
-def _default_tc_pairs(tc_names, roi_names) -> str:
-    """The lab's top-face TCs, by cell number, only where the zone name is unambiguous."""
+def _default_tc_pairs(tc_names, roi_names, zone_names=()) -> str:
+    """The lab's top-face TCs, by cell number, only where the zone name is unambiguous: among the cell zones
+    (``zone_names``) when there are any, so a "Box 3" drawn by hand does not compete with "Cell 3"."""
     pairs = []
     for tc, number in (("T1", 3), ("T2", 6), ("T3", 9)):
-        matches = [name for name in roi_names if re.fullmatch(rf".+ {number}", name)]
+        for names in ((zone_names, roi_names) if zone_names else (roi_names,)):
+            matches = [name for name in names if re.fullmatch(rf".+ {number}", name)]
+            if matches:
+                break
         if tc in tc_names and len(matches) == 1:
             pairs.append(f"{tc} = {matches[0]}")
     return ", ".join(pairs)
@@ -244,7 +279,7 @@ class ExcelExportDialog(FramelessDialog):
         self.extremes_check = QCheckBox("Max and min")
         self.extremes_check.setToolTip("Hottest and coldest pixel of each area. Every column is a formula Excel "
                                        "reads when it opens the workbook: leave them out for many ROIs.")
-        areas = sum(1 for roi in self.rois if roi.kind in ("rect", "ellipse"))
+        areas = sum(1 for roi in self.rois if roi.kind in ("rect", "ellipse", "quad"))
         self.extremes_check.setChecked(areas <= 8)
         self.median_check = QCheckBox("Median")
         self.p95_check = QCheckBox("95th percentile")
@@ -308,10 +343,8 @@ class ExcelExportDialog(FramelessDialog):
         tc_form = QFormLayout(self.tc_file_box)
         tc_form.setContentsMargins(0, 0, 0, 0)
         row, self.tc_file_edit, tc_browse = _path_row("Choose the TC file")
-        saved_path = app_settings().value(_TC_FILE_KEY, "", type=str)
         fit_path = getattr(tc_run, "tc_file", None)
-        self.tc_file_edit.setText(str(fit_path) if fit_path else
-                                  saved_path if saved_path and Path(saved_path).is_file() else "")
+        self.tc_file_edit.setText(str(fit_path) if fit_path else remembered_tc_file(metadata.path))
         tc_browse.clicked.connect(self._browse_tc)
         tc_form.addRow("TC file", row)
         self.tc_sheet_combo = ChevronComboBox()
@@ -531,7 +564,8 @@ class ExcelExportDialog(FramelessDialog):
             if self.tc_pairs_edit.text() == self._tc_auto_pairs:
                 saved = app_settings().value(_TC_PAIRS_KEY, "", type=str)
                 _pairs, errors = parse_tc_pairs(saved, table.names, roi_names)
-                self._tc_auto_pairs = saved if not errors else _default_tc_pairs(table.names, roi_names)
+                zone_names = tuple(roi.name for roi in self.rois if roi.kind == "quad")
+                self._tc_auto_pairs = saved if not errors else _default_tc_pairs(table.names, roi_names, zone_names)
                 self.tc_pairs_edit.setText(self._tc_auto_pairs)
             if (self._tc_clock is not None and self.tc_source_combo.currentData() == "file"
                     and self.tc_check.isChecked() and not self.metadata.presets
@@ -700,7 +734,7 @@ class ExcelExportDialog(FramelessDialog):
             if self._tc_table is not None:
                 pairs, errors = self._file_pairs()
                 if not errors:
-                    parts.append("Pairs: " + " · ".join(f"{tc} -> {roi}" for tc, roi in pairs.items()) + ".")
+                    parts.append("Pairs: " + " · ".join(f"{tc} → {roi}" for tc, roi in pairs.items()) + ".")
                 parts.append(self._file_clock_text())
             if reason:
                 parts.append(reason)
@@ -788,9 +822,8 @@ class ExcelExportDialog(FramelessDialog):
             return
         self._replace = [str(path) for path in replace]
         if self.tc_source_combo.currentData() == "file" and self.tc_prefill() is not None:
-            settings = app_settings()
-            settings.setValue(_TC_FILE_KEY, str(Path(self._tc_read_path).expanduser().resolve()))
-            settings.setValue(_TC_PAIRS_KEY, self.tc_pairs_edit.text().strip())
+            remember_tc_file(self.metadata.path, Path(self._tc_read_path).expanduser().resolve())
+            app_settings().setValue(_TC_PAIRS_KEY, self.tc_pairs_edit.text().strip())
         super().accept()
 
     def done(self, result: int) -> None:

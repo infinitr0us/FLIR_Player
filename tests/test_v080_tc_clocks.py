@@ -319,7 +319,7 @@ def test_settings_only_after_accept(qapp, make_dialog, lab_file, isolated_settin
     assert not isolated_settings.contains(excel_dialog._TC_PAIRS_KEY)
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted
-    assert isolated_settings.value(excel_dialog._TC_FILE_KEY) == str(lab_file)
+    assert excel_dialog.remembered_tc_file(dialog.metadata.path) == str(lab_file)
     assert isolated_settings.value(excel_dialog._TC_PAIRS_KEY) == custom
     again = make_dialog()
     assert wait_until(qapp, lambda: not again._tc_reading)
@@ -328,8 +328,11 @@ def test_settings_only_after_accept(qapp, make_dialog, lab_file, isolated_settin
     fallback = make_dialog()
     assert wait_until(qapp, lambda: not fallback._tc_reading)
     assert fallback.tc_pairs_edit.text() == "T1 = Cell 3, T2 = Cell 6, T3 = Cell 9"
-    isolated_settings.setValue(excel_dialog._TC_FILE_KEY, str(lab_file.with_name("missing.xlsx")))
+    excel_dialog.remember_tc_file(dialog.metadata.path, lab_file.with_name("missing.xlsx"))
     assert make_dialog().tc_file_edit.text() == ""
+    # another recording does not get this recording's TC file (another test's clocks could time it)
+    excel_dialog.remember_tc_file(dialog.metadata.path, lab_file)
+    assert excel_dialog.remembered_tc_file(dialog.metadata.path.with_name("other.csq")) == ""
 
 
 def test_export_cannot_overwrite_its_tc_file(qapp, make_dialog, lab_file, monkeypatch, isolated_settings):
@@ -470,3 +473,12 @@ def test_clock_prefill_written_values_and_chosen_tc_without_sdk(tmp_path):
         assert [tc.cell(TC_FIRST + 4, c).value for c in (1, 2, 3)] == [2, 64, 62]
     finally:
         book.close()
+
+
+def test_default_pairs_prefer_the_cell_zones_over_other_rois_with_the_same_number():
+    names = ("T1", "T2", "T3")
+    rois = ("Box 3", "Cell 3", "Cell 6", "Cell 9")
+    assert excel_dialog._default_tc_pairs(names, rois, ("Cell 3", "Cell 6", "Cell 9")) == (
+        "T1 = Cell 3, T2 = Cell 6, T3 = Cell 9")
+    # without zones, an ambiguous number pairs nothing
+    assert excel_dialog._default_tc_pairs(names, rois) == "T2 = Cell 6, T3 = Cell 9"
