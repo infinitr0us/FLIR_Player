@@ -1854,12 +1854,14 @@ class _Writer:
         passed = not failed and worst_cached <= 0.01
         # every sample skipped (e.g. a flame preset whose ROIs the SDK clamps): nothing was compared
         unchecked = "NOT CHECKED — the SDK clamped every sample"
-        ws.write_formula(summary_row, 3, f'=IF(COUNT({abs_range})=0,"–",MAX({abs_range}))', self.f_calc,
+        # an error among the comparisons stays an error (CHECK); only no comparison at all is "–"
+        ws.write_formula(summary_row, 3, f'=IF(SUMPRODUCT(--ISERROR({abs_range}))>0,MAX({abs_range}),'
+                                         f'IF(COUNT({abs_range})=0,"–",MAX({abs_range})))', self.f_calc,
                          "#NUM!" if failed else worst_cached if checked else "–")
+        d = f"D{summary_row + 1}"
         ws.write_formula(summary_row, 4,
-                         f'=IF(ISNUMBER(D{summary_row + 1}),IF(D{summary_row + 1}<=0.01,'
-                         f'"PASS — formulas reproduce the SDK","CHECK"),'
-                         f'IF(D{summary_row + 1}="–","{unchecked}","CHECK"))',
+                         f'=IF(ISERROR({d}),"CHECK",IF(ISNUMBER({d}),IF({d}<=0.01,'
+                         f'"PASS — formulas reproduce the SDK","CHECK"),IF({d}="–","{unchecked}","CHECK")))',
                          None, ("PASS — formulas reproduce the SDK" if passed else "CHECK") if checked or failed
                          else unchecked)
         ws.write(summary_row + 1, 0, "Binned means are approximations and excluded from the pass mark; "

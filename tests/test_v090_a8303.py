@@ -418,3 +418,70 @@ def test_playback_stays_inside_a_range_whose_end_is_another_presets(qapp, ats, m
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_play_again_after_a_preset_range_end_starts_the_range_over(qapp, ats, monkeypatch) -> None:
+    """Review 0.9.0 (third round): stopped at the preset's last frame in the range (4 of 0-5), Play restarts."""
+    pytest.importorskip("fnv")
+    from conftest import wait_until
+
+    window = _window_on(qapp, ats, monkeypatch, _A8303Like())  # preset 1 = even frames
+    shown = []
+    try:
+        window._change_loop(False)
+        window.transport.slider.set_play_range(0, 5)
+        window.seek_to(0)
+        assert wait_until(qapp, lambda: window.current_packet.index == 0)
+        original = window._present_packet
+        window._present_packet = lambda packet: (shown.append(packet.index), original(packet))
+        window.toggle_playback()
+        assert wait_until(qapp, lambda: not window.playing and window.current_packet.index == 4, timeout=10.0)
+        shown.clear()
+        window.toggle_playback()
+        assert wait_until(qapp, lambda: 0 in shown, timeout=10.0)
+        assert wait_until(qapp, lambda: 4 in shown, timeout=10.0) and max(shown) == 4
+    finally:
+        window.pause_playback(invalidate=True)
+        window.close()
+        qapp.processEvents()
+
+
+def test_a_range_without_the_presets_frames_does_not_loop(qapp, ats, monkeypatch) -> None:
+    """Review 0.9.0 (third round): frames 1-3 are all preset 2; Play with preset 1 shown must not keep seeking."""
+    pytest.importorskip("fnv")
+    from conftest import wait_until
+
+    window = _window_on(qapp, ats, monkeypatch, _A8303Like(preset_of=lambda i: 2 if i in (1, 2) else 1 + i % 2))
+    requests = []
+    try:
+        window.transport.slider.set_play_range(1, 3)
+        original = window.decoder.request_frame
+        window.decoder.request_frame = lambda index, *a, **k: (requests.append(index), original(index, *a, **k))
+        window.toggle_playback()
+        assert wait_until(qapp, lambda: window.current_packet.index == 4)
+        for _ in range(20):
+            qapp.processEvents()
+        assert requests == [1] and not window.playing
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_validation_errors_stay_check(tmp_path) -> None:
+    """Review 0.9.0 (third round): samples whose formula fails are CHECK, not "nothing checked"."""
+    from flir_player.excel_export import ExportData
+    from flir_player.workbook import write_workbook
+    from test_excel_workbook import _source
+
+    for case in ("all", "one"):
+        source = _source("Check", 12, np.random.default_rng(7))
+        source.rois = source.rois[:1]  # one spot, two validation samples
+        rows = source.validation_rows if case == "all" else source.validation_rows[:1]
+        source.rois[0].counts["value"][rows] = 0.0  # LN of a negative argument
+        out = tmp_path / f"errors_{case}.xlsx"
+        write_workbook(out, ExportData(times=np.arange(12, dtype=float), sources=[source], options=ExportOptions(),
+                                       created=datetime(2026, 10, 18), versions={}))
+        values = openpyxl.load_workbook(out, data_only=True)["Validation"]
+        formulas = openpyxl.load_workbook(out)["Validation"]
+        assert (values["D4"].value, values["E4"].value) == ("#NUM!", "CHECK")
+        assert "ISERROR" in formulas["D4"].value and formulas["E4"].value.startswith('=IF(ISERROR(D4),"CHECK"')

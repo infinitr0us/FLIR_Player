@@ -207,6 +207,8 @@ class MainWindow(QMainWindow):
         # with a superframing preset shown: the last frame read inside the play range, once the next one fell
         # beyond it (the range's end is no frame of that preset)
         self._range_last: int | None = None
+        # ((play range, preset), frame): where such a lap ended, so Play there starts the range again
+        self._range_end_seen: tuple[tuple, int] | None = None
         self._filters_state: dict = {
             "point": ("none", 1.0),
             "spatial": ("none", 3),
@@ -528,6 +530,9 @@ class MainWindow(QMainWindow):
             self.pause_playback(invalidate=True)
             return
         start, end = self._playback_bounds()
+        seen = self._range_end_seen
+        if seen is not None and seen[0] == ((start, end), self._preset):
+            end = min(end, seen[1])  # the shown preset's last frame in the range: Play starts it again
         if self.current_packet.index < start or self.current_packet.index >= end:
             if start < end:
                 self._restart_after_seek = True
@@ -1920,6 +1925,8 @@ class MainWindow(QMainWindow):
         if self.current_packet is None or self.current_packet.index < end:
             return False
         self._end_pending = False
+        if self._range_last is not None:
+            self._range_end_seen = ((self._playback_bounds(), self._preset), self._range_last)
         if self.loop_playback:
             self._wrap_playback(start)
         else:
@@ -2086,6 +2093,12 @@ class MainWindow(QMainWindow):
         self._present_packet(packet)
         if self._restart_after_seek:
             self._restart_after_seek = False
+            start, end = self._playback_bounds()
+            if self._preset is not None and not start <= packet.index <= end:
+                # the snap left the play range: it holds no frame of the shown preset
+                self._notify(f"The play range holds no frame of preset {self._preset}: widen it or show "
+                             "another preset")
+                return
             QTimer.singleShot(0, self.toggle_playback)
 
     def _anchor_after_wrap(self, packet: FramePacket) -> None:
