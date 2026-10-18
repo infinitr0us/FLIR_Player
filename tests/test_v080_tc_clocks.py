@@ -230,6 +230,8 @@ def test_dialog_without_clock_uses_manual_ignition(qapp, make_dialog, lab_file, 
     assert why in dialog.tc_label.text() and "taken as logger time 0" in dialog.tc_label.text()
     dialog.ignition_spin.setValue(101)
     assert dialog.options().tc_prefill.offset_s == 0
+    # placed on the workbook's own axis (time 0 = the ignition frame): a clock-timed export must not move it
+    assert dialog.options().tc_prefill.frame is None
 
 
 def test_dialog_clamps_clock_before_recording(qapp, make_dialog, lab_file, monkeypatch):

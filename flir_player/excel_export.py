@@ -894,6 +894,9 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 rate = recording_rate(im, repair)
             measured.append(rate)
             fps = rate.fps
+            height, width = int(im.height), int(im.width)
+            pixel_counts += [int(roi_coordinates(shape, height, width)[0].size) for shape in spec.rois
+                             if shape.kind != "cursor"]
             if pick is not None:  # one preset's frames, always timed by the camera clock
                 if not (first and last and ignition):
                     raise ValueError(f"{spec.path.name}: its clock cannot time the frames of one preset")
@@ -910,9 +913,6 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 spans.append(((first - ignition).total_seconds(), (last - ignition).total_seconds()))
             else:
                 spans.append(source_span(n, fps, spec.ignition_frame))
-            height, width = int(im.height), int(im.width)
-            pixel_counts += [int(roi_coordinates(shape, height, width)[0].size) for shape in spec.rois
-                             if shape.kind != "cursor"]
         pixel_limit = (options.pixel_limit if options.area_means == "signal" else
                        fit_pixel_limit([count for count in pixel_counts if count], options))
         if pixel_limit != options.pixel_limit:
@@ -926,7 +926,11 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 ignition = _stamp(opened[0], specs[0].ignition_frame, repair)
             if zero and ignition and prefill.fps and prefill.fps > 0:
                 delta = prefill.frame / prefill.fps - (ignition - zero).total_seconds()
-                options = dataclass_replace(options, tc_prefill=prefill.rebased(delta))
+                # the dialog's From/To were placed the same way (e.g. the logger's span): they move too
+                options = dataclass_replace(
+                    options, tc_prefill=prefill.rebased(delta),
+                    start_s=None if options.start_s is None else options.start_s + delta,
+                    end_s=None if options.end_s is None else options.end_s + delta)
         times = timeline(spans, options, rates[0])
         total = times.size * len(specs) + 1
         done = 0

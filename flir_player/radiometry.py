@@ -385,7 +385,8 @@ def fit_atmosphere(distance_m, humidity, atmosphere_k, tau) -> tuple[AtmosphereC
 
     def residual(q):
         e1, e2 = bands(q)
-        return e2 + weight(e1, e2) * (e1 - e2) - tau
+        with np.errstate(over="ignore", invalid="ignore"):  # a diverging step: non-finite, rejected below
+            return e2 + weight(e1, e2) * (e1 - e2) - tau
 
     best = None
     alphas = np.geomspace(1e-4, 1.0, 9)

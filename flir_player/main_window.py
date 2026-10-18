@@ -607,7 +607,8 @@ class MainWindow(QMainWindow):
                 self.toggle_playback()
 
     def _playback_bounds(self) -> tuple[int, int]:
-        last = max(0, (self.metadata.num_frames - 1) if self.metadata else 0)
+        # with a superframing preset shown, playback ends at that preset's last frame
+        last = max(0, self.metadata.last_frame(self._preset) if self.metadata else 0)
         if self._play_range is not None:
             start, end = self._play_range
             return (max(0, min(start, last)), max(0, min(end, last)))
@@ -646,9 +647,9 @@ class MainWindow(QMainWindow):
             return
         if self._preset is not None and self.metadata is not None:
             delta = int(delta) * len(self.metadata.presets)  # one preset cycle per step
-        self.seek_to(self.current_packet.index + int(delta))
+        self.seek_to(self.current_packet.index + int(delta), snap=-1 if delta < 0 else 1)
 
-    def seek_to(self, index: int) -> None:
+    def seek_to(self, index: int, snap: int = 1) -> None:
         if self.metadata is None:
             return
         restart = self._restart_after_seek
@@ -661,11 +662,12 @@ class MainWindow(QMainWindow):
             request_id,
             need_clip=self.show_clipping,
             need_metadata=self._metadata_tab_active(),
+            snap=snap,
         )
 
     def _seek_to_end(self) -> None:
         if self.metadata is not None:
-            self.seek_to(self.metadata.num_frames - 1)
+            self.seek_to(self.metadata.last_frame(self._preset), snap=-1)
 
     def _timeline_hover_text(self, index: int) -> str:
         if self.metadata is None:
@@ -1219,7 +1221,10 @@ class MainWindow(QMainWindow):
         if self.metadata is None or self._busy or self.current_packet is None:
             return
         self.pause_playback(invalidate=True)
-        dialog = ExportMovieDialog(self.metadata, self, default_range=self._play_range)
+        # a superframing preset shown: its frames only, one per preset cycle (the movie plays in real time)
+        rate = (self.metadata.nominal_fps / len(self.metadata.presets) if self._preset is not None
+                and self.metadata.presets else None)
+        dialog = ExportMovieDialog(self.metadata, self, default_range=self._play_range, fps=rate)
         if dialog.exec() == ExportMovieDialog.DialogCode.Accepted:
             params = dialog.parameters()
             params["kind"] = "movie"

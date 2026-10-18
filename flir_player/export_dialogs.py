@@ -327,7 +327,9 @@ class ExportMovieDialog(FramelessDialog):
         metadata: VideoMetadata,
         parent=None,
         default_range: tuple[int, int] | None = None,
+        fps: float | None = None,
     ) -> None:
+        """``fps``: the default frame rate (the recording's; a superframing preset's when one is shown)."""
         super().__init__("Export Movie", parent)
         self.setMinimumWidth(480)
         total = metadata.num_frames
@@ -349,7 +351,7 @@ class ExportMovieDialog(FramelessDialog):
         self.fps_spin = QDoubleSpinBox()
         self.fps_spin.setRange(1.0, 240.0)
         self.fps_spin.setDecimals(2)
-        self.fps_spin.setValue(round(metadata.nominal_fps, 2) or 30.0)
+        self.fps_spin.setValue(round(fps if fps is not None else metadata.nominal_fps, 2) or 30.0)
         form.addRow("Frame rate", self.fps_spin)
 
         self.start_spin = QSpinBox()

@@ -376,6 +376,10 @@ def _radiance_route(im, indices, limits, file_parameters, abort) -> CalibrationR
         return CalibrationReport(None, "unavailable", f"Its radiance is no quadratic of its counts (off by "
                                  f"{off / np.ptp(radiance[valid]):.1e} of its span).",
                                  file_parameters=file_parameters, signal="radiance")
+    top = threshold if threshold is not None else float(np.nanmax(counts))
+    if not (np.polyval(np.polyder(poly), 0.0) > 0 and np.polyval(np.polyder(poly), top) > 0):
+        return CalibrationReport(None, "unavailable", "Its radiance does not rise with the counts over the "
+                                 "camera's range.", file_parameters=file_parameters, signal="radiance")
     signal = np.polyval(poly, counts)
     pairs = np.unique(np.column_stack([signal[valid], kelvin[valid]]), axis=0)
     if pairs.shape[0] < 16 or np.ptp(pairs[:, 1]) < 5.0:
@@ -403,12 +407,15 @@ def _radiance_route(im, indices, limits, file_parameters, abort) -> CalibrationR
                                  f"Its radiance does not follow one calibration curve either (max error "
                                  f"{fit_error:.3g} K).", fit_error_k=fit_error, file_parameters=file_parameters,
                                  signal="radiance")
-    widest = int(np.argmax([np.ptp(k[np.isfinite(k)]) for k in kelvin]))
     try:
-        atmosphere, tau_error = _sdk_atmosphere(im, planck, indices[widest], signal[widest], valid[widest])
+        atmosphere, tau_error = _sdk_atmosphere(im, planck, indices, signal, valid)
     except (ValueError, np.linalg.LinAlgError) as exc:
         return CalibrationReport(None, "unavailable", f"The camera's transmission could not be read: {exc}.",
                                  fit_error_k=fit_error, file_parameters=file_parameters, signal="radiance")
+    if tau_error > TRANSMISSION_TOLERANCE:
+        return CalibrationReport(None, "unavailable", f"FLIR's transmission model does not reproduce the camera's "
+                                 f"transmission (max error {tau_error:.2g}).", fit_error_k=fit_error,
+                                 file_parameters=file_parameters, signal="radiance")
     base = limits if limits is not None else _sdk_limits(im, None)
     raw = None if threshold is None else (float(np.polyval(poly, 0.0)), float(np.polyval(poly, threshold)))
     final_limits = RangeLimits(calibrated=base.calibrated, clip=base.clip, saturated=base.saturated, raw=raw)
@@ -416,14 +423,12 @@ def _radiance_route(im, indices, limits, file_parameters, abort) -> CalibrationR
     own = ("the recording's own parameters", MeasurementParameters.from_sdk(file_parameters))
     # Pixels the SDK clamped at neutral parameters are no measurement; under other parameters it
     # spreads them over a few kelvin instead of one clamp value, so they are left out here.
-    checks = _parameter_checks(im, calibration, indices[widest], signal[widest], extra=(own,), valid=valid[widest])
+    checks = _pooled_checks(im, calibration, indices, signal, valid, extra=(own,))
     worst = max((error for _label, error, _n in checks), default=np.inf)
     if not np.isfinite(worst) or worst > TOLERANCE_K:
-        detail = (f"; the camera's transmission could not be reproduced (max error {tau_error:.2g})"
-                  if tau_error > TRANSMISSION_TOLERANCE else "")
         return CalibrationReport(None, "unavailable",
                                  f"The fit to its radiance did not reproduce the SDK under changed parameters "
-                                 f"(max error {worst:.3g} K{detail}).", fit_error_k=fit_error, checks=tuple(checks),
+                                 f"(max error {worst:.3g} K).", fit_error_k=fit_error, checks=tuple(checks),
                                  file_parameters=file_parameters, signal="radiance")
     source = (f"fit to File SDK temperatures over its radiance, with the camera's transmission; verified against "
               f"the File SDK (max error {max(worst, fit_error):.1e} K)")
@@ -433,33 +438,58 @@ def _radiance_route(im, indices, limits, file_parameters, abort) -> CalibrationR
                              signal_poly=tuple(float(v) for v in poly))
 
 
-def _sdk_atmosphere(im, planck, index, signal, valid):
+def _sdk_atmosphere(im, planck, indices, signal, valid):
     """The camera's atmosphere constants, from the SDK's temperatures under automatic transmission.
 
     With ε 0.9 and the window open, a pixel's signal S = ε τ S(T) + (1 − ε) τ S(Tr)
-    + (1 − τ) S(Ta) gives τ from the SDK's T; the median over the pixels
-    ``valid`` at neutral parameters and unclamped at each condition of
-    ``_TRANSMISSION_GRID``, then ``fit_atmosphere``. Returns (constants, their
-    largest error in τ).
+    + (1 − τ) S(Ta) gives τ from the SDK's T; the median over the pixels of
+    frames ``indices`` that are ``valid`` at neutral parameters and unclamped
+    at each condition of ``_TRANSMISSION_GRID``, then ``fit_atmosphere``.
+    Returns (constants, their largest error in τ).
     """
     set_unit_safely(im, fnv.Unit.TEMPERATURE_FACTORY, fnv.TempType.KELVIN)
     eps, reflected = 0.9, 293.15
+    frames = [k for k in range(len(indices)) if valid[k].any()]
     taus = []
     for distance, humidity, atmosphere_k in _TRANSMISSION_GRID:
         params = MeasurementParameters(emissivity=eps, reflected_k=reflected, atmosphere_k=atmosphere_k,
                                        transmission=None, distance_m=distance, humidity=humidity)
         write_parameters(im, sdk_values(params))
-        sdk = read_array(im, index).astype(np.float64)
-        good = valid & _unclamped(sdk)
-        if good.sum() < 16:
-            raise ValueError("too few unclamped pixels")
         s_atm = float(planck.signal(atmosphere_k))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            tau = (signal[good] - s_atm) / (eps * planck.signal(sdk[good]) + (1 - eps) * planck.signal(reflected)
-                                            - s_atm)
+        pooled = []
+        for k in frames:
+            sdk = read_array(im, indices[k]).astype(np.float64)
+            good = valid[k] & _unclamped(sdk)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pooled.append((signal[k][good] - s_atm) / (eps * planck.signal(sdk[good])
+                                                           + (1 - eps) * planck.signal(reflected) - s_atm))
+        tau = np.concatenate(pooled) if pooled else np.empty(0)
+        if tau.size < 16:
+            raise ValueError("too few unclamped pixels")
         taus.append(float(np.median(tau)))
     grid = np.array(_TRANSMISSION_GRID)
     return fit_atmosphere(grid[:, 0], grid[:, 1], grid[:, 2], np.array(taus))
+
+
+def _pooled_checks(im, calibration, indices, signal, valid, extra=()) -> list[tuple[str, float, int]]:
+    """``_parameter_checks`` on every frame with valid pixels: per check the largest error and all pixels compared.
+
+    A preset for flames may hold its few in-range pixels in one frame and lose them to a clamp under a check's
+    parameters there, while another frame keeps some.
+    """
+    merged: dict[str, tuple[float, int]] = {}
+    for k in range(len(indices)):
+        if not valid[k].any():
+            continue
+        for label, error, pixels in _parameter_checks(im, calibration, indices[k], signal[k], extra, valid[k]):
+            worst, total = merged.get(label, (0.0, 0))
+            if pixels:
+                merged[label] = (max(worst, error), total + pixels)
+            else:
+                merged.setdefault(label, (0.0, 0))
+    labels = [label for label, _params in (*_CHECKS, *extra)]
+    return [(label, merged[label][0] if merged.get(label, (0, 0))[1] else float("inf"),
+             merged.get(label, (0, 0))[1]) for label in labels]
 
 
 def _file_parameters(im: Any) -> dict[str, float]:

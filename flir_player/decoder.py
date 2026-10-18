@@ -109,6 +109,14 @@ class _PacketCache:
         return len(self._packets)
 
 
+def series_frames(read: list[int], start: int, end: int, step: int) -> list[int]:
+    """The frames a movie or image series writes: every ``step``-th frame number from ``start`` to ``end``,
+    as the export dialog chose them (and checked for files to replace), of the frames ``read`` (with a
+    superframing preset shown, only its frames are)."""
+    shown = set(read)
+    return [index for index in range(start, end + 1, max(1, int(step))) if index in shown]
+
+
 def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
     """Decode one frame and compose it exactly like the live view (WYSIWYG).
 
@@ -218,14 +226,18 @@ class DecoderThread(QThread):
         request_id: int,
         need_clip: bool = True,
         need_metadata: bool = True,
+        snap: int = 1,
     ) -> None:
         """Latest-wins frame read: superseded pending frame reads are dropped.
+
+        ``snap`` -1 takes, with a superframing preset shown, the preset's frame at or before ``index``
+        (a step back); otherwise the one at or after it.
 
         Frame reads are idempotent and the GUI discards stale request IDs, so
         coalescing pending "frame" commands cannot reorder anything; state
         changes keep strict FIFO order.
         """
-        payload = (int(index), int(request_id), bool(need_clip), bool(need_metadata))
+        payload = (int(index), int(request_id), bool(need_clip), bool(need_metadata)) + ((-1,) if snap < 0 else ())
         with self._commands.not_empty:
             queue = self._commands.queue
             kept = [entry for entry in queue if entry[0] != "frame"]
@@ -343,8 +355,8 @@ class DecoderThread(QThread):
                         self.corrections_ready.emit(source.read_corrections())
                         self.busy_changed.emit(False, "")
                     elif command == "frame":
-                        index, request_id, need_clip, need_metadata = payload
-                        key = (source.revision, source.unit.key, index)
+                        index, request_id, need_clip, need_metadata, *back = payload  # back: (-1,) for a step back
+                        key = (source.revision, source.unit.key, index, *back)
                         packet = cache.get(
                             key, need_clip=need_clip, need_metadata=need_metadata
                         )
@@ -354,6 +366,7 @@ class DecoderThread(QThread):
                                 request_id=request_id,
                                 need_clip=need_clip,
                                 need_metadata=need_metadata,
+                                **({"snap": -1} if back else {}),
                             )
                             cache.put(key, replace(packet, request_id=0))
                         self.frame_ready.emit(replace(packet, request_id=request_id))
@@ -516,11 +529,13 @@ class DecoderThread(QThread):
         step = max(1, int(payload["decimation"]))
         if start < 0 or end >= source.metadata.num_frames or end < start:
             return False, "Invalid or empty frame range"
-        read = source.preset_frames(start, end)  # with a superframing preset chosen, only its frames
-        frame_range = read[::step]
+        read = source.preset_frames(start, end)  # with a superframing preset shown, only its frames
+        frame_range = series_frames(read, start, end, step)
         total = len(frame_range)
         if total <= 0:
-            return False, "Invalid or empty frame range"
+            return False, ("None of the chosen frames belongs to the preset shown; export every frame (step 1) "
+                           "or start on one of its frames" if len(read) <= end - start else
+                           "Invalid or empty frame range")
         if payload.get("revision", source.revision) != source.revision:
             return False, "Analysis settings changed; start the export again"
         is_movie = payload["kind"] == "movie"

@@ -390,8 +390,10 @@ The conversion is FLIR's measurement formula,
 recording's own calibration record. For SEQ/CSQ, that record and a fit to the
 File SDK's temperatures must agree and reproduce the SDK under changed
 parameters before live formulas are written (typically to 5 × 10⁻⁵ K).
-Recordings without a factory calibration, such as ResearchIR user
-calibrations, are exported as counts only. *Export → Save ROI set…* stores the
+Cameras whose counts do not follow the curve, such as the A8303sc, are
+calibrated on the File SDK's radiance instead (see *Superframing cameras*
+below), checked the same way. Recordings without a factory calibration, such
+as ResearchIR user calibrations, are exported as counts only. *Export → Save ROI set…* stores the
 ROIs and the ignition frame next to the recording (`<file>.rois.json`) for
 reuse and for multi-camera workbooks; it also keeps which ROIs were split from
 one box, so cell zones can be re-split after loading.
@@ -515,9 +517,37 @@ When the recording is opened again, the player reopens the last fit from its
 default results folder (`<recording>_tcmatch`, reading the TC file again), so a
 workbook can be filled from it in a later session; the setup dialog also offers
 the last run's search region, whose saved statistics make a rerun quick.
-Superframing recordings use the frames of one preset; their workbook cannot
-separate presets yet, so the Excel export refuses them (its rows would mix the
-presets). Recordings without a factory calibration cannot be fitted.
+Superframing recordings use the frames of one preset (the player's, else the
+lowest range), timed by the camera clock, and their workbook reads the same
+preset. Recordings without a factory calibration cannot be fitted.
+
+## Superframing cameras (A8303sc)
+
+The FLIR A8303sc records in *superframing*: it cycles through presets
+(temperature ranges, e.g. 250 to 600 °C, 500 to 1200 °C and 850 to 2000 °C),
+one frame each. Each preset sees only its own range.
+
+- **Player:** a *Preset* choice under *Unit* (superframing recordings only)
+  shows and measures the frames of one preset, the lowest range to start with,
+  so the picture and the readouts no longer jump between ranges. A one-frame
+  step moves one preset cycle; *Every frame* shows the recording as stored.
+- **Calibration:** this camera's counts do not follow FLIR's calibration curve.
+  The File SDK turns them into radiance (a quadratic of the counts) and its
+  temperatures follow `R / (exp(B/T) − 1)` of that radiance, with the object
+  parameters applied to the radiance and the camera's own atmospheric
+  transmission. The player fits all of it to the SDK, per preset, and verifies
+  it like any other calibration (also at the recording's own parameters). The
+  workbook's counts columns then hold the SDK radiance × 100,000 ("signal"),
+  and the Source sheet says so.
+- **Excel workbook:** *Preset* in the export dialog (the player's to start
+  with). Every row reads that preset's frame nearest its time by the camera
+  clock. Below its range such a preset's values are far off (a cold module
+  reads about 95 °C at the 250 °C preset), so these workbooks start with
+  *Out-of-range values: Leave them blank (#N/A)*, a gap in the charts.
+- **Emissivity from TCs:** works on one preset, with the radiance calibration.
+  A mid-wave camera without a flame filter sees hot gas as well as the battery,
+  so the IR above a TC is often hotter than the TC itself; the fit then reports
+  that no emissivity explains it.
 
 Known SDK issue (fixed by FileSDK 2026.1): with FileSDK 5.0.1, switching
 units on recordings that carry a ResearchIR user calibration

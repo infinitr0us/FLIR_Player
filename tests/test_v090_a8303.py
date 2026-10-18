@@ -43,30 +43,34 @@ PRESETS = {1: ((523.15, 873.15), PlanckConstants(19.104868, 3632.4014, 1.0, 0.0)
 
 
 class _A8303Like:
-    """A superframing ATS handle: frame i has preset 1 + i % 2, 2 frames per second."""
+    """A superframing ATS handle: frame i has preset 1 + i % 2 (or ``preset_of(i)``), 2 frames per second."""
 
-    width = height = 8
     num_frames = 120
 
-    def __init__(self, scene=None, clock_gap: float = 0.0):
+    def __init__(self, scene=None, clock_gap: float = 0.0, size: int = 8, preset_of=None,
+                 transmission=None):
         import fnv
         self.fnv = fnv
+        self.width = self.height = size
         self.unit, self.temp_type = fnv.Unit.COUNTS, fnv.TempType.KELVIN
         self.supported_units = [fnv.Unit.COUNTS, fnv.Unit.RADIANCE_FACTORY, fnv.Unit.TEMPERATURE_FACTORY]
         self.reset_object_parameters()
+        self.preset_of = preset_of or (lambda i: 1 + i % 2)
         info = [NS(available=False, calibrated=False, num_frames=0, min_temp=0.0, max_temp=0.0)]
         for preset, ((low, high), _curve, _quad) in PRESETS.items():
+            frames = sum(1 for i in range(self.num_frames) if self.preset_of(i) == preset)
             info.append(NS(available=True, calibrated=True, min_temp=low, max_temp=high, frame_rate_valid=True,
-                           frame_rate=54.2, num_frames=self.num_frames // 2))
+                           frame_rate=54.2, num_frames=frames))
         self.source_info = NS(camera_model="A8303sc", preset_info=info)
         # each pixel's scene temperature (K) per frame: a module heating up, a little different per pixel
         self.scene = scene if scene is not None else (
-            lambda i: np.linspace(560.0, 840.0, 64).reshape(8, 8) + 30.0 * np.sin(i / 7.0))
+            lambda i: np.linspace(560.0, 840.0, size * size).reshape(size, size) + 30.0 * np.sin(i / 7.0))
         self.clock_gap = clock_gap  # seconds the clock jumps after frame 60 (dropped frames)
+        self.transmission = transmission  # (distance, humidity) → τ: a camera unlike FLIR's model
         self.get_frame(0)
 
     def get_preset(self, index):
-        return 1 + index % 2
+        return self.preset_of(index)
 
     def reset_object_parameters(self):
         self.object_parameters = NS(**sdk_values(FILE_PARAMS), atmospheric_transmission=1.0)
@@ -90,6 +94,8 @@ class _A8303Like:
         a2, a1, a0 = PRESETS[preset][2]
         radiance = a2 * counts * counts + a1 * counts + a0
         params = MeasurementParameters.from_sdk(vars(self.object_parameters))
+        if self.transmission is not None and params.transmission is None and params.distance_m > 0:
+            params = params.with_(transmission=self.transmission(params.distance_m, params.humidity))
         cal = self._curve(preset)
         if self.unit == fnv.Unit.COUNTS:
             self.final = counts
@@ -97,7 +103,7 @@ class _A8303Like:
             self.final = compensated_signal(cal, params, radiance)
         else:
             self.final = object_temperature(cal, params, radiance)
-        self.status = np.zeros((8, 8), np.int8)
+        self.status = np.zeros((self.height, self.width), np.int8)
 
     def update_frame(self):
         self.get_frame(self.index)
@@ -169,6 +175,16 @@ def test_the_radiance_route_verifies_an_a8303_preset(ats) -> None:
     assert derive_calibration(_A8303Like(), ats, indices=frames, signal="counts").signal == "counts"
 
 
+def test_a_transmission_unlike_flirs_model_is_not_verified(ats) -> None:
+    """Review 0.9.0: the transmission fit is checked on its own, not only through two of its points."""
+    pytest.importorskip("fnv")
+    frames = list(range(0, 120, 2))[::6]
+    steps = (lambda _distance, humidity: 0.97 if humidity < 0.3 else 0.85)  # humidity steps, no distance
+    report = derive_calibration(_A8303Like(transmission=steps), ats, indices=frames,
+                                limits=RangeLimits(calibrated=PRESETS[1][0]))
+    assert not report.verified and "transmission" in report.message
+
+
 # --- export --------------------------------------------------------------------------------------------
 
 
@@ -207,6 +223,9 @@ def test_out_of_range_rows_start_blank(tmp_path, ats) -> None:
     late = [row for row in rows if row[0] > 35]
     assert early and all(row[2] == "#N/A" for row in early)  # 177 °C, below preset 1's 250 °C
     assert late and all(isinstance(row[2], float) for row in late)
+    # review 0.9.0: the Summary's values (as written) leave the blank rows out too
+    summary = next(row for row in book["Summary"].iter_rows(values_only=True) if row[1] == "Cell 1")
+    assert summary[3] >= 250.0 and summary[4] == pytest.approx(max(row[2] for row in late))
 
 
 def test_a_frame_timed_tc_sheet_moves_onto_the_clock(tmp_path, ats) -> None:
@@ -216,10 +235,28 @@ def test_a_frame_timed_tc_sheet_moves_onto_the_clock(tmp_path, ats) -> None:
     prefill = TcPrefill(times=(0.0, 1.0, 2.0), columns=((20.0, 21.0, 22.0),), names=("T1",),
                         roi_tc=(("Cell 1", "T1"),), offset_s=-30.0, window=(-30.0, -28.0),
                         roi_use=(("Cell 1", ((-30.0, -29.0),)),), frame=80, fps=2.0)
-    book = _export(tmp_path, ats, _A8303Like(clock_gap=4.0), preset=1, prefill=prefill, ignition=80)
+    options = ExportOptions(step_s=1.0, start_s=10.0, end_s=20.0, tc_prefill=prefill)
+    book = _export(tmp_path, ats, _A8303Like(clock_gap=4.0), preset=1, ignition=80, options=options)
     offset = next(row[1] for row in book["TC Compare"].iter_rows(values_only=True)
                   if row[0] == "Logger time offset (s)")
     assert offset == pytest.approx(-30.0 + 80 / 2.0 - (80 / 2.0 + 4.0))
+    # review 0.9.0: From/To placed the same way (e.g. the logger's span) move with the TC readings
+    times = [row[0] for row in book["Data"].iter_rows(min_row=6, values_only=True) if row[0] is not None]
+    assert (times[0], times[-1]) == (6, 16)
+
+
+def test_superframing_areas_count_for_the_pixel_sheet_budget(tmp_path, ats) -> None:
+    """Review 0.9.0: 42 areas of 400 pixels need more columns than a sheet has; the limit is lowered."""
+    pytest.importorskip("fnv")
+    rois = tuple(RoiShape(k + 1, "rect", ((x, y), (x + 20, y + 20)), f"Cell {k + 1}")
+                 for k, (x, y) in enumerate((x, y) for y in range(0, 120, 20) for x in range(0, 140, 20)))
+    out = tmp_path / "many.xlsx"
+    spec = SourceSpec(ats, rois, ignition_frame=10, preset=1)
+    message = run_export(out, [spec], ExportOptions(step_s=10.0), handles={ats.resolve(): _A8303Like(size=140)})
+    assert "42 ROIs" in message
+    book = openpyxl.load_workbook(out, read_only=True, data_only=True)
+    source = {row[0]: row[1] for row in book["Source"].iter_rows(values_only=True) if row[0]}
+    assert source["Pixel limit for exact means"] < 400
 
 
 # --- player ----------------------------------------------------------------------------------------------
@@ -248,3 +285,44 @@ def test_the_player_reads_one_preset(ats, monkeypatch) -> None:
     assert src.read_frame(1).index == 1
     with pytest.raises(ValueError, match="Preset 3"):
         src.set_preset(3)
+
+
+def test_the_player_never_shows_another_preset(ats, monkeypatch) -> None:
+    """Review 0.9.0: preset 1 is missing over frames 40-70 (dropped); frame 0 is preset 2."""
+    pytest.importorskip("fnv")
+    from flir_player import source as source_module
+
+    preset_of = (lambda i: 2 if i == 0 or 40 <= i <= 70 else 1 + i % 2)
+    fake = _A8303Like(preset_of=preset_of)
+    fake.rois = []
+    fake.can_change_object_parameters = True
+    fake.has_nuc = fake.has_bp = False
+    monkeypatch.setattr(source_module.fnv.file, "ImagerFile", lambda _path: fake)
+    src = source_module.FlirVideoSource()
+    metadata = src.open(ats)
+    assert src.preset == 1 and src.take_first_packet().index == 2
+    assert metadata.start_time == datetime(2026, 10, 6, 10, 47, 59)  # frame 0's stamp, not frame 2's
+    assert metadata.last_frame(1) == 118 and metadata.last_frame(2) == 119 and metadata.last_frame() == 119
+    assert src.read_frame(50).index == 72 and src.read_frame(50, snap=-1).index == 38
+    assert src.read_frame(72, snap=-1).index == 72 and src.read_frame(71, snap=-1).index == 38
+    assert src.read_frame(119).index == 118  # past the preset's last frame: its last one
+
+
+def test_series_exports_write_the_frames_the_dialog_checked() -> None:
+    """Review 0.9.0: the frames written are among those checked for files to replace."""
+    from flir_player.decoder import series_frames
+
+    assert series_frames([1, 3, 5, 7], 0, 7, 1) == [1, 3, 5, 7]
+    assert series_frames([1, 3, 5, 7], 0, 7, 2) == []
+    assert series_frames([0, 3, 6, 9], 0, 9, 3) == [0, 3, 6, 9]
+    assert series_frames(list(range(10)), 2, 9, 4) == [2, 6]
+
+
+def test_the_movie_dialog_starts_at_the_presets_rate(qapp) -> None:
+    from flir_player.export_dialogs import ExportMovieDialog
+    from flir_player.models import VideoMetadata
+
+    metadata = VideoMetadata(path=Path("a.ats"), width=8, height=8, num_frames=120, start_time=None,
+                             end_time=None, duration_seconds=40.0, nominal_fps=3.0)
+    assert ExportMovieDialog(metadata).fps_spin.value() == 3.0
+    assert ExportMovieDialog(metadata, fps=1.0).fps_spin.value() == 1.0

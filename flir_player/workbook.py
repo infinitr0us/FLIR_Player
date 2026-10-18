@@ -813,6 +813,9 @@ class _Writer:
                 out["mean"][present] = np.sum(n * kelvin, axis=1) / np.sum(n, axis=1) * a + b
         if "spread" in out:
             out["spread"] = (out["max"] - out["min"])
+        if self.clamp_default == CLAMP_BLANK:  # as Data starts: out-of-range rows blank, for Summary too
+            for stat in out:
+                out[stat] = np.where(roi.status == 0, out[stat], np.nan)
         return out
 
     def _data_row(self, ws, layout: _RoiLayout, i: int, r: int, cached: dict) -> None:
@@ -823,10 +826,9 @@ class _Writer:
                             else ("Saturated" if status == 3 else "Counts only"))
         if not layout.source.report.verified:
             return  # temperatures cannot be reproduced; counts only
-        blanked = self.clamp_default == CLAMP_BLANK and status != 0
         for stat, col in layout.data_cols.items():
             value = cached[stat][i]
-            value = float(value) if np.isfinite(value) and not blanked else "#N/A"
+            value = float(value) if np.isfinite(value) else "#N/A"
             if stat == "spread":
                 mx, mn = xl_rowcol_to_cell(r, layout.data_cols["max"]), xl_rowcol_to_cell(r, layout.data_cols["min"])
                 ws.write_formula(r, col, f"=IFERROR({mx}-{mn},NA())", self.f_temp, value)

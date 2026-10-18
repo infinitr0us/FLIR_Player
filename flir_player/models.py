@@ -133,6 +133,11 @@ class VideoMetadata:
     saved_parameters: dict[str, float] | None = None
     saved_by: str = ""  # "ResearchIR" when its workspace XML holds the override
     presets: tuple[PresetRange, ...] = ()  # superframing presets; empty for one preset
+    preset_ends: tuple[tuple[int, int], ...] = ()  # superframing: (preset, its last frame)
+
+    def last_frame(self, preset: int | None = None) -> int:
+        """The last frame read: the recording's, or with a superframing preset shown, that preset's."""
+        return dict(self.preset_ends).get(preset, self.num_frames - 1) if preset is not None else self.num_frames - 1
 
     @property
     def filename(self) -> str:

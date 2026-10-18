@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -720,7 +721,10 @@ class ExcelExportDialog(FramelessDialog):
             lag = self._tc_clock.lag_s if self._tc_clock is not None else frame / fps
             key = (self._tc_request, tuple(pairs.items()), lag, fps, frame)
             if self._tc_cached is None or self._tc_cached[0] != key:
-                self._tc_cached = (key, clock_prefill(self._tc_table, lag_s=lag, fps=fps, frame=frame, pairs=pairs))
+                prefill = clock_prefill(self._tc_table, lag_s=lag, fps=fps, frame=frame, pairs=pairs)
+                if self._tc_clock is None:  # logger time 0 is the ignition frame itself: nothing to move
+                    prefill = dataclasses.replace(prefill, frame=None, fps=None)
+                self._tc_cached = (key, prefill)
             return self._tc_cached[1]
 
         return tc_prefill(self.tc_run.result, self.tc_run.table, rois=self.rois,
@@ -768,6 +772,10 @@ class ExcelExportDialog(FramelessDialog):
             if "A700" in self.metadata.camera_model:
                 parts.append("The A700 clock can run slow. The TC and zone curves on TC Compare show any shift; "
                              "time 0 can be moved by hand.")
+            elif "A8303" in self.metadata.camera_model:
+                parts.append("The A8303 clock and the logger's can differ by a minute or more (the A8303 ran 76 s "
+                             "ahead on the 1006 test a). The TC and zone curves on TC Compare show any shift; its "
+                             "logger time offset can be changed there.")
             self.tc_label.setText(" ".join(parts))
             self.tc_label.setToolTip(self._tc_clock.note if self._tc_clock is not None else
                                      self._tc_table.clock_note if self._tc_table is not None else "")
