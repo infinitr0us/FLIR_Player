@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.9.0 — 2026-10-18
+
+Temperatures for the A8303sc and other superframing cameras, after the
+fire-safety engineers' answers on the A8303 (18 October) and their 0.7.4
+workbook of the 1006 test a, which had no temperatures.
+
+### A8303sc temperatures
+
+- This camera's counts do not follow FLIR's calibration curve. The File SDK
+  turns them into radiance (a quadratic of the counts), and its temperatures
+  follow `R / (exp(B/T) − 1)` of that radiance, with emissivity, reflected
+  temperature, transmission and window applied to the radiance and the
+  camera's own atmospheric transmission. The calibration is fitted to the SDK
+  per preset, the camera's transmission constants are recovered from the SDK,
+  and it is verified like any other: the usual checks at changed parameters
+  plus one at the recording's own, over every calibration frame.
+- The workbook's counts columns then hold the radiance × 100,000 ("signal");
+  the Source sheet gives the preset, the signal and its quadratic.
+- *Out-of-range values: Leave them blank (#N/A)* on Settings, offered and
+  chosen to start with in workbooks with such a camera: below its range a
+  preset's values are far off (a cold module reads about 95 °C at the 250 °C
+  preset). Those rows are a gap in the charts and are left out of the Summary.
+- The Validation sheet says *NOT CHECKED* when the SDK clamped every sample
+  (it passed with 0).
+
+### One preset at a time
+
+- *Preset* under *Unit* in the player: a recording that cycles through presets
+  (temperature ranges, one frame each) shows and measures the frames of one,
+  the lowest range to start with; *Every frame* shows it as stored. Steps,
+  playback, the end of a play range and temporal filters follow that preset's
+  frames, also where dropped frames break the cycle; image series and movies
+  write them (a movie starts at the preset's rate).
+- The Excel export takes these recordings (0.8.0 refused them): *Preset* in
+  the export dialog (the player's to start with); every row reads that
+  preset's frame nearest its time by the camera clock.
+- *Fit Emissivity from TCs* runs on one preset with this calibration (its
+  preset starts at the player's), and its results can fill a workbook.
+- A TC file timed by the clocks is moved onto the camera clock, with From/To
+  when they are its span. The export dialog notes that the A8303's clock can
+  differ from the logger's by a minute or more (76 s on the 1006 test a).
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.8.0...v0.9.0)
+
 ## 0.8.0 — 2026-10-16
 
 Cell zones that follow a battery module as the camera sees it, and the zone
