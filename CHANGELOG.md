@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.1 — 2026-10-18
+
+A fix to the Validation sheet, found while exporting the fire-safety
+engineers' own 18 A8303 boxes of the 1006 test a with 0.9.0.
+
+### Validation
+
+- With more than 8 areas the Excel export starts with area means from the
+  mean signal and without *Max and min* (the usual case for 18 cell zones).
+  Every Validation sample was then an approximation, nothing was compared, and
+  the sheet said *NOT CHECKED*, giving the SDK's clamping as the reason
+  although nothing was clamped.
+- Each area's max and min are now always compared with the SDK: an extreme
+  pixel converts exactly. Without *Max and min* their counts are not in the
+  workbook, so each of these samples carries its count in its formula. Samples
+  where the SDK clamped a pixel of the area are still skipped.
+- When nothing can be compared, the sheet gives the real reason: every sample
+  clamped, or no exact sample.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.9.0...v0.9.1)
+
 ## 0.9.0 — 2026-10-18
 
 Temperatures for the A8303sc and other superframing cameras, after the
