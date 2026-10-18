@@ -156,3 +156,23 @@ def test_recalculation_keeps_every_recordings_own_parameters(excel, tmp_path, tr
         assert data.Cells(6, column).Value == pytest.approx(float(expected), abs=1e-6)
     finally:
         book.Close(SaveChanges=False)
+
+
+def test_unexported_extremes_are_checked_in_excel(excel, tmp_path) -> None:
+    """0.9.1: mean-signal areas without Max and min are checked by their extremes (counts in the formula)."""
+    source = _source("Camera A", 14, np.random.default_rng(6))
+    source.rois = [roi for roi in source.rois if roi.mode != "spot"]
+    for roi in source.rois:
+        roi.mode, roi.block = "mean", None
+    path = tmp_path / "signal.xlsx"
+    write_workbook(path, ExportData(times=np.arange(14, dtype=float) - 2.0, sources=[source],
+                                    options=ExportOptions(bins=16, area_means="signal", extremes=False),
+                                    created=datetime(2026, 10, 18), versions={"tool": "test", "sdk": ""}))
+    book = _open(excel, path)
+    try:
+        sheet = book.Worksheets("Validation")
+        assert str(sheet.Range("E4").Value).startswith("PASS") and sheet.Range("D4").Value <= 1e-6
+        rows = [r for r in range(8, 60) if sheet.Cells(r, 3).Value in ("Max", "Min")]
+        assert len(rows) == 8 and all(abs(sheet.Cells(r, 8).Value) <= 1e-6 for r in rows)
+    finally:
+        book.Close(SaveChanges=False)

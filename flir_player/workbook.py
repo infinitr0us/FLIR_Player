@@ -1788,9 +1788,14 @@ class _Writer:
             source = layout.source
             if not source.validation_rows.size:
                 continue
-            stats = [stat for stat in layout.roi.validation if stat in layout.data_cols]
+            # the Data statistics, and an area's max and min also when they are not exported: an extreme
+            # converts exactly, so every area is checked even when its mean is an approximation
+            stats = [stat for stat in layout.roi.validation if stat in layout.data_cols
+                     or (stat in ("max", "min") and layout.roi.mode != "spot" and stat in layout.roi.counts)]
             for stat in stats:
                 for k, row in enumerate(source.validation_rows):
+                    if stat not in layout.count_cols and not np.isfinite(layout.roi.counts[stat][row]):
+                        continue  # its count goes into the formula: no number, no row
                     entries.append((layout, stat, k, int(row)))
         summary_row = 3
         ws.write(summary_row, 0, "Largest |difference| over checked samples (K)", self.f_bold)
@@ -1834,10 +1839,15 @@ class _Writer:
                 cached = float(np.sum(n_ * object_temperature(cal, p, m_)) / np.sum(n_))
                 note = f"binned mean ({bins} bins of equal apparent-temperature width) — approximation"
             else:
-                ref = _cell("Counts", data_r, layout.count_cols[stat])
+                if stat in layout.count_cols:
+                    ref = _cell("Counts", data_r, layout.count_cols[stat])
+                else:  # Max and min not exported: the extreme pixel's count is written into the formula
+                    ref = _num(float(roi.counts[stat][row]))
                 formula = f"=MEDIAN({_num(clip[0])},{curve(ref)},{_num(clip[1])})"
                 cached = float(np.clip(object_temperature(cal, p, roi.counts[stat][row]), *clip))
                 note = "exact (extreme/percentile converts exactly)" if stat != "value" else "exact"
+                if stat not in layout.count_cols:
+                    note = "exact (extreme converts exactly; its count is in the formula, Max and min not exported)"
                 if stat == "mean" and roi.mode == "mean":
                     note = ("mean signal: the temperature of the mean count, not the mean of the pixels' "
                             "temperatures (an approximation)")
@@ -1852,8 +1862,12 @@ class _Writer:
                     failed = True  # outside the curve's domain although the SDK did not clamp
             rows_out.append((layout, stat, row, source, sdk, formula, cached, difference, clamped, note))
         passed = not failed and worst_cached <= 0.01
-        # every sample skipped (e.g. a flame preset whose ROIs the SDK clamps): nothing was compared
-        unchecked = "NOT CHECKED — the SDK clamped every sample"
+        # nothing compared: every sample clamped (e.g. a flame preset whose ROIs the SDK clamps), or only
+        # approximations left (no extreme where the samples are)
+        if rows_out and all(out[8] for out in rows_out):
+            unchecked = "NOT CHECKED — the SDK clamped every sample"
+        else:
+            unchecked = "NOT CHECKED — no exact sample to compare"
         # an error among the comparisons stays an error (CHECK); only no comparison at all is "–"
         ws.write_formula(summary_row, 3, f'=IF(SUMPRODUCT(--ISERROR({abs_range}))>0,MAX({abs_range}),'
                                          f'IF(COUNT({abs_range})=0,"–",MAX({abs_range})))', self.f_calc,
@@ -1864,8 +1878,9 @@ class _Writer:
                          f'"PASS — formulas reproduce the SDK","CHECK"),IF({d}="–","{unchecked}","CHECK")))',
                          None, ("PASS — formulas reproduce the SDK" if passed else "CHECK") if checked or failed
                          else unchecked)
-        ws.write(summary_row + 1, 0, "Binned means are approximations and excluded from the pass mark; "
-                                     "see their own rows.", self.f_note)
+        ws.write(summary_row + 1, 0, "Binned and mean-signal means are approximations and excluded from the pass "
+                                     "mark; see their own rows. Each area's max and min are checked exactly.",
+                 self.f_note)
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
                                                                "value": "PASS", "format": self.f_pass})
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
