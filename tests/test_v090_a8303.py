@@ -48,7 +48,7 @@ class _A8303Like:
     num_frames = 120
 
     def __init__(self, scene=None, clock_gap: float = 0.0, size: int = 8, preset_of=None,
-                 transmission=None):
+                 transmission=None, clamped: bool = False):
         import fnv
         self.fnv = fnv
         self.width = self.height = size
@@ -67,6 +67,7 @@ class _A8303Like:
             lambda i: np.linspace(560.0, 840.0, size * size).reshape(size, size) + 30.0 * np.sin(i / 7.0))
         self.clock_gap = clock_gap  # seconds the clock jumps after frame 60 (dropped frames)
         self.transmission = transmission  # (distance, humidity) → τ: a camera unlike FLIR's model
+        self.clamped = clamped  # the SDK's status: every pixel clamped (a flame preset over a cold scene)
         self.get_frame(0)
 
     def get_preset(self, index):
@@ -103,7 +104,7 @@ class _A8303Like:
             self.final = compensated_signal(cal, params, radiance)
         else:
             self.final = object_temperature(cal, params, radiance)
-        self.status = np.zeros((self.height, self.width), np.int8)
+        self.status = np.full((self.height, self.width), 2 if self.clamped else 0, np.int8)
 
     def update_frame(self):
         self.get_frame(self.index)
@@ -214,6 +215,15 @@ def test_the_export_gives_an_a8303_preset_temperatures(tmp_path, ats) -> None:
     assert list(book["Settings"].iter_rows(min_row=5, max_row=5, values_only=True))[0][1] == "Leave them blank (#N/A)"
 
 
+def test_a_validation_that_checked_nothing_says_so(tmp_path, ats) -> None:
+    """Review 0.9.0: with every sample clamped by the SDK the sheet said "0.0 PASS"."""
+    pytest.importorskip("fnv")
+    book = _export(tmp_path, ats, _A8303Like(clamped=True), preset=1)
+    largest = next(row for row in book["Validation"].iter_rows(values_only=True)
+                   if row[0] == "Largest |difference| over checked samples (K)")
+    assert largest[3] == "–" and largest[4].startswith("NOT CHECKED")
+
+
 def test_out_of_range_rows_start_blank(tmp_path, ats) -> None:
     pytest.importorskip("fnv")
     cold = _A8303Like(scene=lambda i: np.full((8, 8), 450.0 if i < 60 else 700.0) + np.arange(64).reshape(8, 8))
@@ -243,6 +253,22 @@ def test_a_frame_timed_tc_sheet_moves_onto_the_clock(tmp_path, ats) -> None:
     # review 0.9.0: From/To placed the same way (e.g. the logger's span) move with the TC readings
     times = [row[0] for row in book["Data"].iter_rows(min_row=6, values_only=True) if row[0] is not None]
     assert (times[0], times[-1]) == (6, 16)
+
+
+def test_rounded_tc_bounds_keep_their_end_seconds_on_the_clock(tmp_path, ats) -> None:
+    """Review 0.9.0 (second round): the dialog rounds the TC span to 0.1 s on the frame axis; on the clock the
+    span must keep its first and last logger second."""
+    pytest.importorskip("fnv")
+    fps = 1.874015748  # 80 / fps = 42.689076 s, while frame 80 is at clock second 44: delta = -1.310924 s
+    offset = 44.0 - 80 / fps
+    times = tuple(float(t) for t in range(10))
+    prefill = TcPrefill(times=times, columns=(tuple(20.0 + t for t in times),), names=("T1",),
+                        roi_tc=(("Cell 1", "T1"),), offset_s=offset, frame=80, fps=fps)
+    options = ExportOptions(step_s=1.0, start_s=round(times[0] + offset, 1), end_s=round(times[-1] + offset, 1),
+                            tc_prefill=prefill)
+    book = _export(tmp_path, ats, _A8303Like(clock_gap=4.0), preset=1, ignition=80, options=options)
+    rows = [row[0] for row in book["Data"].iter_rows(min_row=6, values_only=True) if row[0] is not None]
+    assert (rows[0], rows[-1], len(rows)) == (0, 9, 10)
 
 
 def test_superframing_areas_count_for_the_pixel_sheet_budget(tmp_path, ats) -> None:
@@ -326,3 +352,69 @@ def test_the_movie_dialog_starts_at_the_presets_rate(qapp) -> None:
                              end_time=None, duration_seconds=40.0, nominal_fps=3.0)
     assert ExportMovieDialog(metadata).fps_spin.value() == 3.0
     assert ExportMovieDialog(metadata, fps=1.0).fps_spin.value() == 1.0
+
+
+# --- the player's transport on a preset (review 0.9.0, second round) ---------------------------------------
+
+
+def _window_on(qapp, ats, monkeypatch, fake):
+    from conftest import wait_until
+    from flir_player import source as source_module
+    from flir_player.main_window import MainWindow
+
+    fake.rois = []
+    fake.can_change_object_parameters = True
+    fake.has_nuc = fake.has_bp = False
+    monkeypatch.setattr(source_module.fnv.file, "ImagerFile", lambda _path: fake)
+    window = MainWindow()
+    window.show()
+    window.open_path(ats)
+    assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
+    return window
+
+
+def test_steps_walk_the_presets_own_frames(qapp, ats, monkeypatch) -> None:
+    """A dropped preset-2 frame makes frames 2 and 3 both preset 1: a step must not skip either."""
+    pytest.importorskip("fnv")
+    from conftest import wait_until
+
+    pattern = [1, 2, 1, 1, 2, 1]
+    window = _window_on(qapp, ats, monkeypatch, _A8303Like(preset_of=lambda i: pattern[i] if i < 6 else 1 + i % 2))
+    try:
+        assert window._preset == 1
+        visited = []
+        for move in (None, 1, 1, -1, -1, -1):
+            if move is None:
+                window.seek_to(2)
+            else:
+                window.step_frames(move)
+            previous = window.current_packet
+            assert wait_until(qapp, lambda: window.current_packet is not previous and not window._busy)
+            visited.append(window.current_packet.index)
+        assert visited == [2, 3, 5, 3, 2, 0]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_playback_stays_inside_a_range_whose_end_is_another_presets(qapp, ats, monkeypatch) -> None:
+    pytest.importorskip("fnv")
+    from conftest import wait_until
+    from flir_player.settings import app_settings
+
+    app_settings().setValue("playback/loop", False)
+    window = _window_on(qapp, ats, monkeypatch, _A8303Like())  # preset 1 = even frames
+    shown = []
+    try:
+        window._change_loop(False)
+        window.transport.slider.set_play_range(0, 5)
+        window.seek_to(2)
+        assert wait_until(qapp, lambda: window.current_packet.index == 2)
+        original = window._present_packet
+        window._present_packet = lambda packet: (shown.append(packet.index), original(packet))
+        window.toggle_playback()
+        assert wait_until(qapp, lambda: not window.playing, timeout=10.0)
+        assert window.current_packet.index == 4 and max(shown) == 4
+    finally:
+        window.close()
+        qapp.processEvents()

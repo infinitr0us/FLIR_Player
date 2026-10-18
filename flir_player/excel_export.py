@@ -926,11 +926,21 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 ignition = _stamp(opened[0], specs[0].ignition_frame, repair)
             if zero and ignition and prefill.fps and prefill.fps > 0:
                 delta = prefill.frame / prefill.fps - (ignition - zero).total_seconds()
-                # the dialog's From/To were placed the same way (e.g. the logger's span): they move too
-                options = dataclass_replace(
-                    options, tc_prefill=prefill.rebased(delta),
-                    start_s=None if options.start_s is None else options.start_s + delta,
-                    end_s=None if options.end_s is None else options.end_s + delta)
+                # the dialog's From/To were placed the same way: they move too, and where they are the TC
+                # readings' span (rounded to its 0.1 s) they become that span exactly
+                times = [t for t in prefill.times if math.isfinite(t)]
+                span = (min(times), max(times)) if times else (math.nan, math.nan)
+
+                def moved(bound, logger_s):
+                    if bound is None:
+                        return None
+                    if abs(bound - (logger_s + prefill.offset_s)) <= 0.051:
+                        return logger_s + prefill.offset_s + delta
+                    return bound + delta
+
+                options = dataclass_replace(options, tc_prefill=prefill.rebased(delta),
+                                            start_s=moved(options.start_s, span[0]),
+                                            end_s=moved(options.end_s, span[1]))
         times = timeline(spans, options, rates[0])
         total = times.size * len(specs) + 1
         done = 0

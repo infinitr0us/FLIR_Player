@@ -204,6 +204,9 @@ class MainWindow(QMainWindow):
         self._play_range: tuple[int, int] | None = None
         self._wrap_pending = False
         self._end_pending = False  # decode reached range end; terminal packet still queued
+        # with a superframing preset shown: the last frame read inside the play range, once the next one fell
+        # beyond it (the range's end is no frame of that preset)
+        self._range_last: int | None = None
         self._filters_state: dict = {
             "point": ("none", 1.0),
             "spatial": ("none", 3),
@@ -557,6 +560,7 @@ class MainWindow(QMainWindow):
         self._ready.clear()
         self._wrap_pending = False
         self._end_pending = False
+        self._range_last = None
         if invalidate:
             self._active_request_id = self._next_request_id()
 
@@ -633,6 +637,7 @@ class MainWindow(QMainWindow):
     def _wrap_playback(self, start: int) -> None:
         """Loop: jump back to the range start and keep playing."""
         self._wrap_pending = True
+        self._range_last = None
         request_id = self._activate_request()
         self._playback_outstanding = True
         self.decoder.request_frame(
@@ -645,9 +650,13 @@ class MainWindow(QMainWindow):
     def step_frames(self, delta: int) -> None:
         if self.current_packet is None:
             return
-        if self._preset is not None and self.metadata is not None:
-            delta = int(delta) * len(self.metadata.presets)  # one preset cycle per step
-        self.seek_to(self.current_packet.index + int(delta), snap=-1 if delta < 0 else 1)
+        delta = int(delta)
+        if self._preset is not None and self.metadata is not None and delta:
+            # the next frame of the preset in that direction (a dropped frame shortens a cycle), and for longer
+            # steps about one preset cycle more per frame
+            sign = 1 if delta > 0 else -1
+            delta = sign + sign * (abs(delta) - 1) * len(self.metadata.presets)
+        self.seek_to(self.current_packet.index + delta, snap=-1 if delta < 0 else 1)
 
     def seek_to(self, index: int, snap: int = 1) -> None:
         if self.metadata is None:
@@ -1904,6 +1913,8 @@ class MainWindow(QMainWindow):
         if not self._end_pending:
             return False
         start, end = self._playback_bounds()
+        if self._range_last is not None:
+            end = min(end, self._range_last)
         if any(packet.index >= end for packet in self._ready):
             return False
         if self.current_packet is None or self.current_packet.index < end:
@@ -2047,6 +2058,14 @@ class MainWindow(QMainWindow):
         if packet.request_id != self._active_request_id:
             return
         if self.playing and self.current_packet is not None:
+            if not self._wrap_pending and packet.index > self._playback_bounds()[1]:
+                # the shown preset has no frame left in the play range: its last one read ends the lap
+                latest = self._latest_decoded if self._latest_decoded is not None else self.current_packet
+                self._range_last = latest.index
+                self._playback_outstanding = False
+                self._end_pending = True
+                self._finish_range_end_if_done()
+                return
             if self._wrap_pending:
                 self._wrap_pending = False
                 self._anchor_after_wrap(packet)

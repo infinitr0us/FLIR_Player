@@ -1802,6 +1802,7 @@ class _Writer:
         abs_range = _range("Validation", first, 8, max(first, last), 8)
         worst_cached = 0.0
         failed = False
+        checked = 0
         rows_out = []
         for j, (layout, stat, k, row) in enumerate(entries):
             source = layout.source
@@ -1844,24 +1845,31 @@ class _Writer:
                 note = "skipped: the SDK clamped a pixel of this ROI"
             difference = cached - sdk
             if not clamped and "approximation" not in note:
+                checked += 1
                 if np.isfinite(difference):
                     worst_cached = max(worst_cached, abs(difference))
                 else:
                     failed = True  # outside the curve's domain although the SDK did not clamp
             rows_out.append((layout, stat, row, source, sdk, formula, cached, difference, clamped, note))
         passed = not failed and worst_cached <= 0.01
-        ws.write_formula(summary_row, 3, f"=MAX({abs_range})", self.f_calc,
-                         "#NUM!" if failed else worst_cached)
+        # every sample skipped (e.g. a flame preset whose ROIs the SDK clamps): nothing was compared
+        unchecked = "NOT CHECKED — the SDK clamped every sample"
+        ws.write_formula(summary_row, 3, f'=IF(COUNT({abs_range})=0,"–",MAX({abs_range}))', self.f_calc,
+                         "#NUM!" if failed else worst_cached if checked else "–")
         ws.write_formula(summary_row, 4,
                          f'=IF(ISNUMBER(D{summary_row + 1}),IF(D{summary_row + 1}<=0.01,'
-                         f'"PASS — formulas reproduce the SDK","CHECK"),"CHECK")',
-                         None, "PASS — formulas reproduce the SDK" if passed else "CHECK")
+                         f'"PASS — formulas reproduce the SDK","CHECK"),'
+                         f'IF(D{summary_row + 1}="–","{unchecked}","CHECK"))',
+                         None, ("PASS — formulas reproduce the SDK" if passed else "CHECK") if checked or failed
+                         else unchecked)
         ws.write(summary_row + 1, 0, "Binned means are approximations and excluded from the pass mark; "
                                      "see their own rows.", self.f_note)
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
                                                                "value": "PASS", "format": self.f_pass})
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
                                                                "value": "CHECK", "format": self.f_fail})
+        ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
+                                                               "value": "NOT CHECKED", "format": self.f_fail})
         for j, (layout, stat, row, source, sdk, formula, cached, difference, clamped, note) in enumerate(rows_out):
             r = first + j
             R = r + 1
