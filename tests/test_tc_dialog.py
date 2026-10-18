@@ -355,9 +355,8 @@ def test_results_dialog_without_pixels_or_with_presets(qapp) -> None:
     assert not dialog.rois_button.isEnabled() and not dialog.workbook_button.isEnabled()
     assert not dialog.eps_button.isEnabled() and not dialog.folder_button.isEnabled()
     dialog.deleteLater()
-    dialog = TcResultsDialog(_output(preset=1), None)
-    assert dialog.rois_button.isEnabled() and not dialog.workbook_button.isEnabled()
-    assert "superframing" in dialog.workbook_button.toolTip()
+    dialog = TcResultsDialog(_output(preset=1), None)  # 0.9.0: a superframing fit fills a workbook too
+    assert dialog.rois_button.isEnabled() and dialog.workbook_button.isEnabled()
     dialog.deleteLater()
 
 

@@ -22,10 +22,14 @@ Stamps with a real year (SEQ, CSQ) pass through unchanged.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
+from .jobs import JobCancelled
 from .models import FrameRate
 
 PLACEHOLDER_YEAR = 1976
@@ -72,6 +76,55 @@ def superframing(im: Any) -> bool:
     presets = [p for p in (getattr(info, "preset_info", ()) or ())
                if getattr(p, "available", False) and int(getattr(p, "num_frames", 0) or 0) > 0]
     return len(presets) >= 2
+
+
+def preset_ranges(im: Any) -> dict[int, tuple[float, float] | None]:
+    """Preset → its calibrated range in K (None when uncalibrated), for the presets with frames.
+
+    Superframing frames name their preset by its index in ``preset_info``.
+    """
+    info = getattr(im, "source_info", None)
+    ranges: dict[int, tuple[float, float] | None] = {}
+    for index, preset in enumerate(getattr(info, "preset_info", ()) or ()):
+        if getattr(preset, "available", False) and int(getattr(preset, "num_frames", 0) or 0) > 0:
+            ranges[index] = ((float(preset.min_temp), float(preset.max_temp))
+                             if getattr(preset, "calibrated", False) else None)
+    return ranges
+
+
+def choose_preset(im: Any, requested: int | None = None) -> int:
+    """``requested``, or the preset with the lowest calibrated range (closest to TC temperatures)."""
+    ranges = preset_ranges(im)
+    if requested is None:
+        return min(ranges, key=lambda p: ranges[p][0] if ranges[p] is not None else math.inf)
+    if requested not in ranges:
+        raise ValueError(f"Preset {requested} is not in this recording (presets: "
+                         f"{', '.join(str(p) for p in sorted(ranges))})")
+    return int(requested)
+
+
+def preset_indices(im: Any, preset: int, abort: Callable[[], bool] | None = None) -> np.ndarray:
+    """Frame indices of ``preset`` in a superframing recording, by every frame's own header.
+
+    The SDK's ``get_preset`` reads only the header (0.3 ms a frame); without it
+    each frame is read. Dropped frames break the preset cycle, so no frame is
+    assumed from its number.
+    """
+    n = int(im.num_frames)
+    lookup = getattr(im, "get_preset", None)
+    labels = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        if abort is not None and i % 4096 == 0 and abort():
+            raise JobCancelled("Cancelled")
+        if lookup is not None:
+            labels[i] = int(lookup(i))
+        else:
+            im.get_frame(i)
+            labels[i] = next(int(str(e["value"])) for e in im.frame_info if str(e["name"]) == "Preset")
+    frames = np.flatnonzero(labels == int(preset))
+    if not frames.size:
+        raise ValueError(f"No frame of preset {preset} in this recording")
+    return frames
 
 
 def preset_frame_rate(im: Any) -> float:

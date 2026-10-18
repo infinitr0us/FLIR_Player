@@ -48,6 +48,7 @@ TC_CAPACITY = 100_000
 TC_FIRST = 8  # 0-based row of the first pasted logger row (Excel row 9)
 CLAMP_ON = "Clamp like FLIR software"
 CLAMP_OFF = "Show extrapolated values (flagged)"
+CLAMP_BLANK = "Leave them blank (#N/A)"  # the default with a radiance-signal camera (far below its range)
 TAU_AUTO = "From distance and humidity"
 TAU_MANUAL = "Manual value"
 UNITS = ("°C", "K", "°F")
@@ -199,6 +200,10 @@ class _Writer:
         self.rows = data.times.size
         self.last = HEADER_ROWS + self.rows - 1  # 0-based last data row
         self.unit = data.options.unit if data.options.unit in UNITS else "°C"
+        # A radiance-signal camera (A8303sc) extrapolates absurdly far below its range: its workbook can
+        # leave out-of-range values blank, and does so to start with. Other workbooks keep their formulas.
+        self.blank_option = any(s.report.verified and s.report.signal == "radiance" for s in data.sources)
+        self.clamp_default = CLAMP_BLANK if self.blank_option else CLAMP_OFF
         # constant-memory row files go to ``tmpdir`` (deleted by close() on success)
         self.wb = xlsxwriter.Workbook(str(path), {
             "constant_memory": True, "nan_inf_to_errors": True, "strings_to_numbers": False,
@@ -414,7 +419,7 @@ class _Writer:
         put(3, 0, "Display unit", self.f_bold)
         put(3, 1, self.unit, self.f_input)
         put(4, 0, "Out-of-range values", self.f_bold)
-        put(4, 1, CLAMP_OFF, self.f_input)
+        put(4, 1, self.clamp_default, self.f_input)
         a, b = _unit_affine(self.unit)
         put(3, INTERNAL, "Unit factor", self.f_note)
         put(3, INTERNAL + 1, None, self.f_calc, formula='=IF($B$4="°F",1.8,1)', cached=a)
@@ -430,7 +435,8 @@ class _Writer:
         self._name("UNIT_B", S, 4, INTERNAL + 1)
         self._name("AXIS_TITLE", S, 5, INTERNAL + 1)
         ws.data_validation(3, 1, 3, 1, {"validate": "list", "source": list(UNITS)})
-        ws.data_validation(4, 1, 4, 1, {"validate": "list", "source": [CLAMP_OFF, CLAMP_ON]})
+        ws.data_validation(4, 1, 4, 1, {"validate": "list", "source": [CLAMP_OFF, CLAMP_ON]
+                                        + ([CLAMP_BLANK] if self.blank_option else [])})
 
         put(7, 0, "Measurement parameters for every recording and ROI", self.f_h2)
         tau_mode = TAU_AUTO if g.transmission is None else TAU_MANUAL
@@ -776,6 +782,14 @@ class _Writer:
             count = layout.count_cols[layout.main]  # spot value or mean count: what TC Compare matches
             self.wb.define_name(f"{layout.name}_CNT", "=" + _range("Counts", HEADER_ROWS, count, self.last, count))
 
+    def _blankable(self, formula: str, r: int, layout: _RoiLayout) -> str:
+        """``formula`` (starting with "="), or #N/A when Settings leaves out-of-range values blank and the
+        row's status is not OK; unchanged in a workbook without that option."""
+        if not self.blank_option:
+            return formula
+        status = xl_rowcol_to_cell(r, layout.status_col)
+        return f'=IF(AND(CLAMP_MODE="{CLAMP_BLANK}",{status}<>"{STATUS_LABELS[0]}"),NA(),{formula[1:]})'
+
     def _cached_temperatures(self, layout: _RoiLayout) -> dict[str, np.ndarray]:
         cal = layout.source.report.calibration if layout.source.report.verified else None
         roi = layout.roi
@@ -809,25 +823,43 @@ class _Writer:
                             else ("Saturated" if status == 3 else "Counts only"))
         if not layout.source.report.verified:
             return  # temperatures cannot be reproduced; counts only
+        blanked = self.clamp_default == CLAMP_BLANK and status != 0
         for stat, col in layout.data_cols.items():
             value = cached[stat][i]
-            value = float(value) if np.isfinite(value) else "#N/A"
+            value = float(value) if np.isfinite(value) and not blanked else "#N/A"
             if stat == "spread":
                 mx, mn = xl_rowcol_to_cell(r, layout.data_cols["max"]), xl_rowcol_to_cell(r, layout.data_cols["min"])
                 ws.write_formula(r, col, f"=IFERROR({mx}-{mn},NA())", self.f_temp, value)
             elif stat == "mean" and roi.mode in ("pixels", "bins"):
-                ws.write_formula(r, col, self._direct(self._mean_formula(layout, r)), self.f_temp, value)
+                formula = self._blankable(self._mean_formula(layout, r), r, layout)
+                ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
             else:
                 ref = _cell("Counts", r, layout.count_cols[stat])
-                ws.write_formula(r, col, self._direct(self._scalar_formula(layout, ref)), self.f_temp, value)
+                formula = self._blankable(self._scalar_formula(layout, ref), r, layout)
+                ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
 
     # --- Counts / Pixels ------------------------------------------------------------------
+
+    @staticmethod
+    def _signal_word(source) -> str:
+        return "signal" if source.report.verified and source.report.signal == "radiance" else "counts"
+
+    def _radiance_note(self) -> str:
+        """A note naming the recordings whose "counts" are their radiance signal ("" when none)."""
+        labels = [source.label for source in self.data.sources if self._signal_word(source) == "signal"]
+        if not labels:
+            return ""
+        return (f"{', '.join(labels)}: the values are the File SDK's radiance × 100,000 (\"signal\"), computed "
+                "from the counts; that camera's temperatures follow its radiance (Source sheet).")
 
     def _counts(self) -> None:
         ws = self.sheets["Counts"]
         ws.write(0, 0, "Raw counts as stored in the recordings (never edited)", self.f_title)
         ws.write(1, 0, "Frame numbers are 1-based as shown in the player. Area statistics are over the "
                        "ROI's pixels.", self.f_note)
+        radiance = self._radiance_note()
+        if radiance:
+            ws.write(2, 0, radiance, self.f_note)
         ws.write(3, 0, "Time (s)", self.f_head)
         for s_index, source in enumerate(self.data.sources):
             c = 1 + 2 * s_index
@@ -843,7 +875,8 @@ class _Writer:
             ws.write(4, c + 1, "Camera clock", self.f_head)
         for layout in self.layouts:
             for stat, col in layout.count_cols.items():
-                ws.write(4, col, "Pixels" if stat == "pixels" else f"{STAT_LABELS[stat]} (counts)", self.f_head)
+                ws.write(4, col, "Pixels" if stat == "pixels" else
+                         f"{STAT_LABELS[stat]} ({self._signal_word(layout.source)})", self.f_head)
         for i in range(self.rows):
             self._check(i)
             r = HEADER_ROWS + i
@@ -875,6 +908,9 @@ class _Writer:
         ws.write(0, 0, "Per-pixel counts of area ROIs (used for exact mean temperatures)", self.f_title)
         ws.write(1, 0, "ROIs above the pixel limit store bins of equal apparent-temperature width instead: "
                        "the pixel count of each bin (n), then its mean count (c).", self.f_note)
+        radiance = self._radiance_note()
+        if radiance:
+            ws.write(2, 0, radiance, self.f_note)
         ws.write(3, 0, "Time (s)", self.f_head)
         for layout in self.layouts:
             roi = layout.roi
@@ -1707,7 +1743,8 @@ class _Writer:
         ws.write(0, 0, "Where the ROIs are (ignition frame of each recording, apparent counts)", self.f_title)
         row = 2
         for source in self.data.sources:
-            ws.write(row, 0, f"{source.label} — {source.info['file_name']} — frame {source.spec.ignition_frame + 1}",
+            shown = source.info.get("preset", {}).get("map_frame", source.spec.ignition_frame)
+            ws.write(row, 0, f"{source.label} — {source.info['file_name']} — frame {shown + 1}",
                      self.f_h2)
             ws.write(row + 1, 0, "ROI", self.f_head)
             for c, text in enumerate(("Type", "Pixels", "x₁", "y₁", "x₂", "y₂"), start=1):
@@ -1866,6 +1903,19 @@ class _Writer:
                 ("Ignition frame (t = 0)", info["ignition_frame"] + 1),
                 ("Temperature calibration", source.report.message),
             ]
+            preset = info.get("preset")
+            if preset:
+                span = (f"{preset['calibrated'][0] - KELVIN:.0f} to {preset['calibrated'][1] - KELVIN:.0f} °C"
+                        if preset.get("calibrated") else "not calibrated")
+                fields.append(("Preset", f"{preset['preset']} ({span}): {preset['frames']:,} frames, "
+                                         f"{preset['rate']:.3f} per second. The camera cycles through its presets; "
+                                         "every row reads a frame of this one, the nearest by the camera clock "
+                                         "(time base: camera timestamps, whatever the setting below)."))
+            if source.report.verified and source.report.signal == "radiance":
+                fields.append(("Signal", "The counts columns hold the File SDK's radiance × 100,000, which is a "
+                                         "quadratic of the counts (" + ", ".join(
+                                             f"{v:.9g}" for v in source.report.signal_poly) + "; highest power "
+                                         "first). This camera's temperatures follow its radiance, not its counts."))
             if source.report.fff is not None:
                 fff = source.report.fff
                 fields += [("FFF PlanckR1 / R2", f"{fff['planck_r1']} / {fff['planck_r2']}"),
@@ -1964,7 +2014,9 @@ class _Writer:
             ("", None),
             ("Colours", self.f_h2),
             ("Yellow = input. Grey = calculated. In Data: grey italic = outside the camera's calibrated range "
-             "(extrapolated, less accurate); red = saturated sensor (value not meaningful).", self.f_wrap),
+             "(extrapolated, less accurate); red = saturated sensor (value not meaningful)." + (
+                 f" Settings → Out-of-range values: \"{CLAMP_BLANK}\" (the start here) leaves those cells "
+                 "empty (#N/A, a gap in the charts)." if self.blank_option else ""), self.f_wrap),
             ("", None),
             ("The formula", self.f_h2),
             ("S(T) = R / (exp(B/T) − F) − O is the camera's calibration curve (counts of a blackbody at T "
@@ -1984,6 +2036,10 @@ class _Writer:
             ("Atmospheric transmission models humidity only; smoke between camera and target is not modelled "
              "(use a manual transmission if you know it).", self.f_wrap),
         ]
+        radiance = self._radiance_note()
+        if radiance:
+            lines += [("", None), ("Cameras whose temperatures follow their radiance", self.f_h2),
+                      (radiance + " In the formula above, read signal for counts.", self.f_wrap)]
         example = self._worked_example()
         if example:
             lines += [("", None), ("Worked example (first sample, initial settings)", self.f_h2),

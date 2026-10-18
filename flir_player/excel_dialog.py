@@ -151,7 +151,7 @@ class ExcelExportDialog(FramelessDialog):
     """Choose recordings, time range, sampling and workbook contents."""
 
     def __init__(self, metadata: VideoMetadata, rois: tuple[RoiShape, ...], current_frame: int,
-                 ignition_frame: int | None = None, tc_run=None, parent=None) -> None:
+                 ignition_frame: int | None = None, tc_run=None, preset: int | None = None, parent=None) -> None:
         super().__init__("Export Excel Workbook", parent)
         self.setMinimumWidth(640)
         self.metadata = metadata
@@ -271,6 +271,25 @@ class ExcelExportDialog(FramelessDialog):
                                         "smooth for recordings without dropped frames.")
         grid.addWidget(QLabel("Time base"), 3, 0)
         grid.addWidget(self.time_base_combo, 3, 1, 1, 2)
+        self.preset_combo = None
+        if metadata.presets:  # superframing: one preset's frames, timed by the camera clock
+            self.preset_combo = ChevronComboBox()
+            lowest = min(metadata.presets, key=lambda p: p.min_k if p.min_k is not None else math.inf)
+            for item in metadata.presets:
+                span = (f"{item.min_k - 273.15:.0f} to {item.max_k - 273.15:.0f} °C"
+                        if item.min_k is not None and item.max_k is not None else "not calibrated")
+                self.preset_combo.addItem(f"Preset {item.index}: {span}", item.index)
+                if item.index == (preset if preset is not None else lowest.index):
+                    self.preset_combo.setCurrentIndex(self.preset_combo.count() - 1)
+            self.preset_combo.setToolTip("The camera cycles through its presets: the workbook reads the frames "
+                                         "of one. The lowest range suits the battery and the TCs, the higher "
+                                         "ones flames.")
+            grid.addWidget(QLabel("Preset"), 4, 0)
+            grid.addWidget(self.preset_combo, 4, 1, 1, 2)
+            self.time_base_combo.setCurrentIndex(self.time_base_combo.findData("clock"))
+            self.time_base_combo.setEnabled(False)
+            self.time_base_combo.setToolTip("A recording that cycles through presets is timed by its camera clock: "
+                                            "each row reads the nearest frame of the chosen preset.")
         box.addLayout(grid)
         panels.addWidget(frame)
 
@@ -572,8 +591,9 @@ class ExcelExportDialog(FramelessDialog):
                 self._tc_auto_pairs = saved if not errors else _default_tc_pairs(table.names, roi_names, zone_names)
                 self.tc_pairs_edit.setText(self._tc_auto_pairs)
             if (self._tc_clock is not None and self.tc_source_combo.currentData() == "file"
-                    and self.tc_check.isChecked() and not self.metadata.presets
-                    and self.time_base_combo.currentData() == "frames" and self.metadata.nominal_fps > 0):
+                    and self.tc_check.isChecked()
+                    and (self.metadata.presets or self.time_base_combo.currentData() == "frames")
+                    and self.metadata.nominal_fps > 0):
                 fps = self.metadata.nominal_fps
                 frame = min(max(round(self._tc_clock.lag_s * fps), 0), self.metadata.num_frames - 1)
                 self._time_from_logger(table, self._tc_clock.lag_s, fps, frame)
@@ -653,11 +673,10 @@ class ExcelExportDialog(FramelessDialog):
     def _tc_usable(self) -> str:
         """Why the selected source cannot fill TC Compare now ("" when it can)."""
         from_file = self.tc_source_combo.currentData() == "file"
-        if self.metadata.presets or (self.tc_run is not None and self.tc_run.result.preset is not None):
-            return "The workbook cannot separate the presets of a superframing recording yet."
         if not self.sheet_checks["tc"].isChecked():
             return "Tick the TC Compare sheet to fill it."
-        if self.time_base_combo.currentData() != "frames":
+        # (a superframing recording is timed by its clock: the export moves the TC readings onto it)
+        if self.time_base_combo.currentData() != "frames" and not self.metadata.presets:
             return "The TC time offset is on the frame-number time base; choose that time base."
         if from_file:
             repeated = _duplicate_names(roi.name for roi in self.rois)
@@ -771,7 +790,8 @@ class ExcelExportDialog(FramelessDialog):
         ignition = self.ignition_spin.value() - 1
         start = options.start_s if options.start_s is not None else -ignition / fps
         end = options.end_s if options.end_s is not None else (self.metadata.num_frames - 1 - ignition) / fps
-        step = 1.0 / fps if options.every_frame else options.step_s
+        # every frame of one preset of a superframing recording: the presets share the frames
+        step = len(self.metadata.presets or (None,)) / fps if options.every_frame else options.step_s
         rows = max(0, int((end - start) / step) + 1) if end >= start else 0
         pixels = []
         for roi in self.rois:
@@ -839,7 +859,8 @@ class ExcelExportDialog(FramelessDialog):
         labels = [self.table.item(r, 0).text().strip() for r in range(self.table.rowCount())]
         ignitions = [self.table.cellWidget(r, 3).value() - 1 for r in range(self.table.rowCount())]
         sources = [{"path": str(self.metadata.path), "label": labels[0], "rois": self.rois,
-                    "ignition_frame": ignitions[0], "current": True}]
+                    "ignition_frame": ignitions[0], "current": True,
+                    "preset": self.preset_combo.currentData() if self.preset_combo is not None else None}]
         for k, other in enumerate(self._others, start=1):
             sources.append({"path": str(other["path"]), "label": labels[k], "rois": other["rois"],
                             "ignition_frame": ignitions[k], "current": False})

@@ -165,11 +165,12 @@ def _render_export_frame(source: FlirVideoSource, payload: dict, index: int):
 class DecoderThread(QThread):
     """Owns File SDK state and performs all decoding away from the UI thread."""
 
-    _STATE_COMMANDS = frozenset({"unit", "params", "corrections", "reference", "filters"})
+    _STATE_COMMANDS = frozenset({"unit", "params", "corrections", "reference", "filters", "preset"})
 
     opened = Signal(object, object, object)
     frame_ready = Signal(object)
     unit_ready = Signal(object, object)
+    preset_ready = Signal(object, object)  # superframing preset (or None), the frame read with it
     object_params_ready = Signal(object)
     corrections_ready = Signal(object)
     reference_ready = Signal(str)
@@ -235,6 +236,10 @@ class DecoderThread(QThread):
 
     def request_unit(self, key: str, index: int, request_id: int) -> None:
         self._commands.put(("unit", (key, int(index), int(request_id))))
+
+    def request_preset(self, preset: int | None, index: int, request_id: int) -> None:
+        """Read only the frames of one preset of a superframing recording (None: every frame)."""
+        self._commands.put(("preset", (preset, int(index), int(request_id))))
 
     def request_object_params(
         self, values: dict[str, float] | None, index: int, request_id: int
@@ -455,6 +460,13 @@ class DecoderThread(QThread):
                             True, f"Wrote {len(written)} bitmask file(s)"
                         )
                         self.busy_changed.emit(False, "")
+                    elif command == "preset":
+                        preset, index, request_id = payload
+                        source.set_preset(preset)
+                        cache.clear()
+                        packet = source.read_frame(index, request_id=request_id)
+                        cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
+                        self.preset_ready.emit(preset, packet)
                     elif command == "unit":
                         key, index, request_id = payload
                         self.busy_changed.emit(True, "Updating thermal unit…")
@@ -502,9 +514,12 @@ class DecoderThread(QThread):
         """Stage a complete job; decimation selects outputs, not filter inputs."""
         start, end = int(payload["start_frame"]), int(payload["end_frame"])
         step = max(1, int(payload["decimation"]))
-        frame_range = range(start, end + 1, step)
+        if start < 0 or end >= source.metadata.num_frames or end < start:
+            return False, "Invalid or empty frame range"
+        read = source.preset_frames(start, end)  # with a superframing preset chosen, only its frames
+        frame_range = read[::step]
         total = len(frame_range)
-        if start < 0 or end >= source.metadata.num_frames or total <= 0:
+        if total <= 0:
             return False, "Invalid or empty frame range"
         if payload.get("revision", source.revision) != source.revision:
             return False, "Analysis settings changed; start the export again"
@@ -533,12 +548,13 @@ class DecoderThread(QThread):
                         stage = job.stage(series_stats_path(dest, base))
                         stats_writer = StatsCsvWriter(stage, stats_csv_header([r.name for r in payload["rois"]]))
                 temporal = source.processing.temporal[0] != "none"
-                inputs = range(start, end + 1) if temporal else frame_range
+                inputs = read if temporal else frame_range
+                outputs = set(frame_range)
                 count = 0
                 try:
                     for index in inputs:
                         job.check_cancelled()
-                        if (index - start) % step:
+                        if index not in outputs:
                             source.read_frame(index, need_clip=False, need_metadata=False)
                             continue
                         packet, rgb, composed, scale = _render_export_frame(source, payload, index)
@@ -590,7 +606,8 @@ class DecoderThread(QThread):
                 parameters = source.read_object_parameters()
             specs.append(SourceSpec(path=path, rois=tuple(entry["rois"]),
                                     ignition_frame=int(entry["ignition_frame"]),
-                                    label=str(entry.get("label", "")), parameters=parameters))
+                                    label=str(entry.get("label", "")), parameters=parameters,
+                                    preset=entry.get("preset")))
         try:
             message = run_export(
                 payload["dest"], specs, payload["options"],

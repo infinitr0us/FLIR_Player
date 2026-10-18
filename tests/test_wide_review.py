@@ -53,6 +53,9 @@ class _AlternatingImager:
     def update_frame(self):
         self.get_frame(self.index)
 
+    def get_preset(self, index):
+        return index % 2  # preset_info's index, as superframing frames name it
+
     def has_unit(self, unit):
         return unit in self.supported_units
 
@@ -60,15 +63,26 @@ class _AlternatingImager:
         pass
 
 
-def test_x1_the_excel_export_refuses_a_superframing_recording(tmp_path) -> None:
+def test_x1_the_excel_export_reads_one_preset_of_a_superframing_recording(tmp_path) -> None:
+    """0.9.0 lifts 0.8.0's refusal: every row reads a frame of one preset (the lowest range unless chosen),
+    timed by the camera clock, calibrated on that preset's frames."""
+    import openpyxl
+
     pytest.importorskip("fnv")  # the fake handle uses the SDK's unit names
     path = tmp_path / "flames.ats"
     path.write_bytes(b"synthetic")
-    im = _AlternatingImager()
-    spec = SourceSpec(path, (RoiShape(1, "cursor", ((3.5, 3.5),), "Cell 1"),))
-    with pytest.raises(ValueError, match="several presets"):
-        run_export(tmp_path / "out.xlsx", [spec], ExportOptions(every_frame=True), handles={path.resolve(): im})
-    assert not (tmp_path / "out.xlsx").exists()
+    roi = RoiShape(1, "cursor", ((3.5, 3.5),), "Cell 1")
+    for preset in (None, 1):
+        im = _AlternatingImager()
+        out = tmp_path / f"out_{preset}.xlsx"
+        spec = SourceSpec(path, (roi,), ignition_frame=10, preset=preset)
+        message = run_export(out, [spec], ExportOptions(step_s=0.2), handles={path.resolve(): im})
+        assert "1/1 recording(s) with live temperatures" in message
+        book = openpyxl.load_workbook(out, data_only=True)
+        frames = [row[1] for row in book["Counts"].iter_rows(min_row=6, values_only=True) if row[1] is not None]
+        assert frames and {(frame - 1) % 2 for frame in frames} == {preset or 0}
+        temps = [row[2] for row in book["Data"].iter_rows(min_row=6, values_only=True) if isinstance(row[2], float)]
+        assert temps and max(abs(t - (im.true_k[3, 3] - 273.15)) for t in temps) < 1e-3
 
 
 # --- engine (w) ---------------------------------------------------------------------------------------

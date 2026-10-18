@@ -62,8 +62,8 @@ try:
 except ModuleNotFoundError:  # pure parts stay importable without the SDK
     fnv = None  # type: ignore[assignment]
 
-from .calibration import (CalibrationReport, derive_calibration, preserved_state, read_array, sdk_values,
-                          set_unit_safely)
+from .calibration import (CalibrationReport, calibration_frames, derive_calibration, preserved_state,
+                          radiance_route_possible, read_array, sdk_values, set_unit_safely)
 from .jobs import JobCancelled, OutputTransaction
 from .models import RoiShape
 from .radiometry import (
@@ -279,9 +279,11 @@ def _file_key(path: Path, *extra) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = False) -> str:
-    # clock-timed bins (superframing) differ from frame-number bins
-    return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []))
+def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = False,
+               signal: tuple[float, ...] | None = None) -> str:
+    # clock-timed bins (superframing) differ from frame-number bins; a radiance signal from the counts
+    return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []),
+                     *([["radiance", *(float(f"{v:.9g}") for v in signal)]] if signal is not None else []))
 
 
 _superframing = superframing
@@ -373,7 +375,17 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             interval = float(np.median(np.diff(frame_times))) if frames.size > 1 else 1.0 / fps
             step = float(step_s) if interval <= 1.01 * float(step_s) else interval
             info["step"] = step
-            key = _cache_key(path, options, step, clock=layout.seconds is not None) if cache_dir is not None else None
+            report = None
+            if radiance_route_possible(im, path):
+                # a calibration fitted to the radiance turns the counts into its signal while reading
+                stage("Checking the temperature calibration")
+                report = derive_calibration(im, path, abort=abort, indices=calibration_frames(im, frames),
+                                            limits=limits)
+                if not (report.verified and report.signal_poly is not None):
+                    report = None
+            signal = report.signal_poly if report is not None else None
+            key = (_cache_key(path, options, step, clock=layout.seconds is not None, signal=signal)
+                   if cache_dir is not None else None)
             fingerprint = recording_fingerprint(path) if key and path.is_file() else None
             cached = _load_cache(cache_dir, key, fingerprint) if key else None
             if cached is not None:
@@ -382,17 +394,20 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
             else:
                 stage(f"Reading {frames.size:,} frames")
                 times, mean, spread, counts, first_frame = _accumulate(
-                    im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key, fingerprint)
+                    im, frames, frame_times, step, (x0, y0, x1, y1), progress, abort, cache_dir, key, fingerprint,
+                    to_signal=report.to_signal if report is not None else None)
             if abort():
                 raise JobCancelled("Cancelled")
-            stage("Checking the temperature calibration")
-            indices = None
-            if layout:  # calibrate on this preset's frames: the hottest bins and a spread
-                peak = np.array([np.nanmax(mean[k]) if counts[k] else -np.inf for k in range(mean.shape[0])])
-                hot = [int(first_frame[k]) for k in np.argsort(peak)[::-1][:4] if first_frame[k] >= 0]
-                spread_frames = frames[np.unique(np.linspace(0, frames.size - 1, 4).astype(int))]
-                indices = sorted(set(hot) | {int(f) for f in spread_frames})
-            report = derive_calibration(im, path, abort=abort, indices=indices, limits=limits)
+            if report is None:
+                stage("Checking the temperature calibration")
+                indices = None
+                if layout:  # calibrate on this preset's frames: the hottest bins and a spread
+                    peak = np.array([np.nanmax(mean[k]) if counts[k] else -np.inf for k in range(mean.shape[0])])
+                    hot = [int(first_frame[k]) for k in np.argsort(peak)[::-1][:4] if first_frame[k] >= 0]
+                    spread_frames = frames[np.unique(np.linspace(0, frames.size - 1, 4).astype(int))]
+                    indices = sorted(set(hot) | {int(f) for f in spread_frames})
+                # the statistics hold counts: only a calibration of the counts fits them
+                report = derive_calibration(im, path, abort=abort, indices=indices, limits=limits, signal="counts")
         params = (MeasurementParameters.from_sdk(report.file_parameters) if report.file_parameters
                   else MeasurementParameters())
         info["calibration"] = report.message
@@ -407,8 +422,12 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
                 pass
 
 
-def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_dir, key, fingerprint=None):
-    """Per-bin statistics of ``frames`` (recording seconds ``frame_times``, ascending) in ``region``."""
+def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_dir, key, fingerprint=None,
+                to_signal=None):
+    """Per-bin statistics of ``frames`` (recording seconds ``frame_times``, ascending) in ``region``.
+
+    ``to_signal`` turns each frame's counts into a calibration's signal first (``CalibrationReport.to_signal``).
+    """
     x0, y0, x1, y1 = region
     h, w = y1 - y0, x1 - x0
     frame_times = np.asarray(frame_times, dtype=np.float64)
@@ -469,6 +488,8 @@ def _accumulate(im, frames, frame_times, step, region, progress, abort, cache_di
             stx.fill(0)
             first_frame[k] = int(frame)
         x = read_array(im, int(frame))[y0:y1, x0:x1].astype(np.float64)
+        if to_signal is not None:
+            x = to_signal(x)
         tau = at - k * step
         s1 += x
         s2 += x * x
@@ -1818,12 +1839,12 @@ def tc_prefill(result: MatchResult, table: TcTable, *, rois: Sequence[RoiShape] 
     from .excel_export import TcPrefill
     from .zones import pair_tcs
 
+    placed = None  # a given frame is placed by frame number / rate (the export moves a clock-timed axis)
     if frame is None:
         _frame, offset = workbook_origin(result)
     else:
-        if result.preset is not None:
-            raise ValueError("The Excel export cannot separate the presets of a superframing recording yet")
         offset = float(result.lag_s - int(frame) / result.fps)
+        placed = (int(frame), float(result.fps))
     names = tuple(ch.name for ch in result.channels)[:10]
     columns = tuple(tuple(float(v) for v in table.values[:, table.index(name) if name in table.names else k])
                     for k, name in enumerate(names))
@@ -1863,7 +1884,8 @@ def tc_prefill(result: MatchResult, table: TcTable, *, rois: Sequence[RoiShape] 
         window = (best.start_s + offset, best.end_s + offset)  # on the workbook's axis
     return TcPrefill(times=tuple(float(t) for t in table.times), columns=columns, names=names,
                      roi_tc=tuple(roi_tc), window=window, offset_s=offset, roi_eps=tuple(roi_eps),
-                     roi_use=tuple(roi_use), match_exclude=tuple(exclude))
+                     roi_use=tuple(roi_use), match_exclude=tuple(exclude),
+                     frame=placed[0] if placed else None, fps=placed[1] if placed else None)
 
 
 def clock_prefill(table: TcTable, *, lag_s: float, fps: float, frame: int,
@@ -1911,7 +1933,7 @@ def clock_prefill(table: TcTable, *, lag_s: float, fps: float, frame: int,
     window = max((run for _roi, runs in roi_use for run in runs), key=lambda run: run[1] - run[0], default=None)
     return TcPrefill(times=tuple(float(t) for t in table.times), columns=columns, names=names,
                      roi_tc=tuple((roi, tc) for tc, roi in pairs.items()), offset_s=offset,
-                     roi_use=tuple(roi_use), window=window)
+                     roi_use=tuple(roi_use), window=window, frame=int(frame), fps=float(fps))
 
 
 def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult, table: TcTable, *,
@@ -1934,13 +1956,12 @@ def write_workbook(dest: str | Path, recording: str | Path, result: MatchResult,
     if any(aliases(Path(dest), Path(path)) for path in protect):
         raise ValueError(f"{Path(dest).name} is the TC file; choose another name for the workbook")
 
-    if result.preset is not None:
-        raise ValueError("The Excel export cannot separate the presets of a superframing recording yet")
     shapes = tuple(roi_shapes(result))
     if not shapes:
         raise ValueError("No TC pixel was found, so the workbook would have no ROIs")
     frame, offset = workbook_origin(result)
-    spec = SourceSpec(path=Path(recording), rois=shapes, ignition_frame=frame, parameters=parameters)
+    spec = SourceSpec(path=Path(recording), rois=shapes, ignition_frame=frame, parameters=parameters,
+                      preset=result.preset)
     options = ExportOptions(start_s=float(table.times[0]) + offset, end_s=float(table.times[-1]) + offset,
                             step_s=result.step, tc_prefill=tc_prefill(result, table))
     return run_export(dest, [spec], options, handles=handles, progress=progress, abort=abort, replace=replace,
@@ -2298,9 +2319,8 @@ def run_analysis(recording: str | Path, tc_file: str | Path, options: MatchOptio
         if figure and series:
             files["figure"] = out / "overview.png"
         if workbook:
-            if result.preset is not None or not roi_shapes(result):
-                say("No workbook: " + ("the Excel export cannot separate superframing presets yet"
-                                       if result.preset is not None else "no TC pixel was found"))
+            if not roi_shapes(result):
+                say("No workbook: no TC pixel was found")
             else:
                 files["workbook"] = out / f"{Path(recording).stem}_vs_TC.xlsx"
         confirmed = list(files.values()) if replace is None else list(replace)

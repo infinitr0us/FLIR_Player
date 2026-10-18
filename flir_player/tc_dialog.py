@@ -196,7 +196,8 @@ class TcCalibrationDialog(FramelessDialog):
 
     def __init__(self, metadata: VideoMetadata, rois: tuple[RoiShape, ...], current_frame: int, *,
                  selected_roi_id: int | None = None, ignition_frame: int | None = None,
-                 previous: dict | None = None, has_results: bool = False, parent=None) -> None:
+                 previous: dict | None = None, has_results: bool = False, preset: int | None = None,
+                 parent=None) -> None:
         super().__init__("Fit Emissivity from TCs", parent)
         self.setMinimumWidth(660)
         self.metadata = metadata
@@ -304,11 +305,11 @@ class TcCalibrationDialog(FramelessDialog):
         if metadata.presets:
             self.preset_combo = ChevronComboBox()
             lowest = min(metadata.presets, key=lambda p: p.min_k if p.min_k is not None else math.inf)
-            for preset in metadata.presets:
-                span = (f"{preset.min_k - 273.15:.0f} to {preset.max_k - 273.15:.0f} °C"
-                        if preset.min_k is not None and preset.max_k is not None else "not calibrated")
-                self.preset_combo.addItem(f"Preset {preset.index}: {span}", preset.index)
-                if preset is lowest:
+            for item in metadata.presets:
+                span = (f"{item.min_k - 273.15:.0f} to {item.max_k - 273.15:.0f} °C"
+                        if item.min_k is not None and item.max_k is not None else "not calibrated")
+                self.preset_combo.addItem(f"Preset {item.index}: {span}", item.index)
+                if item.index == (preset if preset is not None else lowest.index):  # the player's, else the lowest
                     self.preset_combo.setCurrentIndex(self.preset_combo.count() - 1)
             self.preset_combo.setToolTip("Superframing: the frames of one preset are used. The lowest range "
                                          "is closest to TC temperatures.")
@@ -871,9 +872,6 @@ class TcResultsDialog(FramelessDialog):
             self.rois_button.setEnabled(False)
             self.workbook_button.setEnabled(False)
             self.workbook_button.setToolTip("No TC pixel was found")
-        elif result.preset is not None:
-            self.workbook_button.setEnabled(False)
-            self.workbook_button.setToolTip("The Excel export cannot separate superframing presets yet")
         self.folder_button = QPushButton("Open Results Folder")
         self.folder_button.setProperty("variant", "ghost")
         self.folder_button.setEnabled(out_dir is not None)

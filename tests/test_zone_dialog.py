@@ -209,12 +209,13 @@ def test_excel_dialog_fills_tc_compare_from_the_fit_for_zones(qapp) -> None:
     dialog.time_base_combo.setCurrentIndex(0)
     dialog.tc_check.setChecked(False)
     assert dialog.options().tc_prefill is None and "paste" in dialog.tc_label.text()
-    # no fit, or a superframing fit, cannot fill it
+    # no fit cannot fill it; a superframing fit can (0.9.0), placed at its frame for the export to move
     plain = ExcelExportDialog(metadata, tuple(zones[:3]), current_frame=0)
     assert not plain.tc_check.isEnabled() and plain.means_combo.currentData() == "pixels"
     preset = ExcelExportDialog(metadata, tuple(zones), current_frame=0,
                                tc_run=RunOutput(result=replace(result, preset=2), table=table))
-    assert not preset.tc_check.isEnabled() and "superframing" in preset.tc_label.text()
+    assert preset.tc_check.isEnabled() and preset.tc_check.isChecked()
+    assert preset.options().tc_prefill.frame == preset.ignition_spin.value() - 1
     assert np.isfinite(options.tc_prefill.offset_s)
 
 

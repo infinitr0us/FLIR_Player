@@ -362,14 +362,24 @@ def test_zone_prefill_pairs_tcs_with_their_zones_and_marks_their_fitted_rows() -
     assert {roi for roi, _runs in default.roi_use} == {roi for roi, _tc in default.roi_tc}
 
 
-def test_zone_prefill_needs_the_image_size_and_refuses_superframing() -> None:
+def test_zone_prefill_needs_the_image_size_and_records_its_frame() -> None:
+    """0.9.0: a superframing fit fills a workbook too; a prefill placed at a given frame keeps that frame
+    and rate, so the export can move it onto a clock-timed axis (``TcPrefill.rebased``)."""
     from dataclasses import replace
 
     tcmatch, result, table = _scene_result()
     with pytest.raises(ValueError, match="image size"):
         tcmatch.tc_prefill(result, table, rois=[RoiShape(1, "rect", ((0.0, 0.0), (4.0, 4.0)), "Z")])
-    with pytest.raises(ValueError, match="superframing"):
-        tcmatch.tc_prefill(replace(result, preset=1), table, frame=10)
+    placed = tcmatch.tc_prefill(replace(result, preset=1), table, frame=10)
+    assert (placed.frame, placed.fps) == (10, result.fps)
+    assert placed.offset_s == pytest.approx(result.lag_s - 10 / result.fps)
+    origin = tcmatch.tc_prefill(replace(result, preset=1), table)  # the fit's own origin: already clock-based
+    assert origin.frame is None and origin.fps is None
+    moved = placed.rebased(2.5)
+    assert moved.offset_s == pytest.approx(placed.offset_s + 2.5) and moved.frame is None
+    assert all(a2 == pytest.approx(a1 + 2.5) and b2 == pytest.approx(b1 + 2.5)
+               for (_r1, runs1), (_r2, runs2) in zip(placed.roi_use, moved.roi_use)
+               for (a1, b1), (a2, b2) in zip(runs1, runs2))
 
 
 def test_row_formulas_cite_cells_not_names(tmp_path) -> None:

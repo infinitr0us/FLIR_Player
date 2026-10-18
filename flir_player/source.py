@@ -206,6 +206,13 @@ def _superframing_presets(im: Any) -> tuple[PresetRange, ...]:
     return tuple(presets) if len(presets) >= 2 else ()
 
 
+def lowest_preset(presets: tuple[PresetRange, ...]) -> int | None:
+    """The superframing preset with the lowest calibrated range (closest to TC temperatures), or None."""
+    if not presets:
+        return None
+    return min(presets, key=lambda p: p.min_k if p.min_k is not None else math.inf).index
+
+
 def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
     """Static per-recording property rows for the Source Information panel (§4.8.3)."""
     info = im.source_info
@@ -317,6 +324,9 @@ class FlirVideoSource:
         self._pretemporal_bytes = 0
         self._provenance: tuple[int, tuple] | None = None  # (revision, provenance)
         self._clock = TimestampRepair(None)  # ATS year repair (see sdktime)
+        # Superframing: only frames of this preset are read (None: every frame, the presets alternating)
+        self._preset: int | None = None
+        self._cycle = 1  # frames per preset cycle
 
     def _invalidate_processing(self) -> None:
         self.revision += 1
@@ -385,6 +395,9 @@ class FlirVideoSource:
             )
             self.set_unit(preferred_key)
             self._image_roi = self._find_builtin_image_roi()
+            presets = _superframing_presets(self._im)
+            self._cycle = max(1, len(presets))
+            self._preset = lowest_preset(presets)  # a superframing recording opens on its lowest range
 
             first_packet = self.read_frame(0, request_id=0)
             first_time = first_packet.timestamp
@@ -422,7 +435,7 @@ class FlirVideoSource:
                 rate=rate,
                 saved_parameters=saved_parameters,
                 saved_by=saved_by,
-                presets=_superframing_presets(self._im),
+                presets=presets,
             )
             return self._metadata
         except Exception:
@@ -451,6 +464,54 @@ class FlirVideoSource:
         self._invalidate_processing()
         return spec.option
 
+    @property
+    def preset(self) -> int | None:
+        """The superframing preset whose frames are read (None: every frame)."""
+        return self._preset
+
+    def set_preset(self, preset: int | None) -> None:
+        """Read only the frames of ``preset`` of a superframing recording (None: every frame)."""
+        if self._im is None:
+            raise RuntimeError("No FLIR recording is open")
+        if preset is not None and int(preset) not in {p.index for p in _superframing_presets(self._im)}:
+            raise ValueError(f"Preset {preset} is not one this recording cycles through")
+        self._preset = None if preset is None else int(preset)
+        self._invalidate_processing()
+
+    def _preset_of(self, index: int) -> int:
+        lookup = getattr(self._im, "get_preset", None)
+        if lookup is not None:
+            return int(lookup(int(index)))
+        self._im.get_frame(int(index))
+        return int(next(str(e["value"]) for e in self._im.frame_info if str(e["name"]) == "Preset"))
+
+    def _neighbour(self, index: int, step: int) -> int | None:
+        """The nearest frame of the preset after (``step`` 1) or before (-1) ``index``, within two cycles."""
+        n = int(self._im.num_frames)
+        for distance in range(1, 2 * self._cycle + 2):
+            candidate = index + step * distance
+            if not 0 <= candidate < n:
+                return None
+            if self._preset_of(candidate) == self._preset:
+                return candidate
+        return None
+
+    def _snap(self, index: int) -> int:
+        """``index``, or the preset's next frame (its last one at the end of the recording)."""
+        if self._preset is None or self._preset_of(index) == self._preset:
+            return index
+        after = self._neighbour(index, 1)
+        if after is not None:
+            return after
+        before = self._neighbour(index, -1)
+        return before if before is not None else index
+
+    def preset_frames(self, start: int, end: int) -> list[int]:
+        """Frames from ``start`` to ``end`` (inclusive) that are read: the preset's, or all."""
+        if self._preset is None:
+            return list(range(start, end + 1))
+        return [i for i in range(start, end + 1) if self._preset_of(i) == self._preset]
+
     def read_frame(
         self,
         index: int,
@@ -458,9 +519,10 @@ class FlirVideoSource:
         need_clip: bool = True,
         need_metadata: bool = True,
     ) -> FramePacket:
+        """Frame ``index``, or with a preset chosen the preset's next frame (the packet tells which)."""
         if self._im is None or self._unit_spec is None:
             raise RuntimeError("No FLIR recording is open")
-        frame_index = max(0, min(int(index), int(self._im.num_frames) - 1))
+        frame_index = self._snap(max(0, min(int(index), int(self._im.num_frames) - 1)))
         try:
             return self._read_frame(frame_index, request_id, need_clip, need_metadata)
         except BaseException:
@@ -487,17 +549,37 @@ class FlirVideoSource:
                     frame_index, request_id, need_clip, need_metadata,
                     processed=self._temporal.result(temporal),
                 )
-            if frame_index != (
-                self._last_frame_index + 1 if self._last_frame_index is not None else -1
-            ):
+            if frame_index != self._following(self._last_frame_index):
                 self._temporal.reset()
-                for warm_index in range(max(0, frame_index - depth + 1), frame_index):
+                for warm_index in self._earlier(frame_index, depth - 1):
                     self._temporal.push(self._pretemporal_frame(warm_index), depth)
                     self._last_frame_index = warm_index
         self._im.get_frame(frame_index)
         return self._packet_from_current(
             frame_index, request_id, need_clip, need_metadata
         )
+
+    def _following(self, index: int | None) -> int:
+        """The frame read after ``index`` in sequence (-1 when there is none)."""
+        if index is None:
+            return -1
+        if self._preset is None:
+            return index + 1
+        after = self._neighbour(index, 1)
+        return after if after is not None else -1
+
+    def _earlier(self, index: int, count: int) -> list[int]:
+        """Up to ``count`` frames read before ``index`` (the preset's, with one chosen), oldest first."""
+        if self._preset is None:
+            return list(range(max(0, index - count), index))
+        frames: list[int] = []
+        current = index
+        while len(frames) < count:
+            current = self._neighbour(current, -1)
+            if current is None:
+                break
+            frames.append(current)
+        return frames[::-1]
 
     _PRETEMPORAL_BUDGET = 256 * 1024 * 1024
 
@@ -733,6 +815,8 @@ class FlirVideoSource:
         self._pretemporal.clear()
         self._pretemporal_bytes = 0
         self._provenance = None
+        self._preset = None
+        self._cycle = 1
 
     # --- processing pipeline (§4.8.6, §4.9.5.3) ------------------------------------
 
@@ -946,6 +1030,7 @@ class FlirVideoSource:
         spec = self._reference_spec
         return {
             "unit": self.unit.key,
+            "preset": self._preset,
             "object_parameters": self.read_object_parameters(),
             "corrections": self.read_corrections(),
             "reference": None if spec is None else {

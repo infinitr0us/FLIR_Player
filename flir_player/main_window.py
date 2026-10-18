@@ -63,6 +63,7 @@ from .models import (
 )
 from .plots import line_profile_values, roi_values
 from .processing import median_max_size
+from .source import lowest_preset
 from .orientation import Orientation
 from .render import (
     CUSTOM_PALETTE_STOPS,
@@ -211,6 +212,7 @@ class MainWindow(QMainWindow):
         self._reference_params: dict | None = None
         self._object_params: dict | None = None  # latest measurement-parameter snapshot
         self._ignition_frames: dict[str, int] = {}  # recording path → ignition frame (0-based)
+        self._preset: int | None = None  # superframing preset shown (None: every frame)
         # recording path → the last TC fit's request (dialog settings) and output (tcmatch.RunOutput)
         self._tc_runs: dict[str, dict] = {}
         self._temporal: dict[int, dict[int, tuple[float, object]]] = {}
@@ -245,6 +247,7 @@ class MainWindow(QMainWindow):
         self.decoder.opened.connect(self._on_opened)
         self.decoder.frame_ready.connect(self._on_frame_ready)
         self.decoder.unit_ready.connect(self._on_unit_ready)
+        self.decoder.preset_ready.connect(self._on_preset_ready)
         self.decoder.object_params_ready.connect(self._on_object_params_ready)
         self.decoder.corrections_ready.connect(self.inspector.set_corrections)
         self.decoder.reference_ready.connect(self._on_reference_ready)
@@ -349,6 +352,7 @@ class MainWindow(QMainWindow):
     def _connect_ui(self) -> None:
         self.title_bar.open_requested.connect(self.open_dialog)
         self.inspector.unit_changed.connect(self._change_unit)
+        self.inspector.preset_changed.connect(self._change_preset)
         self.inspector.palette_changed.connect(self._change_palette)
         self.inspector.palette_invert_toggled.connect(self._change_palette_invert)
         self.inspector.palette_edit_requested.connect(self._open_palette_editor)
@@ -640,6 +644,8 @@ class MainWindow(QMainWindow):
     def step_frames(self, delta: int) -> None:
         if self.current_packet is None:
             return
+        if self._preset is not None and self.metadata is not None:
+            delta = int(delta) * len(self.metadata.presets)  # one preset cycle per step
         self.seek_to(self.current_packet.index + int(delta))
 
     def seek_to(self, index: int) -> None:
@@ -689,6 +695,20 @@ class MainWindow(QMainWindow):
         self.pause_playback(invalidate=True)
         request_id = self._activate_state_request()
         self.decoder.request_unit(key, self.current_packet.index, request_id)
+
+    def _change_preset(self, preset: int | None) -> None:
+        if self.current_packet is None or self._busy:
+            self.inspector.select_preset(self._preset)  # keep the combo on the preset in force
+            return
+        self.pause_playback(invalidate=True)
+        request_id = self._activate_state_request()
+        self.decoder.request_preset(preset, self.current_packet.index, request_id)
+
+    def _on_preset_ready(self, preset: int | None, packet: FramePacket) -> None:
+        self._preset = preset
+        if packet.request_id != self._active_request_id:
+            return
+        self._present_packet(packet)
 
     def _apply_object_parameters(self, values: dict | None) -> None:
         if self.current_packet is None or self._busy:
@@ -1263,7 +1283,8 @@ class MainWindow(QMainWindow):
         self.pause_playback(invalidate=True)
         dialog = ExcelExportDialog(self.metadata, tuple(self._rois), self.current_packet.index,
                                    ignition_frame=self._ignition_frame(),
-                                   tc_run=self._tc_runs.get(str(self.metadata.path), {}).get("output"), parent=self)
+                                   tc_run=self._tc_runs.get(str(self.metadata.path), {}).get("output"),
+                                   preset=self._preset, parent=self)
         if dialog.exec() != ExcelExportDialog.DialogCode.Accepted:
             return
         params = dialog.parameters()
@@ -1405,7 +1426,8 @@ class MainWindow(QMainWindow):
         run = self._tc_runs.get(str(self.metadata.path), {})
         dialog = TcCalibrationDialog(self.metadata, tuple(self._rois), self.current_packet.index,
                                      selected_roi_id=self._selected_roi_id, ignition_frame=self._ignition_frame(),
-                                     previous=run.get("request"), has_results="output" in run, parent=self)
+                                     previous=run.get("request"), has_results="output" in run,
+                                     preset=self._preset, parent=self)
         code = dialog.exec()
         if code == TcCalibrationDialog.LAST_RESULTS:
             self._show_tc_results()
@@ -1996,6 +2018,8 @@ class MainWindow(QMainWindow):
         self.title_bar.export_button.setEnabled(True)
         self.inspector.set_available_units(options, packet.unit.key)
         self._unit_keys = frozenset(option.key for option in options)
+        self._preset = lowest_preset(metadata.presets)  # as the source opens a superframing recording
+        self.inspector.set_presets(metadata.presets, self._preset)
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
         self.bottom_panel.source.set_details(metadata.source_details)
@@ -2231,6 +2255,8 @@ class MainWindow(QMainWindow):
     def _restore_state(self, state: dict) -> None:
         """Show the measurement/processing state in force in the controls."""
         self.inspector.select_unit(state["unit"])
+        self._preset = state.get("preset")
+        self.inspector.select_preset(self._preset)
         self.inspector.set_object_parameters(state["object_parameters"])
         self.inspector.set_corrections(state["corrections"])
         self._reference_params = state["reference"]

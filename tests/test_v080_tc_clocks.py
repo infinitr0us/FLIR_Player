@@ -310,8 +310,8 @@ def test_dialog_refusals(qapp, make_dialog, lab_file, tmp_path, refusal, monkeyp
     assert dialog.tc_label.text()
     if refusal == "cap":
         assert "10" in dialog.tc_label.text()
-    if refusal == "presets":
-        assert "The workbook cannot separate the presets of a superframing recording yet" in dialog.tc_label.text()
+    if refusal == "presets":  # 0.9.0 fills a superframing workbook too: what stops it here is the frame rate
+        assert "no frame rate" in dialog.tc_label.text()
 
 
 def test_settings_only_after_accept(qapp, make_dialog, lab_file, isolated_settings):

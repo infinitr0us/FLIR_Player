@@ -35,9 +35,11 @@ except ModuleNotFoundError:
 
 from .calibration import (
     CalibrationReport,
+    calibration_frames,
     derive_calibration,
     preserved_state,
     read_array,
+    saturation_threshold,
     sdk_values,
     sdk_version,
     user_calibration_risk,
@@ -47,9 +49,9 @@ from .calibration import (
 from .geometry import quad_label_width, roi_coordinates
 from .jobs import JobCancelled, OutputTransaction
 from .models import FrameRate, RoiShape
-from .radiometry import MeasurementParameters, count_status
+from .radiometry import MeasurementParameters, RangeLimits, count_status
 from .fff import saved_object_parameters
-from .sdktime import TimestampRepair, recording_rate, superframing
+from .sdktime import TimestampRepair, choose_preset, preset_indices, preset_ranges, recording_rate, superframing
 from .zones import ENDS as ZONE_ENDS, MAX_GAP, MAX_LEAN, MAX_ZONES, ZoneSpec
 
 ROI_SET_FORMAT = "flir-player-roi-set"
@@ -222,6 +224,17 @@ class SourceSpec:
     ignition_frame: int = 0
     label: str = ""
     parameters: dict | None = None  # SDK object-parameter values; None = the file's own
+    preset: int | None = None  # superframing: the preset whose frames are read; None = the lowest range
+
+
+@dataclass(frozen=True)
+class PresetFrames:
+    """The frames of one preset of a superframing recording, as the export reads them."""
+
+    preset: int
+    frames: np.ndarray  # its frame indices, ascending
+    calibrated: tuple[float, float] | None  # its calibrated range (K)
+    rate: float  # its frames per second by the camera clock
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +260,18 @@ class TcPrefill:
     roi_eps: tuple[tuple[str, float], ...] = ()
     roi_use: tuple[tuple[str, tuple[tuple[float, float], ...]], ...] = ()
     match_exclude: tuple[str, ...] = ()
+    # The frame-number time it was placed on: the ignition frame and rate taken for the first recording.
+    # A superframing recording is timed by its clock instead, so the export moves the axis by the
+    # difference at that frame (None: placed on the workbook's own axis already).
+    frame: int | None = None
+    fps: float | None = None
+
+    def rebased(self, delta: float) -> "TcPrefill":
+        """The same logger data ``delta`` seconds later on the workbook's axis."""
+        return dataclass_replace(
+            self, offset_s=self.offset_s + delta, frame=None, fps=None,
+            window=None if self.window is None else (self.window[0] + delta, self.window[1] + delta),
+            roi_use=tuple((roi, tuple((a + delta, b + delta) for a, b in runs)) for roi, runs in self.roi_use))
 
     def check(self, capacity: int, width: int) -> None:
         if len(self.names) != len(self.columns) or not 0 < len(self.names) <= width:
@@ -444,18 +469,26 @@ class _ClockSearch:
     """Nearest-timestamp frame search on (non-decreasing) camera timestamps.
 
     ``repair`` maps raw SDK stamps to calendar time (``sdktime.TimestampRepair``);
-    ``origin`` must already be repaired.
+    ``origin`` must already be repaired. With ``indices`` (one preset's frames)
+    positions count those frames only; ``frame`` gives a position's frame.
     """
 
-    def __init__(self, im: Any, n: int, origin: datetime, repair: Callable[[Any], Any] | None = None):
+    def __init__(self, im: Any, n: int, origin: datetime, repair: Callable[[Any], Any] | None = None,
+                 indices: np.ndarray | None = None):
         self.im, self.n, self.origin = im, n, origin
+        self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
+        if self.indices is not None:
+            self.n = int(self.indices.size)
         self.repair = repair or (lambda stamp: stamp)
         self._seconds: dict[int, float] = {}
 
+    def frame(self, position: int) -> int:
+        return int(self.indices[position]) if self.indices is not None else int(position)
+
     def time(self, index: int) -> float:
-        """Seconds of frame ``index`` from ``origin`` (the ignition frame's stamp)."""
+        """Seconds of position ``index`` from ``origin`` (the ignition frame's stamp)."""
         if index not in self._seconds:
-            self.im.get_frame(int(index))
+            self.im.get_frame(self.frame(index))
             stamp = self.repair(self.im.frame_info.time)
             self._seconds[index] = ((stamp - self.origin).total_seconds()
                                     if isinstance(stamp, datetime) else math.nan)
@@ -543,22 +576,20 @@ def bin_counts(values: np.ndarray, bins: int, apparent=None) -> np.ndarray:
     return np.concatenate([counts, means])
 
 
-def _saturation_threshold(im: Any) -> float | None:
-    try:
-        for entry in im.frame_info:
-            if str(entry["name"]) == "SaturationThreshold":
-                return float(str(entry["value"]))
-    except Exception:
-        pass
-    return None
+_saturation_threshold = saturation_threshold  # kept for callers of the old name
 
 
 def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: ExportOptions,
                    report: CalibrationReport, *, progress: Callable[[int], None] | None = None,
-                   abort: Callable[[], bool] | None = None, rate: FrameRate | None = None) -> SourceData:
+                   abort: Callable[[], bool] | None = None, rate: FrameRate | None = None,
+                   preset: PresetFrames | None = None) -> SourceData:
     """Sample one recording on ``times``; the handle's state is restored after.
 
     ``rate`` (``sdktime.recording_rate``) is measured here when not given.
+    With ``preset`` (a superframing recording) each row takes that preset's
+    frame nearest its time by the camera clock, whatever ``options.time_base``.
+    A calibration fitted to the SDK's radiance reads that signal instead of
+    the counts (``CalibrationReport.signal``).
     """
     n = int(im.num_frames)
     height, width = int(im.height), int(im.width)
@@ -567,6 +598,8 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         raise ValueError(f"{spec.path.name}: no ROI covers any pixel")
     coordinates = [roi_coordinates(shape, height, width) for shape in rois]
     repair = TimestampRepair(spec.path)  # ATS clocks carry no year
+    signal = report.signal if report.verified else "counts"
+    to_signal = report.to_signal if report.verified else (lambda counts: counts)
     with preserved_state(im):
         set_unit_safely(im, fnv.Unit.COUNTS)
         stamps = []
@@ -579,12 +612,20 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         clock_fps = rate.clock_fps or fps  # camera timestamps: their own mean rate
         frames = frames_for(times, spec.ignition_frame, fps, n)
         search = None
-        if options.time_base == "clock":
+        if options.time_base == "clock" or preset is not None:
             im.get_frame(max(0, min(n - 1, spec.ignition_frame)))
             origin = repair(im.frame_info.time)
             if isinstance(origin, datetime):
-                search = _ClockSearch(im, n, origin, repair)
+                if preset is not None:
+                    search = _ClockSearch(im, n, origin, repair, indices=preset.frames)
+                    clock_fps = preset.rate
+                    start = int(np.searchsorted(preset.frames, spec.ignition_frame))
+                else:
+                    search = _ClockSearch(im, n, origin, repair)
+                    start = spec.ignition_frame
                 tolerance = 0.5 / clock_fps
+            elif preset is not None:
+                raise ValueError(f"{spec.path.name}: its clock cannot time the frames of one preset")
         rows = times.size
         data = []
         for shape, (ys, _xs) in zip(rois, coordinates):
@@ -603,15 +644,16 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
                 raise JobCancelled("Export cancelled")
             frame = int(frames[row])
             if search is not None:
-                guess = spec.ignition_frame + int(round(times[row] * clock_fps))
-                frame = search.nearest(float(times[row]), guess, tolerance)
+                guess = start + int(round(times[row] * clock_fps))
+                position = search.nearest(float(times[row]), guess, tolerance)
+                frame = search.frame(position) if position >= 0 else -1
                 frames[row] = frame
             if frame < 0:
                 continue
-            values = read_array(im, frame).astype(np.float64)
+            values = to_signal(read_array(im, frame).astype(np.float64))
             clock[row] = repair(im.frame_info.time)
             if saturation is None:
-                saturation = _saturation_threshold(im) or 0.0
+                saturation = saturation_threshold(im) or 0.0
             for roi, (ys, xs) in zip(data, coordinates):
                 stats, block = _region(values[ys, xs], roi.shape, options, apparent)
                 for name, value in stats.items():
@@ -634,10 +676,17 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         validation_rows = _validation_rows(frames, options.validation_rows) if report.verified else np.empty(0, int)
         if validation_rows.size:
             _validate(im, data, coordinates, frames, validation_rows, options)
-        map_png = _roi_map(im, rois, spec, frames) if "roimap" in options.sheets else None
+        map_frame = spec.ignition_frame
+        if preset is not None:  # that preset's frame nearest the ignition frame
+            map_frame = int(preset.frames[int(np.argmin(np.abs(preset.frames - spec.ignition_frame)))])
+        map_png = _roi_map(im, rois, spec, map_frame) if "roimap" in options.sheets else None
     file_parameters = MeasurementParameters.from_sdk(report.file_parameters) if report.file_parameters else MeasurementParameters()
     initial = MeasurementParameters.from_sdk(spec.parameters) if spec.parameters else file_parameters
     info = _source_info(im, spec, fps, stamps, report, saturation)
+    info["signal"] = signal
+    if preset is not None:
+        info["preset"] = {"preset": preset.preset, "frames": int(preset.frames.size), "rate": preset.rate,
+                          "calibrated": preset.calibrated, "map_frame": map_frame}
     info["date_inferred"] = repair.repaired
     info["clock_fps"] = rate.clock_fps
     info["rate_corrected"] = rate.corrected
@@ -717,8 +766,8 @@ def map_scale(rois, width: int, narrowest: float = 24.0, max_width: int = 2000) 
     return int(max(1, min(3, math.ceil(narrowest / min(widths)), max_width // max(1, width))))
 
 
-def _roi_map(im, rois, spec: SourceSpec, frames: np.ndarray) -> bytes | None:
-    """PNG of the ignition frame (apparent counts, Iron) with ROIs and names."""
+def _roi_map(im, rois, spec: SourceSpec, frame: int) -> bytes | None:
+    """PNG of frame ``frame`` (the ignition frame; apparent counts, Iron) with ROIs and names."""
     import io
 
     from PIL import Image
@@ -729,7 +778,7 @@ def _roi_map(im, rois, spec: SourceSpec, frames: np.ndarray) -> bytes | None:
     try:
         set_unit_safely(im, fnv.Unit.COUNTS)
         n = int(im.num_frames)
-        values = read_array(im, max(0, min(n - 1, spec.ignition_frame))).astype(np.float64)
+        values = read_array(im, max(0, min(n - 1, frame))).astype(np.float64)
         low, high = np.percentile(values, (1, 99.7))
         high = max(high, low + 1)
         lut = palette_lut("Iron")
@@ -812,33 +861,49 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 im = open_recording(key)
                 owned.append(im)
             opened.append(im)
-        infos = []
+        chosen: list[tuple[int, np.ndarray] | None] = []
         for spec, im in zip(specs, opened):
-            if superframing(im):
-                # rows would alternate presets (and a calibration fitted on some of them could pass)
-                raise ValueError(f"{spec.path.name} cycles through several presets (superframing); the Excel "
-                                 "export cannot keep them apart yet")
             n = int(im.num_frames)
             if not 0 <= spec.ignition_frame < n:
                 raise ValueError(f"{spec.path.name}: ignition frame {spec.ignition_frame + 1} is outside the recording")
-            infos.append(n)
+            if superframing(im):  # rows read one preset's frames (they would alternate presets otherwise)
+                preset = choose_preset(im, spec.preset)
+                chosen.append((preset, preset_indices(im, preset, abort)))
+            else:
+                chosen.append(None)
         reports = []
-        for spec, im in zip(specs, opened):
+        for spec, im, pick in zip(specs, opened, chosen):
             if abort():
                 raise JobCancelled("Export cancelled")
-            reports.append(derive_calibration(im, spec.path, abort=abort))
-        spans, rates, pixel_counts, measured = [], [], [], []
-        for spec, im in zip(specs, opened):
+            if pick is None:
+                reports.append(derive_calibration(im, spec.path, abort=abort))
+                continue
+            calibrated = preset_ranges(im).get(pick[0])
+            reports.append(derive_calibration(im, spec.path, abort=abort, indices=calibration_frames(im, pick[1]),
+                                              limits=RangeLimits(calibrated=calibrated) if calibrated else None))
+        spans, rates, pixel_counts, measured, presets = [], [], [], [], []
+        for spec, im, pick in zip(specs, opened, chosen):
             repair = TimestampRepair(spec.path)  # an ATS clock can roll over at New Year
             with preserved_state(im):
                 set_unit_safely(im, fnv.Unit.COUNTS)
                 n = int(im.num_frames)
-                first = _stamp(im, 0, repair)
-                last = _stamp(im, n - 1, repair)
+                ends = (0, n - 1) if pick is None else (int(pick[1][0]), int(pick[1][-1]))
+                first = _stamp(im, ends[0], repair)
+                last = _stamp(im, ends[1], repair)
                 ignition = _stamp(im, spec.ignition_frame, repair)
                 rate = recording_rate(im, repair)
             measured.append(rate)
             fps = rate.fps
+            if pick is not None:  # one preset's frames, always timed by the camera clock
+                if not (first and last and ignition):
+                    raise ValueError(f"{spec.path.name}: its clock cannot time the frames of one preset")
+                span = (last - first).total_seconds()
+                preset_rate = (pick[1].size - 1) / span if span > 0 and pick[1].size > 1 else fps / len(preset_ranges(im))
+                presets.append(PresetFrames(pick[0], pick[1], preset_ranges(im).get(pick[0]), preset_rate))
+                rates.append(preset_rate)
+                spans.append(((first - ignition).total_seconds(), (last - ignition).total_seconds()))
+                continue
+            presets.append(None)
             # rows every frame interval: the frame rate, or the clock's mean rate
             rates.append(rate.clock_fps if options.time_base == "clock" and rate.clock_fps > 0 else fps)
             if options.time_base == "clock" and first and last and ignition:
@@ -852,19 +917,30 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                        fit_pixel_limit([count for count in pixel_counts if count], options))
         if pixel_limit != options.pixel_limit:
             options = dataclass_replace(options, pixel_limit=pixel_limit)
+        prefill = options.tc_prefill
+        if prefill is not None and prefill.frame is not None and presets[0] is not None:
+            # placed by frame number / rate; this recording's axis is its clock, from the ignition frame
+            repair = TimestampRepair(specs[0].path)
+            with preserved_state(opened[0]):
+                zero = _stamp(opened[0], 0, repair)
+                ignition = _stamp(opened[0], specs[0].ignition_frame, repair)
+            if zero and ignition and prefill.fps and prefill.fps > 0:
+                delta = prefill.frame / prefill.fps - (ignition - zero).total_seconds()
+                options = dataclass_replace(options, tc_prefill=prefill.rebased(delta))
         times = timeline(spans, options, rates[0])
         total = times.size * len(specs) + 1
         done = 0
         sources = []
         labels_seen: dict[str, int] = {}
-        for spec, im, report, rate in zip(specs, opened, reports, measured):
+        for spec, im, report, rate, preset in zip(specs, opened, reports, measured, presets):
             offset = done
 
             def tick(value, offset=offset):
                 if progress is not None:
                     progress(offset + value, total)
 
-            source = collect_source(im, spec, times, options, report, progress=tick, abort=abort, rate=rate)
+            source = collect_source(im, spec, times, options, report, progress=tick, abort=abort, rate=rate,
+                                    preset=preset)
             count = labels_seen.get(source.label, 0) + 1
             labels_seen[source.label] = count
             if count > 1:

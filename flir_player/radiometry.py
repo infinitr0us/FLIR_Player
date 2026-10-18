@@ -310,3 +310,123 @@ def fit_planck(kelvin, counts) -> PlanckConstants:
             if damping > 1e12:
                 break
     return PlanckConstants(*(float(v) for v in p))
+
+
+def fit_radiance_curve(kelvin, signal) -> PlanckConstants:
+    """Least-squares R and B with F = 1 and O = 0: signal = R / (exp(B / T) − 1).
+
+    The radiance an ATS camera's software reports follows this two-constant
+    curve exactly (A8303sc). With F and O fixed the curve stays exact far
+    below the fitted temperatures, where the reflected and atmosphere terms
+    of the object parameters are evaluated.
+    """
+    t = np.asarray(kelvin, dtype=np.float64).ravel()
+    s = np.asarray(signal, dtype=np.float64).ravel()
+    if t.size < 4 or np.ptp(t) <= 0:
+        raise ValueError("At least four distinct temperatures are needed to fit a calibration")
+    best = None
+    for b in np.geomspace(300.0, 30000.0, 241):
+        with np.errstate(over="ignore", divide="ignore"):
+            g = 1.0 / np.expm1(b / t)
+        norm = float(g @ g)
+        if not 0 < norm < np.inf:
+            continue
+        r = float(g @ s) / norm
+        cost = float(np.sum((r * g - s) ** 2))
+        if best is None or cost < best[0]:
+            best = (cost, r, b)
+    if best is None:
+        raise ValueError("Could not seed the calibration fit")
+    _cost, r, b = best
+    for _ in range(100):  # Gauss-Newton on (R, B)
+        with np.errstate(over="ignore"):
+            g = 1.0 / np.expm1(b / t)
+            jacobian = np.column_stack([g, -r * np.exp(b / t) / t * g * g])
+        step = np.linalg.lstsq(jacobian, -(r * g - s), rcond=None)[0]
+        r, b = r + step[0], b + step[1]
+        if abs(step[1]) < 1e-12 * abs(b):
+            break
+    if not (np.isfinite(r) and np.isfinite(b) and r > 0 and b > 0):
+        raise ValueError("The calibration fit did not converge")
+    return PlanckConstants(float(r), float(b), 1.0, 0.0)
+
+
+UNIT_TRANSMISSION = AtmosphereConstants(X=1.0, alpha1=0.0, alpha2=0.0, beta1=0.0, beta2=0.0)  # τ = 1 everywhere
+
+
+def fit_atmosphere(distance_m, humidity, atmosphere_k, tau) -> tuple[AtmosphereConstants, float]:
+    """FLIR's two-band transmission constants reproducing ``tau`` measured at the given conditions.
+
+    Returns the constants and their largest error in τ. The weight X is linear
+    once the four band coefficients are fixed (variable projection), so only
+    those are refined, by Levenberg–Marquardt from a fixed grid of starts. A
+    camera whose software applies no attenuation gets ``UNIT_TRANSMISSION``.
+    """
+    d = np.asarray(distance_m, dtype=np.float64).ravel()
+    tau = np.asarray(tau, dtype=np.float64).ravel()
+    root_d = np.sqrt(np.maximum(d, 0.0))
+    probe = AtmosphereConstants()
+    root_h = np.sqrt([probe.water_vapour(h, t) for h, t in
+                      zip(np.asarray(humidity, dtype=np.float64).ravel(), np.asarray(atmosphere_k, dtype=np.float64).ravel())])
+    if not (d.size == tau.size == root_h.size) or d.size < 6 or not np.all(np.isfinite(tau)):
+        raise ValueError("Fitting the transmission needs six or more finite measurements")
+    if np.max(np.abs(tau - 1.0)) < 1e-7:
+        return UNIT_TRANSMISSION, float(np.max(np.abs(tau - 1.0)))
+
+    def bands(q):
+        with np.errstate(over="ignore", invalid="ignore"):
+            return (np.exp(-root_d * (q[0] + q[1] * root_h)), np.exp(-root_d * (q[2] + q[3] * root_h)))
+
+    def weight(e1, e2) -> float:
+        span = e1 - e2
+        with np.errstate(over="ignore", invalid="ignore"):
+            norm = float(span @ span)
+            return float((tau - e2) @ span / norm) if 1e-30 < norm < np.inf else 0.0
+
+    def residual(q):
+        e1, e2 = bands(q)
+        return e2 + weight(e1, e2) * (e1 - e2) - tau
+
+    best = None
+    alphas = np.geomspace(1e-4, 1.0, 9)
+    for a1 in alphas:
+        for a2 in alphas:
+            if a2 >= a1:
+                continue
+            p = np.array([a1, 0.0, a2, 0.0])
+            r = residual(p)
+            damping = 1e-3
+            for _ in range(200):
+                jacobian = np.empty((tau.size, 4))
+                for j in range(4):
+                    h = max(abs(p[j]) * 1e-7, 1e-10)
+                    q = p.copy()
+                    q[j] += h
+                    jacobian[:, j] = (residual(q) - r) / h
+                normal = jacobian.T @ jacobian
+                try:
+                    step = np.linalg.solve(normal + damping * np.diag(np.diag(normal) + 1e-30), -(jacobian.T @ r))
+                except np.linalg.LinAlgError:
+                    break
+                q = p + step
+                rq = residual(q)
+                if np.all(np.isfinite(rq)) and rq @ rq < r @ r:
+                    p, r, damping = q, rq, damping / 3
+                    if np.max(np.abs(step)) < 1e-15:
+                        break
+                else:
+                    damping *= 5
+                    if damping > 1e12:
+                        break
+            cost = float(r @ r)
+            if np.isfinite(cost) and (best is None or cost < best[0]):
+                best = (cost, p)
+    if best is None:
+        raise ValueError("Could not fit the transmission model")
+    p = best[1]
+    x = weight(*bands(p))
+    constants = AtmosphereConstants(X=x, alpha1=float(p[0]), beta1=float(p[1]), alpha2=float(p[2]), beta2=float(p[3]))
+    error = max(abs(constants.transmission(a, b, c) - t)
+                for a, b, c, t in zip(d, np.asarray(humidity, dtype=np.float64).ravel(),
+                                      np.asarray(atmosphere_k, dtype=np.float64).ravel(), tau))
+    return constants, float(error)

@@ -2156,6 +2156,7 @@ class ElidingLabel(QLabel):
 
 class InspectorPanel(QWidget):
     unit_changed = Signal(str)
+    preset_changed = Signal(object)  # a superframing preset's index, or None for every frame
     palette_changed = Signal(str)
     palette_invert_toggled = Signal(bool)
     palette_edit_requested = Signal()
@@ -2216,6 +2217,20 @@ class InspectorPanel(QWidget):
         self.unit_combo.currentIndexChanged.connect(self._unit_selected)
         layout.addWidget(self.unit_combo)
         layout.addSpacing(12)
+
+        # superframing recordings only: which preset's frames are shown and measured
+        self.preset_box = QWidget()
+        preset_layout = QVBoxLayout(self.preset_box)
+        preset_layout.setContentsMargins(0, 0, 0, 12)
+        preset_layout.setSpacing(8)
+        preset_layout.addWidget(self._field_label("Preset"))
+        self.preset_combo = ChevronComboBox()
+        self.preset_combo.setToolTip("The camera cycles through presets (temperature ranges), one frame each. "
+                                     "Show and measure the frames of one, or every frame as recorded.")
+        self.preset_combo.currentIndexChanged.connect(self._preset_selected)
+        preset_layout.addWidget(self.preset_combo)
+        self.preset_box.setVisible(False)
+        layout.addWidget(self.preset_box)
 
         palette_header = QHBoxLayout()
         palette_header.setSpacing(8)
@@ -2913,6 +2928,35 @@ class InspectorPanel(QWidget):
         if key:
             self.unit_changed.emit(str(key))
 
+    _ALL_PRESETS = -1  # the combo's data for "every frame" (None does not round-trip through findData)
+
+    def set_presets(self, presets, selected: int | None) -> None:
+        """Offer the presets of a superframing recording (hidden for one preset)."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for preset in presets:
+            span = (f"{preset.min_k - 273.15:.0f} to {preset.max_k - 273.15:.0f} °C"
+                    if preset.min_k is not None and preset.max_k is not None else "not calibrated")
+            self.preset_combo.addItem(f"Preset {preset.index}: {span}", preset.index)
+        if presets:
+            self.preset_combo.addItem("Every frame (presets alternate)", self._ALL_PRESETS)
+        self.preset_combo.blockSignals(False)
+        self.select_preset(selected)
+        self.preset_box.setVisible(bool(presets))
+        self._refresh_enabled_state()
+
+    def select_preset(self, preset: int | None) -> None:
+        index = self.preset_combo.findData(self._ALL_PRESETS if preset is None else int(preset))
+        if index >= 0 and index != self.preset_combo.currentIndex():
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(index)
+            self.preset_combo.blockSignals(False)
+
+    def _preset_selected(self, index: int) -> None:
+        data = self.preset_combo.itemData(index)
+        if data is not None:
+            self.preset_changed.emit(None if data == self._ALL_PRESETS else int(data))
+
     def _set_range_mode(self, mode: str) -> None:
         self.set_range_mode(mode)
         self.range_mode_changed.emit(mode)
@@ -2980,6 +3024,7 @@ class InspectorPanel(QWidget):
     def _refresh_enabled_state(self) -> None:
         enabled = self._data_available and not self._busy
         self.unit_combo.setEnabled(enabled and self.unit_combo.count() > 0)
+        self.preset_combo.setEnabled(enabled and self.preset_combo.count() > 0)
         self.palette_combo.setEnabled(enabled)
         self.palette_invert_check.setEnabled(enabled)
         self.palette_edit_button.setEnabled(enabled)
