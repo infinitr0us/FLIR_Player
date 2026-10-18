@@ -1879,8 +1879,8 @@ class _Writer:
                          None, ("PASS — formulas reproduce the SDK" if passed else "CHECK") if checked or failed
                          else unchecked)
         ws.write(summary_row + 1, 0, "Binned and mean-signal means are approximations and excluded from the pass "
-                                     "mark; see their own rows. Each area's max and min are checked exactly.",
-                 self.f_note)
+                                     "mark; see their own rows. Each area's max and min are exact and count, "
+                                     "except on samples where the SDK clamped one of its pixels.", self.f_note)
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
                                                                "value": "PASS", "format": self.f_pass})
         ws.conditional_format(summary_row, 4, summary_row, 4, {"type": "text", "criteria": "begins with",
