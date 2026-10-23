@@ -10,8 +10,8 @@ both measure, because of a count offset FLIR's calibration does not remove (loca
 
 A joined choice is a tuple of presets, lowest range first, wherever one preset is an int.
 
-The camera can also put its internal shutter (flag) in front of the sensor for a minute or more (about 70 s every
-30 minutes on the A8303 fire tests); its frame headers then say ``FlagInFOV = T`` and the frames show no scene.
+The camera can also put its internal shutter (flag) in front of the sensor for a minute or more (about 70 s, three
+or four times in each A8303 fire test); its frame headers then say ``FlagInFOV = T`` and the frames show no scene.
 """
 from __future__ import annotations
 

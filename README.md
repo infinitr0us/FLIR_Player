@@ -542,7 +542,8 @@ sees only its own range.
   frame read about 1,205 °C, in FLIR's File SDK too) and is left out; the
   player's notice and the workbook's Source sheet say so.
 - **Camera shutter:** the A8303sc puts its shutter in front of the sensor for
-  about a minute every 30 minutes (frame header `FlagInFOV`). Those frames show
+  about 70 s, three or four times in each of the fire tests (frame header
+  `FlagInFOV`; every 30 minutes on the 1006 test a). Those frames show
   no scene: the player says so, the workbook leaves their rows without counts
   (*Shutter in view*), and the TC fit leaves them out.
 - **Calibration:** this camera's counts do not follow FLIR's calibration curve.

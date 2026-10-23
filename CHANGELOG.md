@@ -34,7 +34,7 @@ emissivity, 0.95.
 ### Camera shutter
 
 - Frames whose header says the camera's shutter covered the sensor
-  (`FlagInFOV`, about 70 s every 30 minutes on the A8303sc fire tests) show no
+  (`FlagInFOV`; about 70 s, three or four times in each A8303sc fire test) show no
   scene. Their workbook rows keep the frame and clock but no counts, with the
   status *Shutter in view*; the Source sheet counts them. The player says so
   when it shows one, and *Fit Emissivity from TCs* leaves them out.
