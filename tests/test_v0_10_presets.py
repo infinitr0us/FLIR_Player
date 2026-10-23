@@ -9,6 +9,7 @@ carried a count offset (its cold frames read 1,205 °C); the shutter covered the
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -538,14 +539,15 @@ def test_the_reference_label_follows_a_preset_change(qapp, ats, monkeypatch) -> 
     window.open_path(ats)
     try:
         assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
-        labels = []
-        window.decoder.reference_ready.connect(labels.append)
-        window.decoder.request_reference({"path": str(ats), "frame_index": 0, "op": "subtract"}, 0, 101)
-        assert wait_until(qapp, lambda: labels and not window._busy)
-        assert labels[-1].endswith("frame 1")
-        window.decoder.request_preset(2, 0, 102)
-        assert wait_until(qapp, lambda: len(labels) >= 2 and not window._busy)
-        assert labels[-1].endswith("frame 2")  # preset 2's frame of the reference's cycle
+        shown = window.inspector.reference_label
+        window.decoder.request_reference({"path": str(ats), "frame_index": 0, "op": "subtract"}, 0,
+                                         window._activate_state_request())
+        assert wait_until(qapp, lambda: shown.text().endswith("frame 1") and not window._busy)
+        window._change_preset(2)
+        assert wait_until(qapp, lambda: shown.text().endswith("frame 2") and not window._busy)  # preset 2's frame
+        # review round 5: a preset result superseded by a newer request leaves the label alone
+        window._on_preset_ready((1, 2), dataclasses.replace(window.current_packet, request_id=-7), "other · frame 9")
+        assert shown.text().endswith("frame 2")
     finally:
         window.close()
         qapp.processEvents()

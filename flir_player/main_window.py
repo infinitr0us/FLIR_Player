@@ -722,10 +722,12 @@ class MainWindow(QMainWindow):
         request_id = self._activate_state_request()
         self.decoder.request_preset(preset, self.current_packet.index, request_id)
 
-    def _on_preset_ready(self, preset: int | None, packet: FramePacket) -> None:
+    def _on_preset_ready(self, preset, packet: FramePacket, reference_label: str | None = None) -> None:
         self._preset = preset
         if packet.request_id != self._active_request_id:
             return
+        if reference_label:  # the reference now reads the preset shown's frame of its cycle
+            self.inspector.set_reference_label(reference_label)
         self._present_packet(packet)
 
     def _apply_object_parameters(self, values: dict | None) -> None:

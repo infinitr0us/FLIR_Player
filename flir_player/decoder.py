@@ -178,7 +178,8 @@ class DecoderThread(QThread):
     opened = Signal(object, object, object)
     frame_ready = Signal(object)
     unit_ready = Signal(object, object)
-    preset_ready = Signal(object, object)  # superframing preset (or None), the frame read with it
+    # superframing preset (or None), the frame read with it, and the reference's label then (None: no reference)
+    preset_ready = Signal(object, object, object)
     object_params_ready = Signal(object)
     corrections_ready = Signal(object)
     reference_ready = Signal(str)
@@ -479,9 +480,9 @@ class DecoderThread(QThread):
                         cache.clear()
                         packet = source.read_frame(index, request_id=request_id)
                         cache.put((packet.revision, packet.unit.key, packet.index), replace(packet, request_id=0))
-                        self.preset_ready.emit(preset, packet)
-                        if source.reference_label:  # a reference from this recording follows the presets shown
-                            self.reference_ready.emit(source.reference_label)
+                        # a reference from this recording follows the presets shown: its label travels with the
+                        # request-tagged result, so a superseded change cannot relabel another recording
+                        self.preset_ready.emit(preset, packet, source.reference_label or None)
                     elif command == "unit":
                         key, index, request_id = payload
                         self.busy_changed.emit(True, "Updating thermal unit…")
