@@ -590,6 +590,20 @@ class FlirVideoSource:
                 return frame
         raise ValueError(f"The recording has no frame of preset {self._base}")
 
+    def _same_cycle(self, index: int) -> int:
+        """``index``, or the frame of the preset shown nearest it by the clock: its frame of the same cycle (a
+        cycle's frames are 17 ms apart on the A8303sc, cycles about a second)."""
+        if self._preset is None or self._preset_of(index) == self._base:
+            return index
+        candidates = [f for f in (self._neighbour(index, -1), self._neighbour(index, 1)) if f is not None]
+        if not candidates:
+            raise ValueError(f"The recording has no frame of preset {self._base}")
+        at = self._timestamp_for_frame(index)
+        stamps = {f: self._timestamp_for_frame(f) for f in candidates}
+        if at is None or any(stamp is None for stamp in stamps.values()):
+            return min(candidates, key=lambda f: abs(f - index))
+        return min(candidates, key=lambda f: abs((stamps[f] - at).total_seconds()))
+
     def preset_last_frame(self, preset: int) -> int:
         """The last frame of ``preset`` (playback ends there)."""
         last = int(self._im.num_frames) - 1
@@ -1037,9 +1051,8 @@ class FlirVideoSource:
                 for key in ("nuc", "bp"):
                     if getattr(im, f"has_{key}", False):
                         setattr(im, f"apply_{key}", getattr(self._im, f"apply_{key}", False))
-            index = max(0, min(int(frame_index), int(im.num_frames) - 1))
-            if same_file and self._preset is not None:
-                index = self._snap(index)  # a frame of the preset shown, as the frames it is compared with
+            anchor = max(0, min(int(frame_index), int(im.num_frames) - 1))  # the frame chosen, kept as asked
+            index = self._same_cycle(anchor) if same_file else anchor  # read: the preset shown, of its cycle
             im.get_frame(index)
             if same_file:  # presets joined: merged as the frames shown, so a frame minus itself is zero
                 reference = self._current_raw(index)[0]
@@ -1061,7 +1074,8 @@ class FlirVideoSource:
                 f"match the current recording ({expected[1]}×{expected[0]})"
             )
         self._reference = reference
-        self._reference_spec = (resolved, index, str(operation))
+        # the frame as chosen: a later preset change reads its cycle again, never a frame further on
+        self._reference_spec = (resolved, anchor, str(operation))
         self._processing = replace(self._processing, file_op=str(operation))
         self._invalidate_processing()
         self._reference_label = f"{resolved.name} · frame {index + 1}"

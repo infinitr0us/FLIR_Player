@@ -450,6 +450,12 @@ def test_a_reference_from_the_recording_is_joined_too(ats, monkeypatch) -> None:
     np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
     src.set_preset((1, 2))
     np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+    for _ in range(2):  # review round 3: through preset 2 and back, the reference stays on frame 0's cycle
+        src.set_preset(2)
+        np.testing.assert_array_equal(src.read_frame(1).data, 0.0)  # frame 1: preset 2's frame of that cycle
+        src.set_preset((1, 2))
+        np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+    assert src._reference_spec[1] == 0
 
 
 def test_the_median_difference_takes_both_middle_values() -> None:
