@@ -382,6 +382,7 @@ class FlirVideoSource:
         # preset whose range holds it (merge_presets) from the same cycle's frames
         self._preset: Preset = None
         self._join_check: tuple[Preset, Any] | None = None  # (choice, presets.PresetCheck) once compared
+        self._merged: tuple[tuple[int, int], Any, tuple[int, ...]] | None = None  # last merge: (revision, frame), ...
 
     def _invalidate_processing(self) -> None:
         self.revision += 1
@@ -717,6 +718,8 @@ class FlirVideoSource:
             data = self._process_frame(data, frame_index)
         else:
             data = processed
+            if self._merged is not None and self._merged[0] == (self.revision, frame_index):
+                status, joined = self._merged[1], self._merged[2]  # the frame shown again: its merged status
         merged = len(joined) > 1
         (
             minimum,
@@ -819,7 +822,9 @@ class FlirVideoSource:
         ranges = {p.index: (p.min_k, p.max_k) if p.min_k is not None else None
                   for p in _superframing_presets(self._im)}
         merged, merged_status, _which = merge_presets(layers, ranges, self._unit_spec.temperature_type)
-        return merged, merged_status, tuple(preset for preset, _v, _s in layers)
+        used = tuple(preset for preset, _v, _s in layers)
+        self._merged = ((self.revision, frame_index), merged_status, used)
+        return merged, merged_status, used
 
     def _analysis_provenance(self) -> tuple:
         # Small immutable values, never SDK handles, accompany numerical exports.
@@ -971,6 +976,7 @@ class FlirVideoSource:
         self._provenance = None
         self._preset = None
         self._join_check = None
+        self._merged = None
 
     # --- processing pipeline (§4.8.6, §4.9.5.3) ------------------------------------
 
@@ -1026,10 +1032,15 @@ class FlirVideoSource:
                     if getattr(im, f"has_{key}", False):
                         setattr(im, f"apply_{key}", getattr(self._im, f"apply_{key}", False))
             index = max(0, min(int(frame_index), int(im.num_frames) - 1))
+            if same_file and self._preset is not None:
+                index = self._snap(index)  # a frame of the preset shown, as the frames it is compared with
             im.get_frame(index)
-            reference = np.array(im.final, copy=True).reshape(
-                (int(im.height), int(im.width))
-            )
+            if same_file:  # presets joined: merged as the frames shown, so a frame minus itself is zero
+                reference = self._current_raw(index)[0]
+            else:
+                reference = np.array(im.final, copy=True).reshape(
+                    (int(im.height), int(im.width))
+                )
         finally:
             if not same_file:
                 try:

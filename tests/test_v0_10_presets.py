@@ -45,7 +45,8 @@ class _Info(list):
 class _Superframing:
     """A superframing ATS handle: cycle k (one frame per preset, 17 ms apart) starts at k seconds."""
 
-    def __init__(self, scene=None, presets=(1, 2), cycles=60, pedestal=None, shutter=(), size=8):
+    def __init__(self, scene=None, presets=(1, 2), cycles=60, pedestal=None, shutter=(), size=8, covered=(),
+                 clamp_above=None):
         import fnv
         self.fnv = fnv
         self.presets = tuple(presets)
@@ -65,6 +66,8 @@ class _Superframing:
                                + 20.0 * np.sin(k / 5.0))
         self.pedestal = pedestal or {}  # preset → counts added (the 1006a preset 3)
         self.shutter = set(shutter)  # cycles whose frames the shutter covered
+        self.covered = set(covered)  # single frames the shutter covered (its edge falling inside a cycle)
+        self.clamp_above = clamp_above  # K above a preset's range where the SDK clamps high (status 4)
         self.get_frame(0)
 
     def get_preset(self, index):
@@ -77,7 +80,8 @@ class _Superframing:
         preset = self.get_preset(index)
         _range, curve, (a2, a1, a0) = PRESETS[preset]
         cycle = index // len(self.presets)
-        scene = np.full((self.height, self.width), 290.0) if cycle in self.shutter else self.scene(cycle)
+        flag = cycle in self.shutter or index in self.covered
+        scene = np.full((self.height, self.width), 290.0) if flag else self.scene(cycle)
         radiance = curve.signal(scene)
         counts = (-a1 + np.sqrt(a1 * a1 - 4 * a2 * (a0 - radiance))) / (2 * a2)
         return counts + self.pedestal.get(preset, 0.0)
@@ -88,7 +92,7 @@ class _Superframing:
         cycle, member = divmod(index, len(self.presets))
         preset = self.get_preset(index)
         time = datetime(2026, 10, 6, 10, 47, 59) + timedelta(seconds=cycle + 0.017 * member)
-        self.frame_info = _Info(time, preset, cycle in self.shutter)
+        self.frame_info = _Info(time, preset, cycle in self.shutter or index in self.covered)
         counts = self.counts_for(index)
         (low, high), curve, (a2, a1, a0) = PRESETS[preset]
         radiance = a2 * counts * counts + a1 * counts + a0
@@ -102,6 +106,8 @@ class _Superframing:
         else:
             self.final = kelvin
         self.status = np.where((kelvin >= low) & (kelvin <= high), 0, 1).astype(np.int8)
+        if self.clamp_above is not None:
+            self.status[kelvin > high + self.clamp_above] = 4
 
     def update_frame(self):
         self.get_frame(self.index)
@@ -159,7 +165,7 @@ def test_presets_that_agree_are_joined() -> None:
     check = check_presets(im, (1, 2, 3), ranges, cycles=8)
     assert check.kept == (1, 2, 3) and not check.left_out
     assert all(pair.agrees for pair in check.pairs)
-    assert check.pairs[0].difference_k == pytest.approx(0.0, abs=2.0)  # each preset's curve at ε 0.95
+    assert check.pairs[0].difference_k == pytest.approx(0.0, abs=5.0)  # 5 K bins; each preset's curve at ε 0.95
 
 
 def test_an_offset_preset_is_left_out() -> None:
@@ -392,3 +398,69 @@ def test_the_excel_dialog_starts_on_the_players_choice(qapp, tmp_path) -> None:
     assert one._chosen_preset() == 2
     joined.close()
     one.close()
+
+
+# --- review of 0.10.0 ------------------------------------------------------------------------------------------
+
+
+RANGES = {p: r for p, (r, _c, _q) in PRESETS.items()}
+
+
+def test_an_offset_preset_is_left_out_in_a_hot_scene() -> None:
+    """Review: with the scene above preset 2's floor nothing contradicts; the median difference tells."""
+    pytest.importorskip("fnv")
+    hot = _Superframing(presets=(1, 2, 3), size=40, pedestal={3: 4151.0},
+                        scene=lambda k: np.linspace(1200.0, 1600.0, 1600).reshape(40, 40))
+    check = check_presets(hot, (1, 2, 3), RANGES, cycles=8)
+    assert check.left_out == (3,) and check.pairs[-1].offset and check.pairs[-1].share < 0.5
+    assert any(line.startswith("Preset 3 left out") and "against preset 2" in line for line in check.notes())
+
+
+def test_the_check_reads_the_recordings_own_parameters() -> None:
+    """Review: an emissivity set in the player must not change the verdict."""
+    pytest.importorskip("fnv")
+    im = _Superframing(presets=(1, 2, 3), size=40, pedestal={3: 4151.0})
+    im.object_parameters.emissivity = 0.2
+    assert check_presets(im, (1, 2, 3), RANGES, cycles=8).left_out == (3,)
+
+
+def test_a_higher_frame_under_the_shutter_is_skipped() -> None:
+    """Review: preset 1 exposed but preset 2's frame of the cycle covered must not fail preset 2."""
+    pytest.importorskip("fnv")
+    im = _Superframing(presets=(1, 2), size=40, covered={2 * k + 1 for k in range(60) if k != 30})
+    assert check_presets(im, (1, 2), RANGES, cycles=8).kept == (1, 2)
+
+
+def test_a_choice_that_skips_a_preset_is_still_checked() -> None:
+    """Review: presets (1, 3) of a 1-2-3 cycle: preset 3's frame is two frames on."""
+    pytest.importorskip("fnv")
+    im = _Superframing(presets=(1, 2, 3), size=40, pedestal={3: 4151.0})
+    check = check_presets(im, (1, 3), RANGES, cycles=8)
+    assert check.left_out == (3,) and check.pairs[0].informative > 1000
+
+
+def test_a_reference_from_the_recording_is_joined_too(ats, monkeypatch) -> None:
+    """Review: a frame minus itself as the reference is zero with presets joined."""
+    pytest.importorskip("fnv")
+    src = _player(ats, monkeypatch, _Superframing(size=40))
+    src.load_reference(ats, 0, "subtract")
+    src.set_unit("temperature_factory_k")
+    np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+
+
+def test_a_temporal_refetch_keeps_the_merged_clip_mask(ats, monkeypatch) -> None:
+    """Review: reading the shown frame again (ROI edit) must not take the lowest preset's clipping."""
+    pytest.importorskip("fnv")
+    from flir_player.processing import ProcessingState
+
+    src = _player(ats, monkeypatch, _Superframing(size=40, clamp_above=150.0))
+    src.set_unit("temperature_factory_k")
+    src.set_processing(ProcessingState(temporal=("mean", 2)))
+    first = src.read_frame(2)
+    again = src.read_frame(2)
+    np.testing.assert_array_equal(first.data, again.data)
+    assert (first.clip_mask is None) == (again.clip_mask is None)
+    if first.clip_mask is not None:
+        np.testing.assert_array_equal(first.clip_mask, again.clip_mask)
+    src.set_preset(1)  # preset 1 alone clamps the hottest pixels: the mask is not empty by construction
+    assert src.read_frame(2).clip_mask is not None

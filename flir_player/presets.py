@@ -34,6 +34,10 @@ KELVIN = 273.15
 LEAVE_OUT_SHARE = 0.5  # share of contradicting pixels above which a preset is left out
 MIN_PIXELS = 1000  # fewer informative pixels: the pair is not judged (the preset joins; it adds nothing wrong)
 MARGIN_K = 100.0  # flames change by tens of kelvin within the 17 ms between the presets of a cycle
+# where both presets read inside their ranges, their median difference: 18 to 112 K between healthy presets on the
+# fire tests (flicker and the ranges' asymmetry), +649 K for 1006a's preset 3
+DIFFERENCE_K = 300.0
+_EDGES = np.arange(-3000.0, 3005.0, 5.0)  # bins of those differences (K)
 CYCLES = 24  # cycles read by the check: the hottest half by the lowest preset's counts, the rest spread out
 MAX_CYCLE_GAP_S = 0.5  # frames of one cycle are 17 ms apart; the next cycle comes about 1 s later
 
@@ -103,15 +107,20 @@ class PairCheck:
     informative: int  # pixels that tell: the upper preset in range, or the lower one above its range
     contradicting: int  # of those, pixels the other preset reads well colder (MARGIN_K) than that range allows
     both: int  # pixels inside both ranges
-    difference_k: float | None  # median upper − lower over those (flames change within the 17 ms: a guide only)
+    difference_k: float | None  # median upper − lower over those (None: fewer than MIN_PIXELS)
 
     @property
     def share(self) -> float | None:
         return self.contradicting / self.informative if self.informative >= MIN_PIXELS else None
 
     @property
+    def offset(self) -> bool:
+        """Where both read inside their ranges, they differ by more than flames change within a cycle."""
+        return self.difference_k is not None and abs(self.difference_k) > DIFFERENCE_K
+
+    @property
     def agrees(self) -> bool:
-        return self.share is None or self.share <= LEAVE_OUT_SHARE
+        return not self.offset and (self.share is None or self.share <= LEAVE_OUT_SHARE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,21 +136,57 @@ class PresetCheck:
         """One plain line per preset judged, for the Source sheet and the player."""
         lines = []
         for pair in self.pairs:
-            if pair.share is None:
+            diff = (f"where both are inside their ranges it reads {pair.difference_k:+.0f} K against preset "
+                    f"{pair.lower} (median of {pair.both:,} pixels)" if pair.difference_k is not None else "")
+            if pair.agrees and pair.share is None and pair.difference_k is None:
                 lines.append(f"Preset {pair.upper}: too few pixels in its range to compare with preset {pair.lower} "
                              f"({pair.informative:,}); joined.")
             elif pair.agrees:
-                lines.append(f"Preset {pair.upper} agrees with preset {pair.lower}: in {pair.share:.1%} of "
-                             f"{pair.informative:,} pixels their frames of one cycle differ by more than "
-                             f"{MARGIN_K:.0f} K the impossible way (flames flicker).")
+                text = (f"in {pair.share:.1%} of {pair.informative:,} pixels their frames of one cycle differ by more "
+                        f"than {MARGIN_K:.0f} K the impossible way" if pair.share is not None else "")
+                lines.append(f"Preset {pair.upper} agrees with preset {pair.lower}: "
+                             + "; ".join(part for part in (text, diff) if part) + " (flames flicker).")
             else:
-                diff = (f"; where both are inside their ranges it reads {pair.difference_k:+.0f} K against preset "
-                        f"{pair.lower} (median)" if pair.difference_k is not None else "")
-                lines.append(f"Preset {pair.upper} left out: of {pair.informative:,} pixels it reads inside its range, "
-                             f"{pair.share:.0%} read more than {MARGIN_K:.0f} K colder in preset {pair.lower}'s frame of "
-                             f"the same cycle{diff}. Its frames carry an offset (FLIR's File SDK reads them the same "
-                             "way).")
+                parts = []
+                if pair.share is not None and pair.share > LEAVE_OUT_SHARE:
+                    parts.append(f"of {pair.informative:,} pixels it reads inside its range, {pair.share:.0%} read more "
+                                 f"than {MARGIN_K:.0f} K colder in preset {pair.lower}'s frame of the same cycle")
+                if diff:
+                    parts.append(diff + (f", more than {DIFFERENCE_K:.0f} K" if pair.offset else ""))
+                lines.append(f"Preset {pair.upper} left out: " + "; ".join(parts) + ". Its frames carry an offset "
+                             "(FLIR's File SDK reads them the same way).")
         return lines
+
+
+class _Tally:
+    """One pair's evidence, summed cycle by cycle (no frames kept)."""
+
+    def __init__(self) -> None:
+        self.informative = self.contradicting = self.both = 0
+        self.histogram = np.zeros(_EDGES.size - 1, dtype=np.int64)
+
+    def add(self, low: tuple[np.ndarray, np.ndarray], high: tuple[np.ndarray, np.ndarray],
+            range_low: tuple[float, float], range_high: tuple[float, float]) -> None:
+        (tl, sl), (tu, su) = low, high
+        lo_l, hi_l = range_low
+        lo_u, hi_u = range_high
+        in_l = (sl == 0) & (tl >= lo_l) & (tl <= hi_l)
+        in_u = (su == 0) & (tu >= lo_u) & (tu <= hi_u)
+        above_l = ((sl & 4) != 0) | (tl > hi_l)
+        self.informative += int(np.count_nonzero(in_u)) + int(np.count_nonzero(above_l & ~in_u))
+        self.contradicting += (int(np.count_nonzero(in_u & ~above_l & (tl < lo_u - MARGIN_K)))
+                               + int(np.count_nonzero(above_l & ~in_u & (tu < hi_l - MARGIN_K))))
+        both = in_l & in_u
+        self.both += int(np.count_nonzero(both))
+        if both.any():
+            d = np.clip((tu - tl)[both], _EDGES[0], _EDGES[-1] - 1e-9)
+            self.histogram += np.histogram(d, bins=_EDGES)[0]
+
+    def median(self) -> float | None:
+        if self.both < MIN_PIXELS:
+            return None
+        k = int(np.searchsorted(np.cumsum(self.histogram), self.both / 2.0))
+        return float((_EDGES[k] + _EDGES[k + 1]) / 2.0)
 
 
 def _frame_time(im: Any) -> datetime | None:
@@ -151,7 +196,8 @@ def _frame_time(im: Any) -> datetime | None:
 
 def cycle_mate(im: Any, frame: int, preset: int, presets: int, n: int | None = None) -> int | None:
     """The frame of ``preset`` in the same cycle as ``frame``, or None: the next one within ``presets`` frames
-    (a cycle runs from the lowest preset up), else the one before. The caller checks the clock."""
+    (the recording's presets per cycle; a cycle runs from the lowest preset up), else the one before. The caller
+    checks the clock."""
     n = int(im.num_frames) if n is None else n
     for candidate in [*range(frame + 1, frame + presets), *range(frame - 1, frame - presets, -1)]:
         if 0 <= candidate < n and preset_of(im, candidate) == preset:
@@ -163,12 +209,17 @@ def check_presets(im: Any, presets: Sequence[int], ranges: Mapping[int, tuple[fl
                   cycles: int = CYCLES, abort: Callable[[], bool] | None = None) -> PresetCheck:
     """Compare each preset with the presets below it on ``cycles`` cycles of the open recording.
 
-    Reads the SDK's temperatures (kelvin) and per-pixel status at the handle's object parameters; the caller
-    restores the handle's state (``calibration.preserved_state``). A pixel contradicts when the upper preset
-    reads it inside its range while the lower one, 17 ms away and not above its own range, reads it more than
-    MARGIN_K colder than the upper range's floor; or when the lower preset reads it above its range while the
-    upper one reads it more than MARGIN_K under the lower range's top. A flame cannot cool by hundreds of kelvin
-    and back within 17 ms, so most pixels contradicting means one preset is offset.
+    ``ranges`` holds every preset of the recording (its cycle width). Reads the SDK's temperatures (kelvin) and
+    per-pixel status at the recording's own object parameters, so the verdict does not depend on the player's
+    settings; the caller restores the handle's state (``calibration.preserved_state``). Frames the shutter
+    covered are skipped. A preset is left out when it disagrees with the highest preset kept below it:
+
+    * contradictions: the upper preset reads a pixel inside its range while the lower one, 17 ms away and not
+      above its own range, reads it more than MARGIN_K colder than the upper range's floor; or the lower preset
+      reads it above its range while the upper one reads it more than MARGIN_K under the lower range's top. A
+      flame cannot cool by hundreds of kelvin and back within 17 ms: most pixels contradicting means an offset;
+    * or, where both read inside their ranges, their median difference exceeds DIFFERENCE_K (an offset in a hot
+      scene, where the lower preset holds most pixels and nothing contradicts).
     """
     from .calibration import read_array, set_unit_safely
 
@@ -176,11 +227,15 @@ def check_presets(im: Any, presets: Sequence[int], ranges: Mapping[int, tuple[fl
     if len(order) < 2:
         return PresetCheck(tuple(order), (), (), 0)
     n = int(im.num_frames)
+    width = max(len(ranges), len(order))  # frames per cycle: a joined choice may skip a preset of the cycle
     base = order[0]
+    reset = getattr(im, "reset_object_parameters", None)
+    if reset is not None:
+        reset()  # the recording's own parameters
     # base-preset frames spread over the recording, then the hottest of a wider probe
     probe = []
     for start in np.linspace(0, n - 1, 4 * cycles).astype(int):
-        for i in range(int(start), min(n, int(start) + 2 * len(order))):
+        for i in range(int(start), min(n, int(start) + 2 * width)):
             if preset_of(im, i) == base:
                 probe.append(i)
                 break
@@ -195,7 +250,9 @@ def check_presets(im: Any, presets: Sequence[int], ranges: Mapping[int, tuple[fl
     spread = [probe[k] for k in np.linspace(0, len(probe) - 1, cycles - len(hottest)).astype(int)]
     chosen = sorted(set(hottest) | set(spread))
     set_unit_safely(im, fnv.Unit.TEMPERATURE_FACTORY, fnv.TempType.KELVIN)
-    samples: list[dict[int, tuple[np.ndarray, np.ndarray]]] = []
+    tallies = {(a, b): _Tally() for i, a in enumerate(order) for b in order[i + 1:]}
+    limits = {p: ranges.get(p) or (-np.inf, np.inf) for p in order}
+    compared = 0
     for frame in chosen:
         if abort is not None and abort():
             raise JobCancelled("Cancelled")
@@ -203,41 +260,26 @@ def check_presets(im: Any, presets: Sequence[int], ranges: Mapping[int, tuple[fl
         if shutter_in_view(im):
             continue
         when = _frame_time(im)
-        status = np.array(im.status, copy=True).reshape(kelvin.shape)
-        cycle = {base: (kelvin, status)}
+        cycle = {base: (kelvin, np.array(im.status, copy=True).reshape(kelvin.shape))}
         for p in order[1:]:
-            mate = cycle_mate(im, frame, p, len(order), n)
+            mate = cycle_mate(im, frame, p, width, n)
             if mate is None:
                 continue
             values = read_array(im, mate).astype(np.float64)
             other = _frame_time(im)
-            if when is not None and other is not None and abs((other - when).total_seconds()) > MAX_CYCLE_GAP_S:
+            if shutter_in_view(im) or (when is not None and other is not None
+                                       and abs((other - when).total_seconds()) > MAX_CYCLE_GAP_S):
                 continue
             cycle[p] = (values, np.array(im.status, copy=True).reshape(values.shape))
-        samples.append(cycle)
+        for (a, b), tally in tallies.items():
+            if a in cycle and b in cycle:
+                tally.add(cycle[a], cycle[b], limits[a], limits[b])
+        compared += 1
     kept, left_out, pairs = [base], [], []
     for upper in order[1:]:
         lower = kept[-1]
-        informative = contradicting = both_n = 0
-        diffs = []
-        lo_l, hi_l = ranges[lower] or (-np.inf, np.inf)
-        lo_u, hi_u = ranges[upper] or (-np.inf, np.inf)
-        for cycle in samples:
-            if lower not in cycle or upper not in cycle:
-                continue
-            (tl, sl), (tu, su) = cycle[lower], cycle[upper]
-            in_l = (sl == 0) & (tl >= lo_l) & (tl <= hi_l)
-            in_u = (su == 0) & (tu >= lo_u) & (tu <= hi_u)
-            above_l = ((sl & 4) != 0) | (tl > hi_l)
-            informative += int(np.count_nonzero(in_u)) + int(np.count_nonzero(above_l & ~in_u))
-            contradicting += (int(np.count_nonzero(in_u & ~above_l & (tl < lo_u - MARGIN_K)))
-                              + int(np.count_nonzero(above_l & ~in_u & (tu < hi_l - MARGIN_K))))
-            both = in_l & in_u
-            both_n += int(np.count_nonzero(both))
-            diffs.append((tu - tl)[both])
-        d = np.concatenate(diffs) if diffs else np.empty(0)
-        pair = PairCheck(lower, upper, informative, contradicting, both_n,
-                         float(np.median(d)) if d.size >= MIN_PIXELS else None)
+        tally = tallies[(lower, upper)]
+        pair = PairCheck(lower, upper, tally.informative, tally.contradicting, tally.both, tally.median())
         pairs.append(pair)
         (kept if pair.agrees else left_out).append(upper)
-    return PresetCheck(tuple(kept), tuple(left_out), tuple(pairs), len(samples))
+    return PresetCheck(tuple(kept), tuple(left_out), tuple(pairs), compared)

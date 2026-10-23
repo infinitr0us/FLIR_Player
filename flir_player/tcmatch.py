@@ -286,7 +286,8 @@ def _file_key(path: Path, *extra) -> str:
 def _cache_key(path: Path, options: MatchOptions, step: float, clock: bool = False,
                signal: tuple[float, ...] | None = None) -> str:
     # clock-timed bins (superframing) differ from frame-number bins; a radiance signal from the counts
-    return _file_key(path, options.roi, options.preset, round(step, 9), 2, *(["clock"] if clock else []),
+    # version 3 (0.10.0): superframing statistics leave shutter frames out; earlier caches hold them
+    return _file_key(path, options.roi, options.preset, round(step, 9), 3, *(["clock"] if clock else []),
                      *([["radiance", *(float(f"{v:.9g}") for v in signal)]] if signal is not None else []))
 
 
