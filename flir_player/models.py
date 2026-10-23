@@ -135,8 +135,11 @@ class VideoMetadata:
     presets: tuple[PresetRange, ...] = ()  # superframing presets; empty for one preset
     preset_ends: tuple[tuple[int, int], ...] = ()  # superframing: (preset, its last frame)
 
-    def last_frame(self, preset: int | None = None) -> int:
-        """The last frame read: the recording's, or with a superframing preset shown, that preset's."""
+    def last_frame(self, preset=None) -> int:
+        """The last frame read: the recording's, or with a superframing preset shown (the lowest of presets
+        joined), that preset's."""
+        if isinstance(preset, (tuple, list)):
+            preset = preset[0] if preset else None
         return dict(self.preset_ends).get(preset, self.num_frames - 1) if preset is not None else self.num_frames - 1
 
     @property
@@ -208,6 +211,8 @@ class FramePacket:
     revision: int = 0
     processing: object = None
     analysis: tuple = ()
+    shutter: bool = False  # the camera's shutter covered the sensor (FlagInFOV): no scene in this frame
+    presets_note: str = ""  # superframing presets joined: what this frame shows of them
 
 
 @dataclass(frozen=True, slots=True)

@@ -76,6 +76,7 @@ from .radiometry import (
     count_status,
     object_temperature,
 )
+from .presets import shutter_in_view
 from .sdktime import TimestampRepair, recording_rate, superframing
 from .tcdata import ChannelFlags, TcTable, failure_flags, read_tc_table, resample, window_mask
 
@@ -201,6 +202,7 @@ class PresetLayout:
     ranges: Mapping[int, tuple[float, float]] = field(default_factory=dict)  # preset → calibrated range (K)
     seconds: np.ndarray | None = None  # clock time of every frame from the first
     breaks: int = 0  # places where the preset cycle breaks (dropped frames)
+    shutter: int = 0  # frames the camera's shutter covered (FlagInFOV), left out of ``frames``
 
     def __bool__(self) -> bool:
         return bool(self.frames)
@@ -223,6 +225,7 @@ def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progre
     repair = repair or (lambda stamp: stamp)
     labels = np.zeros(n, dtype=np.int64)
     seconds = np.full(n, np.nan)
+    covered = np.zeros(n, dtype=bool)
     origin = None
     for i in range(n):
         if i % 256 == 0:
@@ -234,6 +237,7 @@ def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progre
         if label is None:
             raise ValueError("The recording has several presets but its frames do not say which")
         labels[i] = int(label)
+        covered[i] = shutter_in_view(im)
         stamp = repair(im.frame_info.time)
         if isinstance(stamp, datetime):
             origin = stamp if origin is None else origin
@@ -243,7 +247,7 @@ def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progre
     if not np.all(np.isfinite(seconds)) or np.any(np.diff(seconds) < 0):
         raise ValueError("The clock of this superframing recording cannot time its frames "
                          "(missing or backward time stamps)")
-    frames = {int(p): np.flatnonzero(labels == p) for p in np.unique(labels)}
+    frames = {int(p): np.flatnonzero((labels == p) & ~covered) for p in np.unique(labels)}  # no shutter frames
     pattern = list(dict.fromkeys(int(v) for v in labels[:4 * len(frames)]))  # the cycle, in order
     follows = {p: pattern[(k + 1) % len(pattern)] for k, p in enumerate(pattern)}
     breaks = int(sum(follows.get(int(a)) != int(b) for a, b in zip(labels[:-1], labels[1:])))
@@ -254,7 +258,7 @@ def preset_frames(im: Any, *, repair: Callable[[Any], Any] | None = None, progre
         entry = all_presets[p] if 0 <= p < len(all_presets) else None
         if entry is not None and getattr(entry, "calibrated", False):
             ranges[p] = (float(entry.min_temp), float(entry.max_temp))
-    return PresetLayout(frames=frames, ranges=ranges, seconds=seconds, breaks=breaks)
+    return PresetLayout(frames=frames, ranges=ranges, seconds=seconds, breaks=breaks, shutter=int(covered.sum()))
 
 
 def choose_preset(layout: PresetLayout, requested: int | None = None) -> tuple[int | None, RangeLimits | None]:
@@ -294,7 +298,8 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
     """``preset_frames``, kept in ``cache_dir`` (the scan reads every frame header)."""
     if not _superframing(im):
         return PresetLayout()
-    store = Path(cache_dir) / f"{_file_key(path, 'presets', 1)}_presets.npz" if cache_dir is not None else None
+    # version 2: shutter frames left out (0.10.0)
+    store = Path(cache_dir) / f"{_file_key(path, 'presets', 2)}_presets.npz" if cache_dir is not None else None
     fingerprint = recording_fingerprint(path) if store is not None and path.is_file() else None
     if store is not None and store.exists():
         try:
@@ -304,7 +309,8 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
                 presets = [int(p) for p in data["presets"]]
                 return PresetLayout(frames={p: data[f"frames_{p}"] for p in presets},
                                     ranges={p: tuple(data[f"range_{p}"]) for p in presets if f"range_{p}" in data},
-                                    seconds=data["seconds"], breaks=int(data["breaks"]))
+                                    seconds=data["seconds"], breaks=int(data["breaks"]),
+                                    shutter=int(data["shutter"]) if "shutter" in data.files else 0)
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
             pass  # unreadable (e.g. a run stopped while writing it): scan again
     if stage is not None:
@@ -317,7 +323,7 @@ def _cached_layout(im: Any, path: Path, cache_dir: Path | None, repair, progress
         if fingerprint:
             arrays["fingerprint"] = np.array(fingerprint)
         np.savez(partial, presets=np.array(sorted(layout.frames)), seconds=layout.seconds, breaks=layout.breaks,
-                 **arrays)
+                 shutter=layout.shutter, **arrays)
         os.replace(partial, store)  # complete files only
     return layout
 
@@ -368,6 +374,8 @@ def sample_recording(path: str | Path, options: MatchOptions, *, step_s: float =
                 info["preset"] = preset
                 if layout.breaks:
                     info["preset_breaks"] = layout.breaks
+                if layout.shutter:
+                    info["shutter_frames"] = layout.shutter
             else:
                 frames = np.arange(n)
             # recording seconds of each frame: frame number / rate, or the clock on superframing files
@@ -1650,6 +1658,9 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         breaks = samples.info.get("preset_breaks", 0)
         notes.append("Superframing: the frames of the chosen preset were timed by the camera clock"
                      + (f"; the preset cycle breaks {breaks} time(s) (dropped frames)." if breaks else "."))
+        if samples.info.get("shutter_frames"):
+            notes.append(f"{samples.info['shutter_frames']:,} frames were left out: the camera's shutter covered "
+                         "the sensor (frame header FlagInFOV), so they show no scene.")
     if tcs_agree:
         common = float(np.median(medians))
     elif len(medians) == 1:

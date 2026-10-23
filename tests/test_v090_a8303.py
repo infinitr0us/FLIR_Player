@@ -300,7 +300,8 @@ def test_the_player_reads_one_preset(ats, monkeypatch) -> None:
     fake.has_nuc = fake.has_bp = False
     src = source_module.FlirVideoSource()
     metadata = src.open(ats)
-    assert [p.index for p in metadata.presets] == [1, 2] and src.preset == 1
+    # 0.10.0: a superframing recording opens on its presets joined; frames are read and stepped as preset 1's
+    assert [p.index for p in metadata.presets] == [1, 2] and src.preset == (1, 2)
     assert [src.read_frame(i).index for i in (0, 1, 2, 3, 119)] == [0, 2, 2, 4, 118]
     src.set_preset(2)
     assert [src.read_frame(i).index for i in (0, 1, 118)] == [1, 1, 119]
@@ -326,7 +327,7 @@ def test_the_player_never_shows_another_preset(ats, monkeypatch) -> None:
     monkeypatch.setattr(source_module.fnv.file, "ImagerFile", lambda _path: fake)
     src = source_module.FlirVideoSource()
     metadata = src.open(ats)
-    assert src.preset == 1 and src.take_first_packet().index == 2
+    assert src.preset == (1, 2) and src.take_first_packet().index == 2  # presets joined (0.10.0), read as 1's
     assert metadata.start_time == datetime(2026, 10, 6, 10, 47, 59)  # frame 0's stamp, not frame 2's
     assert metadata.last_frame(1) == 118 and metadata.last_frame(2) == 119 and metadata.last_frame() == 119
     assert src.read_frame(50).index == 72 and src.read_frame(50, snap=-1).index == 38
@@ -381,7 +382,7 @@ def test_steps_walk_the_presets_own_frames(qapp, ats, monkeypatch) -> None:
     pattern = [1, 2, 1, 1, 2, 1]
     window = _window_on(qapp, ats, monkeypatch, _A8303Like(preset_of=lambda i: pattern[i] if i < 6 else 1 + i % 2))
     try:
-        assert window._preset == 1
+        assert window._preset == (1, 2)  # presets joined (0.10.0): steps walk preset 1's frames
         visited = []
         for move in (None, 1, 1, -1, -1, -1):
             if move is None:

@@ -22,6 +22,8 @@ import numpy as np
 
 from .calibration import set_unit_safely
 from .fff import describe_parameters, saved_object_parameters
+from .presets import (MAX_CYCLE_GAP_S, Preset, base_preset, by_range, check_presets, cycle_mate, describe,
+                      is_joined, shutter_in_view)
 from .sdktime import TimestampRepair, preset_frame_rate, recording_rate
 from .models import (
     CadenceInfo,
@@ -213,6 +215,57 @@ def lowest_preset(presets: tuple[PresetRange, ...]) -> int | None:
     return min(presets, key=lambda p: p.min_k if p.min_k is not None else math.inf).index
 
 
+def joined_presets(presets: tuple[PresetRange, ...]) -> Preset:
+    """Every preset of a superframing recording joined, lowest range first (None for one preset): what the
+    player shows a superframing recording with (in temperature units each pixel takes the preset that holds it)."""
+    if not presets:
+        return None
+    return by_range([p.index for p in presets], {p.index: (p.min_k, p.max_k) if p.min_k is not None else None
+                                                 for p in presets})
+
+
+def _kelvin(values: np.ndarray, temperature_type: Any) -> np.ndarray:
+    """Temperatures in the SDK's ``temperature_type`` as kelvin."""
+    name = str(getattr(temperature_type, "name", temperature_type)).upper()
+    if "CELSIUS" in name:
+        return values + 273.15
+    if "FAHRENHEIT" in name:
+        return (values - 32.0) / 1.8 + 273.15
+    if "RANKINE" in name:
+        return values / 1.8
+    return values
+
+
+def merge_presets(layers, ranges, temperature_type) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per pixel, the preset a pixel takes among ``layers`` (preset, SDK temperatures, SDK status; lowest range
+    first): the first inside its range; else the lowest above its range but not clamped high; else the lowest
+    below its range; else the highest (``excel_export.pick_preset``'s rule, pixel by pixel). Returns the merged
+    values, their status and each pixel's preset."""
+    values = np.stack([np.asarray(v, dtype=np.float64) for _p, v, _s in layers])
+    status = np.stack([np.asarray(st) for _p, _v, st in layers])
+    codes = []
+    for (preset, v, st) in layers:
+        low, high = ranges.get(preset) or (-np.inf, np.inf)
+        k = _kelvin(np.asarray(v, dtype=np.float64), temperature_type)
+        st = np.asarray(st)
+        code = np.ones(k.shape, dtype=np.int8)  # below its range
+        inside = (st == 0) & (k >= low) & (k <= high)
+        code[inside] = 0
+        code[~inside & (k > high)] = 2
+        code[(st & 4) != 0] = 3  # clamped high (saturated)
+        codes.append(code)
+    choice = np.full(values.shape[1:], len(layers) - 1, dtype=np.intp)
+    decided = np.zeros(values.shape[1:], dtype=bool)
+    for wanted in (0, 2, 1):
+        for k, code in enumerate(codes):
+            hit = ~decided & (code == wanted)
+            choice[hit] = k
+            decided |= hit
+    pick = choice[None]
+    presets = np.asarray([preset for preset, _v, _s in layers])
+    return (np.take_along_axis(values, pick, 0)[0], np.take_along_axis(status, pick, 0)[0], presets[choice])
+
+
 def _source_details(im: Any) -> tuple[tuple[str, str], ...]:
     """Static per-recording property rows for the Source Information panel (§4.8.3)."""
     info = im.source_info
@@ -324,8 +377,11 @@ class FlirVideoSource:
         self._pretemporal_bytes = 0
         self._provenance: tuple[int, tuple] | None = None  # (revision, provenance)
         self._clock = TimestampRepair(None)  # ATS year repair (see sdktime)
-        # Superframing: only frames of this preset are read (None: every frame, the presets alternating)
-        self._preset: int | None = None
+        # Superframing: only frames of this preset are read (None: every frame, the presets alternating); a
+        # tuple joins presets: the lowest's frames are read, and in temperature units each pixel takes the
+        # preset whose range holds it (merge_presets) from the same cycle's frames
+        self._preset: Preset = None
+        self._join_check: tuple[Preset, Any] | None = None  # (choice, presets.PresetCheck) once compared
 
     def _invalidate_processing(self) -> None:
         self.revision += 1
@@ -395,7 +451,7 @@ class FlirVideoSource:
             self.set_unit(preferred_key)
             self._image_roi = self._find_builtin_image_roi()
             presets = _superframing_presets(self._im)
-            self._preset = lowest_preset(presets)  # a superframing recording opens on its lowest range
+            self._preset = joined_presets(presets)  # a superframing recording opens on its presets joined
 
             first_packet = self.read_frame(0, request_id=0)
             # the recording's first stamp, whichever preset is shown (TC timing counts from it)
@@ -466,17 +522,30 @@ class FlirVideoSource:
         return spec.option
 
     @property
-    def preset(self) -> int | None:
-        """The superframing preset whose frames are read (None: every frame)."""
+    def preset(self) -> Preset:
+        """The superframing preset whose frames are read (None: every frame), or the presets joined."""
         return self._preset
 
-    def set_preset(self, preset: int | None) -> None:
-        """Read only the frames of ``preset`` of a superframing recording (None: every frame)."""
+    @property
+    def _base(self) -> int | None:
+        """The preset whose frames are read and stepped through (the lowest of presets joined)."""
+        return base_preset(self._preset)
+
+    def set_preset(self, preset: Preset) -> None:
+        """Read only the frames of ``preset`` of a superframing recording (None: every frame); a tuple joins
+        those presets (lowest range first)."""
         if self._im is None:
             raise RuntimeError("No FLIR recording is open")
-        if preset is not None and int(preset) not in {p.index for p in _superframing_presets(self._im)}:
-            raise ValueError(f"Preset {preset} is not one this recording cycles through")
-        self._preset = None if preset is None else int(preset)
+        available = {p.index: p for p in _superframing_presets(self._im)}
+        wanted = tuple(preset) if isinstance(preset, (tuple, list)) else (() if preset is None else (int(preset),))
+        unknown = [q for q in wanted if int(q) not in available]
+        if unknown:
+            raise ValueError(f"Preset {unknown[0]} is not one this recording cycles through")
+        if len(wanted) > 1:
+            self._preset = by_range([int(q) for q in wanted], {i: (p.min_k, p.max_k) if p.min_k is not None else None
+                                                               for i, p in available.items()})
+        else:
+            self._preset = int(wanted[0]) if wanted else None
         self._invalidate_processing()
 
     def _preset_of(self, index: int) -> int:
@@ -488,7 +557,7 @@ class FlirVideoSource:
 
     def _neighbour(self, index: int, step: int, preset: int | None = None) -> int | None:
         """The nearest frame of the preset after (``step`` 1) or before (-1) ``index``; None past the ends."""
-        preset = self._preset if preset is None else preset
+        preset = self._base if preset is None else preset
         lookup = getattr(self._im, "next_frame_number" if step > 0 else "previous_frame_number", None)
         if lookup is not None:  # the SDK's own index of the presets, however far (dropped frames)
             frame, _end = lookup(int(index), int(preset), None)
@@ -506,13 +575,13 @@ class FlirVideoSource:
 
         Never a frame of another preset: a recording without one raises ValueError.
         """
-        if self._preset is None or self._preset_of(index) == self._preset:
+        if self._preset is None or self._preset_of(index) == self._base:
             return index
         for step in (direction, -direction):
             frame = self._neighbour(index, step)
             if frame is not None:
                 return frame
-        raise ValueError(f"The recording has no frame of preset {self._preset}")
+        raise ValueError(f"The recording has no frame of preset {self._base}")
 
     def preset_last_frame(self, preset: int) -> int:
         """The last frame of ``preset`` (playback ends there)."""
@@ -526,7 +595,7 @@ class FlirVideoSource:
         """Frames from ``start`` to ``end`` (inclusive) that are read: the preset's, or all."""
         if self._preset is None:
             return list(range(start, end + 1))
-        return [i for i in range(start, end + 1) if self._preset_of(i) == self._preset]
+        return [i for i in range(start, end + 1) if self._preset_of(i) == self._base]
 
     def read_frame(
         self,
@@ -614,9 +683,7 @@ class FlirVideoSource:
             return cached
         if raw is None:
             self._im.get_frame(frame_index)
-            raw = np.array(self._im.final, copy=True).reshape(
-                (int(self._im.height), int(self._im.width))
-            )
+            raw = self._current_raw(frame_index)[0]
         data = self._pretemporal_stages(raw)
         self._pretemporal[key] = data
         self._pretemporal_bytes += data.nbytes
@@ -643,13 +710,14 @@ class FlirVideoSource:
         interactive requests pass False when those views are hidden, exports
         always keep the defaults.
         """
+        status = None
+        joined: tuple[int, ...] = ()
         if processed is None:
-            data = np.array(self._im.final, copy=True).reshape(
-                (int(self._im.height), int(self._im.width))
-            )
+            data, status, joined = self._current_raw(frame_index)
             data = self._process_frame(data, frame_index)
         else:
             data = processed
+        merged = len(joined) > 1
         (
             minimum,
             maximum,
@@ -658,9 +726,9 @@ class FlirVideoSource:
             num_pixels,
             min_position,
             max_position,
-        ) = self._whole_image_stats(data)
+        ) = self._whole_image_stats(data, app=merged)
 
-        clip_mask = self._clip_mask(data.shape) if need_clip else None
+        clip_mask = self._clip_mask(data.shape, status) if need_clip else None
         metadata_entries = self._frame_metadata_entries() if need_metadata else ()
 
         return FramePacket(
@@ -672,7 +740,7 @@ class FlirVideoSource:
             maximum=maximum,
             mean=mean,
             request_id=request_id,
-            roi_stats=self._frame_roi_stats(data),
+            roi_stats=self._frame_roi_stats(data, app=merged),
             std_dev=std_dev,
             num_pixels=num_pixels,
             min_position=min_position,
@@ -684,7 +752,74 @@ class FlirVideoSource:
             revision=self.revision,
             processing=self._processing,
             analysis=self._analysis_provenance(),
+            shutter=shutter_in_view(self._im),
+            presets_note=self._presets_note() if is_joined(self._preset) else "",
         )
+
+    def _joined_now(self) -> tuple[int, ...]:
+        """The presets merged pixel by pixel now: those chosen, less any whose frames disagree with the presets
+        below them (compared once per choice; ``presets.check_presets``); none outside temperature units."""
+        if not is_joined(self._preset) or self._unit_spec is None or self._unit_spec.temperature_type is None:
+            return ()
+        if self._join_check is None or self._join_check[0] != self._preset:
+            from .calibration import preserved_state
+
+            available = _superframing_presets(self._im)
+            ranges = {p.index: (p.min_k, p.max_k) if p.min_k is not None else None for p in available}
+            with preserved_state(self._im):
+                check = check_presets(self._im, self._preset, ranges)
+            self._join_check = (self._preset, check)
+        return self._join_check[1].kept
+
+    def _presets_note(self) -> str:
+        """What the presets joined show (the choice, not one frame: a shutter frame merges nothing), for a notice."""
+        if self._unit_spec is None or self._unit_spec.temperature_type is None:
+            return f"Presets joined: in {self._unit_spec.option.label if self._unit_spec else 'this unit'} the " \
+                   f"frames of preset {self._base} are shown (temperature units join them)."
+        ranges = {p.index: (p.min_k, p.max_k) if p.min_k is not None else None
+                  for p in _superframing_presets(self._im)}
+        kept = self._joined_now()
+        text = describe(kept, ranges) if len(kept) > 1 else f"Preset {self._base} only"
+        check = self._join_check[1] if self._join_check is not None else None
+        if check is not None and check.left_out:
+            left = ", ".join(str(q) for q in check.left_out)
+            text += (f". Preset {left} left out: its frames disagree with the presets below it (a camera offset; "
+                     "see the Excel export's Source sheet)")
+        return text
+
+    def _current_raw(self, frame_index: int) -> tuple[np.ndarray, np.ndarray | None, tuple[int, ...]]:
+        """The current frame's values (and, with presets joined in a temperature unit, its SDK status and the
+        presets merged): each pixel from the same cycle's frame of the preset that holds it. The SDK is left on
+        ``frame_index``."""
+        shape = (int(self._im.height), int(self._im.width))
+        presets = self._joined_now()  # the first comparison moves the SDK: back to the frame afterwards
+        if presets:
+            self._im.get_frame(frame_index)
+        data = np.array(self._im.final, copy=True).reshape(shape)
+        if len(presets) < 2 or shutter_in_view(self._im):
+            return data, None, presets[:1]
+        status = np.array(self._im.status, copy=True).reshape(shape)
+        when = getattr(self._im.frame_info, "time", None)
+        layers = [(presets[0], data, status)]
+        count = len(_superframing_presets(self._im))
+        for preset in presets[1:]:
+            mate = cycle_mate(self._im, frame_index, preset, count)
+            if mate is None:
+                continue
+            self._im.get_frame(mate)
+            other = getattr(self._im.frame_info, "time", None)
+            if shutter_in_view(self._im) or (hasattr(when, "timestamp") and hasattr(other, "timestamp")
+                                             and abs((other - when).total_seconds()) > MAX_CYCLE_GAP_S):
+                continue
+            layers.append((preset, np.array(self._im.final, copy=True).reshape(shape),
+                           np.array(self._im.status, copy=True).reshape(shape)))
+        self._im.get_frame(frame_index)
+        if len(layers) < 2:
+            return data, status, presets[:1]
+        ranges = {p.index: (p.min_k, p.max_k) if p.min_k is not None else None
+                  for p in _superframing_presets(self._im)}
+        merged, merged_status, _which = merge_presets(layers, ranges, self._unit_spec.temperature_type)
+        return merged, merged_status, tuple(preset for preset, _v, _s in layers)
 
     def _analysis_provenance(self) -> tuple:
         # Small immutable values, never SDK handles, accompany numerical exports.
@@ -699,7 +834,7 @@ class FlirVideoSource:
         self._provenance = (self.revision, provenance)
         return provenance
 
-    def _whole_image_stats(self, data: np.ndarray):
+    def _whole_image_stats(self, data: np.ndarray, app: bool = False):
         """Whole-image statistics for one (possibly processed) frame.
 
         When the processing pipeline is inactive, the SDK's built-in whole-image
@@ -709,7 +844,7 @@ class FlirVideoSource:
         sees pre-processing data, so the app-side reduction is kept for the
         processing-active case.
         """
-        if not self._processing.is_active and self._image_roi is not None:
+        if not self._processing.is_active and not app and self._image_roi is not None:
             try:
                 roi = self._image_roi
                 return (
@@ -768,14 +903,14 @@ class FlirVideoSource:
             data = apply_spatial_filter(data, state.spatial[0], state.spatial[1])
         return data
 
-    def _frame_roi_stats(self, data: np.ndarray) -> tuple[RoiStats, ...]:
+    def _frame_roi_stats(self, data: np.ndarray, app: bool = False) -> tuple[RoiStats, ...]:
         """Use SDK fast paths only for coverage with established parity.
 
         Long SDK diagonal lines can differ by a pixel from integer nearest
         sampling. Always measure lines with our canonical geometry, including
         when processing is disabled, so enabling identity filters changes nothing.
         """
-        if self._processing.is_active:
+        if self._processing.is_active or app:  # filtered, or presets merged: measure what is shown
             shapes = tuple(shape for _, shape, _ in self._roi_handles)
             return roi_stats_app(data, shapes)
         sdk_stats = {stats.id: stats for stats in self._roi_stats()}
@@ -784,7 +919,7 @@ class FlirVideoSource:
         return tuple(app[roi_id] if roi_id in app else sdk_stats[roi_id]
                      for roi_id, _shape, _handle in self._roi_handles if roi_id in app or roi_id in sdk_stats)
 
-    def _clip_mask(self, shape: tuple[int, ...]) -> np.ndarray | None:
+    def _clip_mask(self, shape: tuple[int, ...], status: np.ndarray | None = None) -> np.ndarray | None:
         """Boolean mask of pixels the SDK clamped to its clip range.
 
         In temperature units the SDK status is 1 outside the calibrated range
@@ -794,7 +929,8 @@ class FlirVideoSource:
         """
         if self._im is None:
             return None
-        status = np.array(self._im.status, copy=False)
+        if status is None:  # presets merged pass the merged status
+            status = np.array(self._im.status, copy=False)
         if status.size != int(np.prod(shape)):
             return None
         clipped = (status.reshape(shape) & (2 | 4)) != 0
@@ -834,6 +970,7 @@ class FlirVideoSource:
         self._pretemporal_bytes = 0
         self._provenance = None
         self._preset = None
+        self._join_check = None
 
     # --- processing pipeline (§4.8.6, §4.9.5.3) ------------------------------------
 

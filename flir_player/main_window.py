@@ -63,7 +63,8 @@ from .models import (
 )
 from .plots import line_profile_values, roi_values
 from .processing import median_max_size
-from .source import lowest_preset
+from .presets import as_preset, base_preset
+from .source import joined_presets
 from .orientation import Orientation
 from .render import (
     CUSTOM_PALETTE_STOPS,
@@ -217,7 +218,8 @@ class MainWindow(QMainWindow):
         self._reference_params: dict | None = None
         self._object_params: dict | None = None  # latest measurement-parameter snapshot
         self._ignition_frames: dict[str, int] = {}  # recording path → ignition frame (0-based)
-        self._preset: int | None = None  # superframing preset shown (None: every frame)
+        self._preset = None  # superframing preset shown (None: every frame), or presets joined (a tuple)
+        self._last_notes: tuple[bool, str] = (False, "")  # the shutter and presets notices last shown
         # recording path → the last TC fit's request (dialog settings) and output (tcmatch.RunOutput)
         self._tc_runs: dict[str, dict] = {}
         self._temporal: dict[int, dict[int, tuple[float, object]]] = {}
@@ -2041,7 +2043,8 @@ class MainWindow(QMainWindow):
         self.title_bar.export_button.setEnabled(True)
         self.inspector.set_available_units(options, packet.unit.key)
         self._unit_keys = frozenset(option.key for option in options)
-        self._preset = lowest_preset(metadata.presets)  # as the source opens a superframing recording
+        self._preset = joined_presets(metadata.presets)  # as the source opens a superframing recording
+        self._last_notes = (False, "")
         self.inspector.set_presets(metadata.presets, self._preset)
         self.inspector.set_data_available(True)
         self.analysis_toolbar.set_enabled(True)
@@ -2096,7 +2099,7 @@ class MainWindow(QMainWindow):
             start, end = self._playback_bounds()
             if self._preset is not None and not start <= packet.index <= end:
                 # the snap left the play range: it holds no frame of the shown preset
-                self._notify(f"The play range holds no frame of preset {self._preset}: widen it or show "
+                self._notify(f"The play range holds no frame of preset {base_preset(self._preset)}: widen it or show "
                              "another preset")
                 return
             QTimer.singleShot(0, self.toggle_playback)
@@ -2141,7 +2144,18 @@ class MainWindow(QMainWindow):
             if transition != (1.0, 0.0):
                 self._sync_value_controls(packet, transition)
         self.current_packet = packet
+        self._present_notes(packet)
         self._render_current_frame()
+
+    def _present_notes(self, packet: FramePacket) -> None:
+        """Say once when the camera's shutter covers the frames, and what presets joined show when that changes."""
+        shutter, note = self._last_notes
+        if packet.shutter and not shutter:
+            self._notify("The camera's shutter covered the sensor in this frame (frame header FlagInFOV): it shows "
+                         "no scene. The Excel export leaves such rows without temperatures.")
+        elif packet.presets_note and packet.presets_note != note:
+            self._notify(packet.presets_note)
+        self._last_notes = (packet.shutter, packet.presets_note or note)
 
     def _sync_value_controls(self, packet: FramePacket, transition) -> None:
         """Carry fixed range and thresholds into a new numerical domain.
@@ -2292,7 +2306,7 @@ class MainWindow(QMainWindow):
     def _restore_state(self, state: dict) -> None:
         """Show the measurement/processing state in force in the controls."""
         self.inspector.select_unit(state["unit"])
-        self._preset = state.get("preset")
+        self._preset = as_preset(state.get("preset"))
         self.inspector.select_preset(self._preset)
         self.inspector.set_object_parameters(state["object_parameters"])
         self.inspector.set_corrections(state["corrections"])

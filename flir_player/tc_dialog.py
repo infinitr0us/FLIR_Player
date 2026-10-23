@@ -47,6 +47,7 @@ from .excel_dialog import _panel
 from .export_dialogs import _path_row, confirm_replace
 from .geometry import area_extent
 from .models import RoiShape, VideoMetadata
+from .presets import base_preset
 from .settings import app_settings
 from .tcdata import TEXT_SUFFIXES, WORKBOOK_SUFFIXES, TcTable, parse_windows, read_tc_table, sheet_names, suggest_sheet
 from .tcmatch import (
@@ -196,7 +197,7 @@ class TcCalibrationDialog(FramelessDialog):
 
     def __init__(self, metadata: VideoMetadata, rois: tuple[RoiShape, ...], current_frame: int, *,
                  selected_roi_id: int | None = None, ignition_frame: int | None = None,
-                 previous: dict | None = None, has_results: bool = False, preset: int | None = None,
+                 previous: dict | None = None, has_results: bool = False, preset=None,
                  parent=None) -> None:
         super().__init__("Fit Emissivity from TCs", parent)
         self.setMinimumWidth(660)
@@ -309,7 +310,8 @@ class TcCalibrationDialog(FramelessDialog):
                 span = (f"{item.min_k - 273.15:.0f} to {item.max_k - 273.15:.0f} °C"
                         if item.min_k is not None and item.max_k is not None else "not calibrated")
                 self.preset_combo.addItem(f"Preset {item.index}: {span}", item.index)
-                if item.index == (preset if preset is not None else lowest.index):  # the player's, else the lowest
+                # the player's (the lowest of presets joined), else the lowest
+                if item.index == (base_preset(preset) if preset is not None else lowest.index):
                     self.preset_combo.setCurrentIndex(self.preset_combo.count() - 1)
             self.preset_combo.setToolTip("Superframing: the frames of one preset are used. The lowest range "
                                          "is closest to TC temperatures.")

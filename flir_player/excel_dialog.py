@@ -40,6 +40,7 @@ from .export_dialogs import _path_row, confirm_replace
 from .geometry import roi_coordinates
 from .jobs import unique_destination
 from .models import RoiShape, VideoMetadata
+from .presets import base_preset, is_joined
 from .settings import app_settings
 from .widgets import ChevronComboBox, FramelessDialog, MessageDialog
 
@@ -77,6 +78,9 @@ def remember_tc_file(recording, tc_file) -> None:
     files.pop(key, None)
     files[key] = str(tc_file)
     app_settings().setValue(_TC_FILE_KEY, json.dumps(dict(list(files.items())[-_TC_FILES_KEPT:])))
+
+
+_JOINED = -2  # the preset list's data for the presets joined (a tuple does not round-trip through Qt)
 
 
 def _duplicate_names(names) -> list[str]:
@@ -275,16 +279,23 @@ class ExcelExportDialog(FramelessDialog):
         self.preset_combo = None
         if metadata.presets:  # superframing: one preset's frames, timed by the camera clock
             self.preset_combo = ChevronComboBox()
-            lowest = min(metadata.presets, key=lambda p: p.min_k if p.min_k is not None else math.inf)
+            self._joined = tuple(p.index for p in sorted(metadata.presets, key=lambda p: p.min_k if p.min_k is not None
+                                                         else math.inf))
+            low = min((p.min_k for p in metadata.presets if p.min_k is not None), default=None)
+            high = max((p.max_k for p in metadata.presets if p.max_k is not None), default=None)
+            self.preset_combo.addItem("Presets joined" + (f": {low - 273.15:.0f} to {high - 273.15:.0f} °C"
+                                                          if low is not None and high is not None else ""), _JOINED)
             for item in metadata.presets:
                 span = (f"{item.min_k - 273.15:.0f} to {item.max_k - 273.15:.0f} °C"
                         if item.min_k is not None and item.max_k is not None else "not calibrated")
                 self.preset_combo.addItem(f"Preset {item.index}: {span}", item.index)
-                if item.index == (preset if preset is not None else lowest.index):
+                if not is_joined(preset) and preset is not None and item.index == base_preset(preset):
                     self.preset_combo.setCurrentIndex(self.preset_combo.count() - 1)
-            self.preset_combo.setToolTip("The camera cycles through its presets: the workbook reads the frames "
-                                         "of one. The lowest range suits the battery and the TCs, the higher "
-                                         "ones flames.")
+            self.preset_combo.setToolTip("The camera cycles through its presets (temperature ranges). Presets "
+                                         "joined: each ROI takes, row by row, the lowest preset whose range holds "
+                                         "it, so one curve runs from the battery to the flames (a preset that "
+                                         "disagrees with those below it is left out; Source says why). Or read the "
+                                         "frames of one preset.")
             grid.addWidget(QLabel("Preset"), 4, 0)
             grid.addWidget(self.preset_combo, 4, 1, 1, 2)
             self.time_base_combo.setCurrentIndex(self.time_base_combo.findData("clock"))
@@ -600,6 +611,13 @@ class ExcelExportDialog(FramelessDialog):
                 self._time_from_logger(table, self._tc_clock.lag_s, fps, frame)
         self._update()
 
+    def _chosen_preset(self):
+        """The preset list's choice for the export: a preset, the presets joined (a tuple), or None."""
+        if self.preset_combo is None:
+            return None
+        data = self.preset_combo.currentData()
+        return self._joined if data == _JOINED else data
+
     def _file_pairs(self):
         return parse_tc_pairs(self.tc_pairs_edit.text(), self._tc_table.names,
                               (roi.name for roi in self.rois))
@@ -868,7 +886,7 @@ class ExcelExportDialog(FramelessDialog):
         ignitions = [self.table.cellWidget(r, 3).value() - 1 for r in range(self.table.rowCount())]
         sources = [{"path": str(self.metadata.path), "label": labels[0], "rois": self.rois,
                     "ignition_frame": ignitions[0], "current": True,
-                    "preset": self.preset_combo.currentData() if self.preset_combo is not None else None}]
+                    "preset": self._chosen_preset()}]
         for k, other in enumerate(self._others, start=1):
             sources.append({"path": str(other["path"]), "label": labels[k], "rois": other["rois"],
                             "ignition_frame": ignitions[k], "current": False})

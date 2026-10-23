@@ -103,8 +103,8 @@ def choose_preset(im: Any, requested: int | None = None) -> int:
     return int(requested)
 
 
-def preset_indices(im: Any, preset: int, abort: Callable[[], bool] | None = None) -> np.ndarray:
-    """Frame indices of ``preset`` in a superframing recording, by every frame's own header.
+def preset_labels(im: Any, abort: Callable[[], bool] | None = None) -> np.ndarray:
+    """Every frame's preset in a superframing recording, by its own header.
 
     The SDK's ``get_preset`` reads only the header (0.3 ms a frame); without it
     each frame is read. Dropped frames break the preset cycle, so no frame is
@@ -121,6 +121,13 @@ def preset_indices(im: Any, preset: int, abort: Callable[[], bool] | None = None
         else:
             im.get_frame(i)
             labels[i] = next(int(str(e["value"])) for e in im.frame_info if str(e["name"]) == "Preset")
+    return labels
+
+
+def preset_indices(im: Any, preset: int, abort: Callable[[], bool] | None = None,
+                   labels: np.ndarray | None = None) -> np.ndarray:
+    """Frame indices of ``preset`` in a superframing recording (``labels``: ``preset_labels``, read when None)."""
+    labels = preset_labels(im, abort) if labels is None else labels
     frames = np.flatnonzero(labels == int(preset))
     if not frames.size:
         raise ValueError(f"No frame of preset {preset} in this recording")

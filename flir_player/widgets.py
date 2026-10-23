@@ -2226,7 +2226,9 @@ class InspectorPanel(QWidget):
         preset_layout.addWidget(self._field_label("Preset"))
         self.preset_combo = ChevronComboBox()
         self.preset_combo.setToolTip("The camera cycles through presets (temperature ranges), one frame each. "
-                                     "Show and measure the frames of one, or every frame as recorded.")
+                                     "Presets joined: in temperature units each pixel takes the preset whose range "
+                                     "holds it (a preset that disagrees with those below it is left out). Or show "
+                                     "and measure the frames of one, or every frame as recorded.")
         self.preset_combo.currentIndexChanged.connect(self._preset_selected)
         preset_layout.addWidget(self.preset_combo)
         self.preset_box.setVisible(False)
@@ -2929,11 +2931,19 @@ class InspectorPanel(QWidget):
             self.unit_changed.emit(str(key))
 
     _ALL_PRESETS = -1  # the combo's data for "every frame" (None does not round-trip through findData)
+    _JOINED = -2  # the combo's data for the presets joined (a tuple does not round-trip either)
 
-    def set_presets(self, presets, selected: int | None) -> None:
+    def set_presets(self, presets, selected) -> None:
         """Offer the presets of a superframing recording (hidden for one preset)."""
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
+        self._joined = tuple(sorted((p.index for p in presets), key=lambda i: next(
+            (p.min_k for p in presets if p.index == i and p.min_k is not None), math.inf)))
+        if presets:
+            low = min((p.min_k for p in presets if p.min_k is not None), default=None)
+            high = max((p.max_k for p in presets if p.max_k is not None), default=None)
+            span = f": {low - 273.15:.0f} to {high - 273.15:.0f} °C" if low is not None and high is not None else ""
+            self.preset_combo.addItem(f"Presets joined{span}", self._JOINED)
         for preset in presets:
             span = (f"{preset.min_k - 273.15:.0f} to {preset.max_k - 273.15:.0f} °C"
                     if preset.min_k is not None and preset.max_k is not None else "not calibrated")
@@ -2945,8 +2955,12 @@ class InspectorPanel(QWidget):
         self.preset_box.setVisible(bool(presets))
         self._refresh_enabled_state()
 
-    def select_preset(self, preset: int | None) -> None:
-        index = self.preset_combo.findData(self._ALL_PRESETS if preset is None else int(preset))
+    def select_preset(self, preset) -> None:
+        if isinstance(preset, (tuple, list)):
+            data = self._JOINED if len(preset) > 1 else int(preset[0])
+        else:
+            data = self._ALL_PRESETS if preset is None else int(preset)
+        index = self.preset_combo.findData(data)
         if index >= 0 and index != self.preset_combo.currentIndex():
             self.preset_combo.blockSignals(True)
             self.preset_combo.setCurrentIndex(index)
@@ -2955,7 +2969,8 @@ class InspectorPanel(QWidget):
     def _preset_selected(self, index: int) -> None:
         data = self.preset_combo.itemData(index)
         if data is not None:
-            self.preset_changed.emit(None if data == self._ALL_PRESETS else int(data))
+            self.preset_changed.emit(None if data == self._ALL_PRESETS else
+                                     tuple(getattr(self, "_joined", ())) if data == self._JOINED else int(data))
 
     def _set_range_mode(self, mode: str) -> None:
         self.set_range_mode(mode)

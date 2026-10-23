@@ -51,7 +51,10 @@ from .jobs import JobCancelled, OutputTransaction
 from .models import FrameRate, RoiShape
 from .radiometry import MeasurementParameters, RangeLimits, count_status
 from .fff import saved_object_parameters
-from .sdktime import TimestampRepair, choose_preset, preset_indices, preset_ranges, recording_rate, superframing
+from .presets import (MAX_CYCLE_GAP_S, Preset, PresetCheck, base_preset, by_range, check_presets, is_joined,
+                      shutter_in_view)
+from .sdktime import (TimestampRepair, choose_preset, preset_indices, preset_labels, preset_ranges, recording_rate,
+                      superframing)
 from .zones import ENDS as ZONE_ENDS, MAX_GAP, MAX_LEAN, MAX_ZONES, ZoneSpec
 
 ROI_SET_FORMAT = "flir-player-roi-set"
@@ -224,7 +227,9 @@ class SourceSpec:
     ignition_frame: int = 0
     label: str = ""
     parameters: dict | None = None  # SDK object-parameter values; None = the file's own
-    preset: int | None = None  # superframing: the preset whose frames are read; None = the lowest range
+    # superframing: the preset whose frames are read (None = the lowest range), or presets to join (a tuple:
+    # each area takes, row by row, the lowest of them whose range holds it; see presets.py)
+    preset: Preset = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +240,16 @@ class PresetFrames:
     frames: np.ndarray  # its frame indices, ascending
     calibrated: tuple[float, float] | None  # its calibrated range (K)
     rate: float  # its frames per second by the camera clock
+
+
+@dataclass(frozen=True)
+class ExtraPreset:
+    """A preset joined above a recording's own (lowest) one: its calibration and its frame for every row."""
+
+    preset: int
+    report: CalibrationReport
+    frames: np.ndarray  # frame index per row (its frame of the row's cycle), -1 where none
+    calibrated: tuple[float, float] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +357,7 @@ class RoiData:
     status: np.ndarray  # int8 per row (radiometry.STATUS_LABELS; -1 = no frame)
     validation: dict[str, np.ndarray] = field(default_factory=dict)  # stat → SDK kelvin
     validation_clamped: np.ndarray | None = None  # bool per validation row
+    preset: np.ndarray | None = None  # presets joined: the preset each row's counts come from (-1: none)
 
 
 @dataclass
@@ -359,6 +375,18 @@ class SourceData:
     file_parameters: MeasurementParameters
     validation_rows: np.ndarray  # row indices
     map_png: bytes | None = None
+    extra: tuple[ExtraPreset, ...] = ()  # presets joined above the recording's own (report, frames)
+    shutter: np.ndarray | None = None  # bool per row: the camera's shutter covered the sensor (no scene)
+
+    @property
+    def presets(self) -> tuple[int, ...]:
+        """The presets joined, lowest first (empty unless joined)."""
+        own = self.info.get("preset", {}).get("preset")
+        return (own, *(extra.preset for extra in self.extra)) if self.extra and own is not None else ()
+
+    def calibration_for(self, preset: int):
+        """The calibration report of one of the presets joined (the recording's own for any other)."""
+        return next((extra.report for extra in self.extra if extra.preset == preset), self.report)
 
 
 @dataclass
@@ -415,6 +443,17 @@ def estimate(rows: int, rois: list[tuple[str, int]], options: ExportOptions) -> 
         compared = len({roi for roi, _tc in prefill.roi_tc}) if prefill is not None and prefill.roi_tc else len(rois)
         cells += rows * 9 * compared  # the comparison block, Use and Fit row
     return {"rows": rows, "cells": cells, "megabytes": cells * 14 / 1e6}
+
+
+def pick_preset(statuses) -> int:
+    """Which of the presets joined an area takes in one row, from its status in each (lowest range first): the
+    first inside its range; else the lowest above its range but not saturated (it extrapolates upward from its
+    curve); else the lowest below its range; else the highest."""
+    for wanted in (0, 2, 1):
+        for k, status in enumerate(statuses):
+            if status == wanted:
+                return k
+    return len(statuses) - 1
 
 
 def roi_status(calibration, mode: str, counts: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -582,14 +621,19 @@ _saturation_threshold = saturation_threshold  # kept for callers of the old name
 def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: ExportOptions,
                    report: CalibrationReport, *, progress: Callable[[int], None] | None = None,
                    abort: Callable[[], bool] | None = None, rate: FrameRate | None = None,
-                   preset: PresetFrames | None = None) -> SourceData:
+                   preset: PresetFrames | None = None,
+                   extra: tuple[tuple[PresetFrames, CalibrationReport], ...] = (),
+                   check: PresetCheck | None = None) -> SourceData:
     """Sample one recording on ``times``; the handle's state is restored after.
 
     ``rate`` (``sdktime.recording_rate``) is measured here when not given.
     With ``preset`` (a superframing recording) each row takes that preset's
     frame nearest its time by the camera clock, whatever ``options.time_base``.
+    ``extra`` joins higher presets to it: each row also reads their frame of
+    the same cycle, and each ROI takes the counts of one (``pick_preset``).
     A calibration fitted to the SDK's radiance reads that signal instead of
-    the counts (``CalibrationReport.signal``).
+    the counts (``CalibrationReport.signal``). Rows whose frame the camera's
+    shutter covered keep their frame and clock but no counts (``shutter``).
     """
     n = int(im.num_frames)
     height, width = int(im.height), int(im.width)
@@ -600,6 +644,9 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
     repair = TimestampRepair(spec.path)  # ATS clocks carry no year
     signal = report.signal if report.verified else "counts"
     to_signal = report.to_signal if report.verified else (lambda counts: counts)
+    # presets joined: only verified calibrations of the same signal convert in the workbook
+    extra = tuple((frames_q, report_q) for frames_q, report_q in extra
+                  if preset is not None and report.verified and report_q.verified and report_q.signal == report.signal)
     with preserved_state(im):
         set_unit_safely(im, fnv.Unit.COUNTS)
         stamps = []
@@ -635,10 +682,18 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
                 shape=shape, pixels=int(ys.size), mode=mode,
                 counts={name: np.full(rows, np.nan) for name in names},
                 block=np.full((rows, block_width), np.nan) if block_width else None,
-                status=np.full(rows, -1, dtype=np.int8)))
+                status=np.full(rows, -1, dtype=np.int8),
+                preset=np.full(rows, -1, dtype=np.int8) if extra else None))
         clock: list[datetime | None] = [None] * rows
         saturation = None
         apparent = report.calibration.planck.temperature if report.verified else None
+        shutter = np.zeros(rows, dtype=bool)
+        joined = []  # (its frames, its report, its clock search, its frame per row)
+        if extra and search is None:
+            raise ValueError(f"{spec.path.name}: its clock cannot time the frames of the presets joined")
+        for frames_q, report_q in extra:
+            joined.append((frames_q, report_q, _ClockSearch(im, n, origin, repair, indices=frames_q.frames),
+                           np.full(rows, -1, dtype=np.int64)))
         for row in range(rows):
             if abort is not None and abort():
                 raise JobCancelled("Export cancelled")
@@ -654,15 +709,23 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
             clock[row] = repair(im.frame_info.time)
             if saturation is None:
                 saturation = saturation_threshold(im) or 0.0
-            for roi, (ys, xs) in zip(data, coordinates):
-                stats, block = _region(values[ys, xs], roi.shape, options, apparent)
-                for name, value in stats.items():
-                    roi.counts[name][row] = value
-                if block is not None:
-                    roi.block[row, :block.size] = block
+            if shutter_in_view(im):  # the camera's shutter covered the sensor: no scene in this frame
+                shutter[row] = True
+            elif not joined:
+                for roi, (ys, xs) in zip(data, coordinates):
+                    stats, block = _region(values[ys, xs], roi.shape, options, apparent)
+                    for name, value in stats.items():
+                        roi.counts[name][row] = value
+                    if block is not None:
+                        roi.block[row, :block.size] = block
+            else:
+                _join_row(im, row, frame, search.time(position), values, report, preset.preset, joined, data,
+                          coordinates, options)
             if progress is not None:
                 progress(row + 1)
         for roi in data:
+            if joined:
+                continue  # each row's status came with its preset (_join_row)
             low = roi.counts.get("min", roi.counts.get("value"))
             high = roi.counts.get("max", roi.counts.get("value"))
             present = np.isfinite(high)
@@ -673,9 +736,17 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
                 if saturation:
                     status = np.where(high >= saturation, 3, status).astype(np.int8)
             roi.status = np.where(present, status, -1).astype(np.int8)
-        validation_rows = _validation_rows(frames, options.validation_rows) if report.verified else np.empty(0, int)
+        usable = np.where(shutter, -1, frames)
+        validation_rows = _validation_rows(usable, options.validation_rows) if report.verified else np.empty(0, int)
+        if joined and validation_rows.size:  # check the higher presets' formulas too: rows that use one
+            higher = np.flatnonzero(np.any([roi.preset > preset.preset for roi in data], axis=0) & (usable >= 0))
+            if higher.size:
+                count = min(higher.size, max(1, options.validation_rows // 3))
+                picks = np.unique(np.rint(np.linspace(0, higher.size - 1, count)).astype(int))
+                validation_rows = np.union1d(validation_rows, higher[picks])
+        extra_frames = {frames_q.preset: per_row for frames_q, _report_q, _search_q, per_row in joined}
         if validation_rows.size:
-            _validate(im, data, coordinates, frames, validation_rows, options)
+            _validate(im, data, coordinates, frames, validation_rows, options, extra_frames)
         map_frame = spec.ignition_frame
         if preset is not None:  # that preset's frame nearest the ignition frame
             map_frame = int(preset.frames[int(np.argmin(np.abs(preset.frames - spec.ignition_frame)))])
@@ -687,6 +758,10 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
     if preset is not None:
         info["preset"] = {"preset": preset.preset, "frames": int(preset.frames.size), "rate": preset.rate,
                           "calibrated": preset.calibrated, "map_frame": map_frame}
+    if check is not None:
+        info["preset_check"] = {"kept": check.kept, "left_out": check.left_out, "notes": check.notes(),
+                                "cycles": check.cycles}
+    info["shutter_rows"] = int(shutter.sum())
     info["date_inferred"] = repair.repaired
     info["clock_fps"] = rate.clock_fps
     info["rate_corrected"] = rate.corrected
@@ -700,10 +775,44 @@ def collect_source(im: Any, spec: SourceSpec, times: np.ndarray, options: Export
         start = sdk_values(initial)
         info["saved_parameters_used"] = all(math.isclose(value, start[key], rel_tol=1e-5, abs_tol=1e-5)
                                             for key, value in saved.items() if key in start)
+    extras = tuple(ExtraPreset(frames_q.preset, report_q, per_row, frames_q.calibrated)
+                   for frames_q, report_q, _search_q, per_row in joined)
     return SourceData(spec=spec, label=spec.label or info["camera_short"], info=info, fps=fps,
                       num_frames=n, frames=frames, clock=clock, rois=data, report=report,
                       initial=initial, file_parameters=file_parameters,
-                      validation_rows=validation_rows, map_png=map_png)
+                      validation_rows=validation_rows, map_png=map_png, extra=extras, shutter=shutter)
+
+
+def _join_row(im, row: int, frame: int, at: float, values: np.ndarray, report: CalibrationReport, own: int,
+              joined, data: list[RoiData], coordinates, options: ExportOptions) -> None:
+    """One row of a recording with presets joined: read each higher preset's frame of the same cycle (the
+    nearest by the clock, at most ``MAX_CYCLE_GAP_S`` away; none on a shutter frame) and give each ROI the
+    counts, block and status of the preset ``pick_preset`` chooses."""
+    layers = [(own, report, values)]
+    for frames_q, report_q, search_q, per_row in joined:
+        guess = int(np.searchsorted(frames_q.frames, frame))
+        position = search_q.nearest(at, guess, MAX_CYCLE_GAP_S)
+        if position < 0 or not abs(search_q.time(position) - at) <= MAX_CYCLE_GAP_S:
+            continue
+        frame_q = search_q.frame(position)
+        values_q = report_q.to_signal(read_array(im, frame_q).astype(np.float64))
+        if shutter_in_view(im):
+            continue
+        per_row[row] = frame_q
+        layers.append((frames_q.preset, report_q, values_q))
+    for roi, (ys, xs) in zip(data, coordinates):
+        candidates = []
+        for preset, report_p, layer in layers:
+            stats, block = _region(layer[ys, xs], roi.shape, options, report_p.calibration.planck.temperature)
+            status = roi_status(report_p.calibration, roi.mode, {k: np.array([v]) for k, v in stats.items()})
+            candidates.append((preset, stats, block, int(status[0])))
+        preset, stats, block, status = candidates[pick_preset([c[3] for c in candidates])]
+        for name, value in stats.items():
+            roi.counts[name][row] = value
+        if block is not None:
+            roi.block[row, :block.size] = block
+        roi.status[row] = status
+        roi.preset[row] = preset
 
 
 def same_parameters(a: MeasurementParameters, b: MeasurementParameters) -> bool:
@@ -728,8 +837,9 @@ def _validation_rows(frames: np.ndarray, count: int) -> np.ndarray:
     return present[picks]
 
 
-def _validate(im, data, coordinates, frames, rows, options) -> None:
-    """SDK temperatures (file-default parameters, kelvin) on a few rows."""
+def _validate(im, data, coordinates, frames, rows, options, extra_frames=None) -> None:
+    """SDK temperatures (file-default parameters, kelvin) on a few rows; with presets joined, each ROI's from
+    the frame of the preset its row took (``extra_frames``: preset → frame per row)."""
     im.reset_object_parameters()
     set_unit_safely(im, fnv.Unit.TEMPERATURE_FACTORY, fnv.TempType.KELVIN)
     for roi in data:
@@ -737,9 +847,15 @@ def _validate(im, data, coordinates, frames, rows, options) -> None:
         roi.validation = {name: np.full(rows.size, np.nan) for name in names}
         roi.validation_clamped = np.zeros(rows.size, dtype=bool)
     for k, row in enumerate(rows):
-        kelvin = read_array(im, int(frames[row])).astype(np.float64)
-        status = np.array(im.status, copy=True).reshape(kelvin.shape)
+        read: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for roi, (ys, xs) in zip(data, coordinates):
+            frame = int(frames[row])
+            if extra_frames and roi.preset is not None and int(roi.preset[row]) in extra_frames:
+                frame = int(extra_frames[int(roi.preset[row])][row])
+            if frame not in read:
+                kelvin = read_array(im, frame).astype(np.float64)
+                read[frame] = (kelvin, np.array(im.status, copy=True).reshape(kelvin.shape))
+            kelvin, status = read[frame]
             values = kelvin[ys, xs]
             roi.validation_clamped[k] = bool(np.any(status[ys, xs] & (2 | 4)))
             if roi.mode == "spot":
@@ -861,33 +977,52 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 im = open_recording(key)
                 owned.append(im)
             opened.append(im)
-        chosen: list[tuple[int, np.ndarray] | None] = []
+        # superframing: (the presets read, lowest first: (preset, its frames)), the joining check
+        chosen: list[tuple[list[tuple[int, np.ndarray]], PresetCheck | None] | None] = []
         for spec, im in zip(specs, opened):
             n = int(im.num_frames)
             if not 0 <= spec.ignition_frame < n:
                 raise ValueError(f"{spec.path.name}: ignition frame {spec.ignition_frame + 1} is outside the recording")
             if superframing(im):  # rows read one preset's frames (they would alternate presets otherwise)
-                preset = choose_preset(im, spec.preset)
-                chosen.append((preset, preset_indices(im, preset, abort)))
+                ranges = preset_ranges(im)
+                if is_joined(spec.preset):
+                    wanted = by_range(sorted({choose_preset(im, p) for p in spec.preset}), ranges)
+                else:
+                    wanted = (choose_preset(im, base_preset(spec.preset)),)
+                check = None
+                if len(wanted) > 1:
+                    with preserved_state(im):
+                        check = check_presets(im, wanted, ranges, abort=abort)
+                    wanted = check.kept
+                labels = preset_labels(im, abort)
+                chosen.append(([(p, preset_indices(im, p, labels=labels)) for p in wanted], check))
             else:
                 chosen.append(None)
-        reports = []
+        reports, extras = [], []
         for spec, im, pick in zip(specs, opened, chosen):
             if abort():
                 raise JobCancelled("Export cancelled")
             if pick is None:
                 reports.append(derive_calibration(im, spec.path, abort=abort))
+                extras.append([])
                 continue
-            calibrated = preset_ranges(im).get(pick[0])
-            reports.append(derive_calibration(im, spec.path, abort=abort, indices=calibration_frames(im, pick[1]),
-                                              limits=RangeLimits(calibrated=calibrated) if calibrated else None))
+            found = []
+            for preset_p, frames_p in pick[0]:
+                if found and not found[0][2].verified:
+                    break  # counts only: nothing to join
+                calibrated = preset_ranges(im).get(preset_p)
+                found.append((preset_p, frames_p, derive_calibration(
+                    im, spec.path, abort=abort, indices=calibration_frames(im, frames_p),
+                    limits=RangeLimits(calibrated=calibrated) if calibrated else None)))
+            reports.append(found[0][2])
+            extras.append(found[1:])
         spans, rates, pixel_counts, measured, presets = [], [], [], [], []
         for spec, im, pick in zip(specs, opened, chosen):
             repair = TimestampRepair(spec.path)  # an ATS clock can roll over at New Year
             with preserved_state(im):
                 set_unit_safely(im, fnv.Unit.COUNTS)
                 n = int(im.num_frames)
-                ends = (0, n - 1) if pick is None else (int(pick[1][0]), int(pick[1][-1]))
+                ends = (0, n - 1) if pick is None else (int(pick[0][0][1][0]), int(pick[0][0][1][-1]))
                 first = _stamp(im, ends[0], repair)
                 last = _stamp(im, ends[1], repair)
                 ignition = _stamp(im, spec.ignition_frame, repair)
@@ -901,8 +1036,10 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 if not (first and last and ignition):
                     raise ValueError(f"{spec.path.name}: its clock cannot time the frames of one preset")
                 span = (last - first).total_seconds()
-                preset_rate = (pick[1].size - 1) / span if span > 0 and pick[1].size > 1 else fps / len(preset_ranges(im))
-                presets.append(PresetFrames(pick[0], pick[1], preset_ranges(im).get(pick[0]), preset_rate))
+                own, own_frames = pick[0][0]
+                preset_rate = ((own_frames.size - 1) / span if span > 0 and own_frames.size > 1
+                               else fps / len(preset_ranges(im)))
+                presets.append(PresetFrames(own, own_frames, preset_ranges(im).get(own), preset_rate))
                 rates.append(preset_rate)
                 spans.append(((first - ignition).total_seconds(), (last - ignition).total_seconds()))
                 continue
@@ -946,15 +1083,21 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
         done = 0
         sources = []
         labels_seen: dict[str, int] = {}
-        for spec, im, report, rate, preset in zip(specs, opened, reports, measured, presets):
+        for spec, im, report, rate, preset, extra, pick in zip(specs, opened, reports, measured, presets, extras,
+                                                              chosen):
             offset = done
 
             def tick(value, offset=offset):
                 if progress is not None:
                     progress(offset + value, total)
 
+            joined = tuple((PresetFrames(p, frames_p, preset_ranges(im).get(p), preset.rate), report_p)
+                           for p, frames_p, report_p in extra)
             source = collect_source(im, spec, times, options, report, progress=tick, abort=abort, rate=rate,
-                                    preset=preset)
+                                    preset=preset, extra=joined, check=pick[1] if pick is not None else None)
+            for p, _frames_p, report_p in extra:
+                if not report_p.verified:
+                    source.info.setdefault("preset_uncalibrated", []).append((p, report_p.message))
             count = labels_seen.get(source.label, 0) + 1
             labels_seen[source.label] = count
             if count > 1:

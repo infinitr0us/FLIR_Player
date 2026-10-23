@@ -56,6 +56,10 @@ STAT_LABELS = {"value": "Value", "mean": "Mean", "max": "Max", "min": "Min",
                "median": "Median", "p95": "P95"}
 BIG = 1e9
 INTERNAL = 18  # first column of Settings' collapsed constants
+EXTRA = INTERNAL + 16  # first column of the constants of presets joined above a recording's own
+SOURCE_KEYS = ("R", "B", "F", "O", "SMAX", "CALLO", "CALHI", "CLIPLO", "CLIPHI")  # per preset joined, Settings
+ROI_KEYS = ("K2", "LO", "HI", "CLO", "CHI", "C", "SREFL")  # per preset joined (K1 and A do not depend on it)
+SHUTTER = "Shutter in view"  # Data status of a row whose frame the camera's shutter covered
 MATCH = "Emissivity Match"
 MATCH_DEFAULTS = (0.90, 0.98, 0.01)  # lowest, highest emissivity and step: the engineers' range
 MATCH_CANDIDATES = 41  # rows of the candidate table (step 0.002 still spans 0.90-0.98)
@@ -190,6 +194,8 @@ class _RoiLayout:
     pixel_col: int | None  # first Pixels column
     title: str
     main: str  # "value" or "mean"
+    presets: tuple[int, ...] = ()  # presets joined (lowest first): each row's constants follow its preset
+    preset_col: int | None = None  # Counts column of each row's preset (presets joined)
 
 
 class _Writer:
@@ -332,8 +338,11 @@ class _Writer:
 
     def _plan_layout(self) -> None:
         data_col = 2  # A: time (s), B: time (min)
-        count_col = 1  # A: time; then per source frame + clock
-        count_col += 2 * len(self.data.sources)
+        count_col = 1  # A: time; then per source frame + clock (+ the frame of each preset joined)
+        self.count_source_cols = {}
+        for s_index, source in enumerate(self.data.sources, start=1):
+            self.count_source_cols[s_index] = count_col
+            count_col += 2 + len(source.extra)
         pixel_col = 1
         number = 0
         for s_index, source in enumerate(self.data.sources, start=1):
@@ -357,6 +366,10 @@ class _Writer:
                     count_col += 1
                 count_cols["pixels"] = count_col
                 count_col += 1
+                preset_col = None
+                if source.presets:
+                    preset_col = count_col
+                    count_col += 1
                 first_pixel = None
                 if roi.block is not None:
                     first_pixel = pixel_col
@@ -366,7 +379,8 @@ class _Writer:
                     src=f"SRC_{s_index}", data_cols=data_cols, status_col=status_col,
                     count_cols=count_cols, pixel_col=first_pixel,
                     title=f"{source.label} · {roi.shape.name}",
-                    main="value" if roi.mode == "spot" else "mean"))
+                    main="value" if roi.mode == "spot" else "mean",
+                    presets=source.presets, preset_col=preset_col))
         self.data_width = data_col
         self.count_width = count_col
         self.pixel_width = pixel_col
@@ -552,6 +566,22 @@ class _Writer:
             self.wb.define_name(f"{src}_CNTLO", f"={_num(low)}")
             self.wb.define_name(f"{src}_CNTHI", f"={_num(high)}")
             self._refs[f"{src}_CNTLO"], self._refs[f"{src}_CNTHI"] = _num(low), _num(high)
+            # presets joined: each higher preset's curve, ranges and count range, collapsed like the others
+            for k, extra in enumerate(source.extra):
+                q, cal_q = extra.preset, extra.report.calibration
+                lim_q = cal_q.limits
+                values = (cal_q.planck.R, cal_q.planck.B, cal_q.planck.F, cal_q.planck.O,
+                          cal_q.planck.R / (1 - cal_q.planck.F) if cal_q.planck.F < 1 else 1e300,
+                          *(lim_q.calibrated or (None, None)), *(lim_q.clip or (None, None)))
+                for j, (key, value) in enumerate(zip(SOURCE_KEYS, values)):
+                    c = EXTRA + len(SOURCE_KEYS) * k + j
+                    put(r0 + 1, c, f"Preset {q}: {key}", self.f_head)
+                    put(r, c, value, self.f_const)
+                    self._name(f"{src}_{key}P{q}", S, r, c)
+                low, high = self._count_range(source, q)
+                self.wb.define_name(f"{src}_CNTLOP{q}", f"={_num(low)}")
+                self.wb.define_name(f"{src}_CNTHIP{q}", f"={_num(high)}")
+                self._refs[f"{src}_CNTLOP{q}"], self._refs[f"{src}_CNTHIP{q}"] = _num(low), _num(high)
 
         # ROIs
         q0 = r0 + 3 + len(self.data.sources) + 1
@@ -631,6 +661,31 @@ class _Writer:
                 self._name(f"{name}_{label}", S, r, c)
             for label, c in col.items():
                 self._name(f"{name}_{label}", S, r, c)
+            # presets joined: the same coefficients with each higher preset's curve (K1 and A are shared)
+            for k, extra in enumerate(layout.source.extra):
+                q = extra.preset
+                at = {key: EXTRA + len(ROI_KEYS) * k + j for j, key in enumerate(ROI_KEYS)}
+                ref = {key: f"{xl_col_to_name(c)}{R}" for key, c in at.items()}
+                s_q = lambda t, q=q: f"({src}_RP{q}/(EXP({src}_BP{q}/({t}))-{src}_FP{q})-{src}_OP{q})"  # noqa: E731
+                extra_cached = cached["extra"][q]
+                formulas = {
+                    "K2": (f"=((1-{src}_WTAU)*{s_q(f'{src}_WT')}/{src}_WTAU+(1-I{R})*{src}_TAU*{s_q(f'J{R}')}"
+                           f"+(1-{src}_TAU)*{s_q(f'{src}_TATM')})/(I{R}*{src}_TAU)", extra_cached["k2"]),
+                    "LO": (f'=IF(AND(CLAMP_MODE="{CLAMP_ON}",ISNUMBER({src}_CLIPLOP{q})),{src}_CLIPLOP{q},'
+                           f'-{BIG:.0E})', -BIG),
+                    "HI": (f'=IF(AND(CLAMP_MODE="{CLAMP_ON}",ISNUMBER({src}_CLIPHIP{q})),{src}_CLIPHIP{q},'
+                           f'{BIG:.0E})', BIG),
+                    "CLO": (f"=IF({ref['LO']}>0,({s_q(ref['LO'])}+{ref['K2']})/{cell['K1']},-{BIG:.0E})", -BIG),
+                    "CHI": (f"=IF({ref['HI']}<{BIG:.0E},({s_q(ref['HI'])}+{ref['K2']})/{cell['K1']},{BIG:.0E})", BIG),
+                    "C": (f"=((1-{src}_WTAU)*{s_q(f'{src}_WT')}/{src}_WTAU+(1-{src}_TAU)*{s_q(f'{src}_TATM')})"
+                          f"/{src}_TAU", extra_cached["c"]),
+                    "SREFL": (f"={s_q(f'J{R}')}", extra_cached["srefl"]),
+                }
+                for key, c in at.items():
+                    formula, value = formulas[key]
+                    put(r, c, None, self.f_calc, formula=formula, cached=value)
+                    put(q0 + 1, c, f"Preset {q}: {key}", self.f_head)
+                    self._name(f"{name}_{key}P{q}", S, r, c)
         for r in sorted(rows):
             for c, value, fmt, formula, cached in rows[r]:
                 if formula is not None:
@@ -646,13 +701,18 @@ class _Writer:
         # Constants and intermediate coefficients: collapsed, expandable with "+".
         ws.set_column(INTERNAL, INTERNAL + 14, 16, self.f_const, {"level": 1, "hidden": True})
         ws.set_column(INTERNAL + 15, INTERNAL + 15, 70)
+        joined = max((len(source.extra) for source in self.data.sources), default=0)
+        if joined:  # the presets joined: collapsed with the other constants
+            ws.set_column(EXTRA, EXTRA + max(len(SOURCE_KEYS), len(ROI_KEYS)) * joined - 1, 16, self.f_const,
+                          {"level": 1, "hidden": True})
         ws.freeze_panes(0, 1)
 
     @staticmethod
-    def _count_range(source: SourceData) -> tuple[float, float]:
-        """Raw counts at the camera's calibrated range; ±BIG when it is unknown."""
-        if source.report.verified:
-            calibrated = source.report.calibration.count_limits()["calibrated"]
+    def _count_range(source: SourceData, preset: int | None = None) -> tuple[float, float]:
+        """Raw counts at the camera's calibrated range (of one of the presets joined); ±BIG when unknown."""
+        report = source.report if preset is None else source.calibration_for(preset)
+        if report.verified:
+            calibrated = report.calibration.count_limits()["calibrated"]
             if calibrated is not None and all(math.isfinite(v) for v in calibrated):
                 return float(min(calibrated)), float(max(calibrated))
         return -BIG, BIG
@@ -677,10 +737,15 @@ class _Writer:
         p = self._params(layout)
         values = {"eps": p.emissivity, "trefl": p.reflected_k}
         if cal is None:
-            return dict(values, k1=0, k2=0, a=0, c=0, srefl=0)
+            return dict(values, k1=0, k2=0, a=0, c=0, srefl=0, extra={})
         k1, k2 = coefficients(cal, p)
         a, c = compensated_signal(cal, p, None)
-        return dict(values, k1=k1, k2=k2, a=a, c=c, srefl=float(cal.planck.signal(p.reflected_k)))
+        extra = {}
+        for preset in layout.source.extra:  # one transmission per recording: the formulas use its cell
+            cal_q = preset.report.calibration
+            extra[preset.preset] = {"k2": coefficients(cal_q, p)[1], "c": compensated_signal(cal_q, p, None)[1],
+                                    "srefl": float(cal_q.planck.signal(p.reflected_k))}
+        return dict(values, k1=k1, k2=k2, a=a, c=c, srefl=float(cal.planck.signal(p.reflected_k)), extra=extra)
 
     # --- formula builders -------------------------------------------------------------------
 
@@ -689,23 +754,43 @@ class _Writer:
     # The curve T = B / ln(R / v + F), v = object signal + O, is only valid for
     # 0 < v < SMAX (the Python model's rule); outside it the result is #N/A.
 
-    def _signal(self, layout: _RoiLayout, counts: str) -> str:
-        src, name = layout.src, layout.name
-        return f"({name}_K1*MEDIAN({name}_CLO,{counts},{name}_CHI)-{name}_K2+{src}_O)"
+    @staticmethod
+    def _pick(layout: _RoiLayout, name: str, pre: str | None) -> str:
+        """The constant ``name`` (a ROI_ or SRC_ name) for the preset in ``pre`` (a cell, or a range in an array
+        formula): ``name`` itself unless presets are joined. Picked arithmetically, base + (X_q − base)·(pre = q),
+        so a constant of another preset never brings its error into the result (they are all finite)."""
+        if not layout.presets or pre is None:
+            return name
+        return "(" + name + "".join(f"+({name}P{q}-{name})*({pre}={q})" for q in layout.presets[1:]) + ")"
 
-    def _scalar_formula(self, layout: _RoiLayout, ref: str) -> str:
-        src = layout.src
-        v = self._signal(layout, ref)
-        return (f"=IF(ISNUMBER({ref}),IFERROR(IF(AND({v}>0,{v}<{src}_SMAX),"
-                f"{src}_B/LN({src}_R/{v}+{src}_F)*UNIT_A+UNIT_B,NA()),NA()),NA())")
+    def _const(self, layout: _RoiLayout, pre: str | None):
+        """(ROI constant, source constant) lookups for the preset in ``pre``."""
+        return (lambda key: self._pick(layout, f"{layout.name}_{key}", pre),
+                lambda key: self._pick(layout, f"{layout.src}_{key}", pre))
 
-    def _clamped(self, layout: _RoiLayout, ref: str) -> str:
+    def _pre_cell(self, layout: _RoiLayout, r: int) -> str | None:
+        """The Counts cell holding row ``r``'s preset (presets joined), else None."""
+        return _cell("Counts", r, layout.preset_col) if layout.preset_col is not None else None
+
+    def _signal(self, layout: _RoiLayout, counts: str, pre: str | None = None) -> str:
+        roi_k, src_k = self._const(layout, pre)
+        return f"({layout.name}_K1*MEDIAN({roi_k('CLO')},{counts},{roi_k('CHI')})-{roi_k('K2')}+{src_k('O')})"
+
+    def _scalar_formula(self, layout: _RoiLayout, ref: str, pre: str | None = None) -> str:
+        _roi_k, src_k = self._const(layout, pre)
+        v = self._signal(layout, ref, pre)
+        return (f"=IF(ISNUMBER({ref}),IFERROR(IF(AND({v}>0,{v}<{src_k('SMAX')}),"
+                f"{src_k('B')}/LN({src_k('R')}/{v}+{src_k('F')})*UNIT_A+UNIT_B,NA()),NA()),NA())")
+
+    def _clamped(self, layout: _RoiLayout, ref: str, pre: str | None = None) -> str:
         """Elementwise counts clamp for arrays (MEDIAN would aggregate)."""
-        name = layout.name
-        return f"({ref}+({name}_CLO-{ref})*({ref}<{name}_CLO)+({name}_CHI-{ref})*({ref}>{name}_CHI))"
+        roi_k, _src_k = self._const(layout, pre)
+        lo, hi = roi_k("CLO"), roi_k("CHI")
+        return f"({ref}+({lo}-{ref})*({ref}<{lo})+({hi}-{ref})*({ref}>{hi}))"
 
-    def _mean_formula(self, layout: _RoiLayout, row: int) -> str:
-        src, name = layout.src, layout.name
+    def _mean_formula(self, layout: _RoiLayout, row: int, pre: str | None = None) -> str:
+        name = layout.name
+        roi_k, src_k = self._const(layout, pre)
         roi = layout.roi
         width = roi.block.shape[1]
         if roi.mode == "pixels":
@@ -716,12 +801,12 @@ class _Writer:
             weights = _range("Pixels", row, layout.pixel_col, row, layout.pixel_col + bins - 1)
             values = _range("Pixels", row, layout.pixel_col + bins, row, layout.pixel_col + width - 1)
             total = f"SUM({weights})"
-        element = f"({name}_K1*{self._clamped(layout, values)}-{name}_K2+{src}_O)"
-        curve = f"{src}_B/LN({src}_R/{element}+{src}_F)"
+        element = f"({name}_K1*{self._clamped(layout, values, pre)}-{roi_k('K2')}+{src_k('O')})"
+        curve = f"{src_k('B')}/LN({src_k('R')}/{element}+{src_k('F')})"
         body = f"SUMPRODUCT({weights + ',' if weights else ''}{curve})/{total}"
         # every element is valid iff the (clamped) extremes are: v rises with counts
-        low, high = self._signal(layout, f"MIN({values})"), self._signal(layout, f"MAX({values})")
-        return (f"=IF({total}=0,NA(),IFERROR(IF(AND({low}>0,{high}<{src}_SMAX),"
+        low, high = self._signal(layout, f"MIN({values})", pre), self._signal(layout, f"MAX({values})", pre)
+        return (f"=IF({total}=0,NA(),IFERROR(IF(AND({low}>0,{high}<{src_k('SMAX')}),"
                 f"({body})*UNIT_A+UNIT_B,NA()),NA()))")
 
     # --- Data -------------------------------------------------------------------------------
@@ -781,6 +866,9 @@ class _Writer:
                                                                   self.last, layout.status_col))
             count = layout.count_cols[layout.main]  # spot value or mean count: what TC Compare matches
             self.wb.define_name(f"{layout.name}_CNT", "=" + _range("Counts", HEADER_ROWS, count, self.last, count))
+            if layout.preset_col is not None:  # each row's preset (presets joined), for the Match arrays
+                self.wb.define_name(f"{layout.name}_PRE", "=" + _range("Counts", HEADER_ROWS, layout.preset_col,
+                                                                        self.last, layout.preset_col))
 
     def _blankable(self, formula: str, r: int, layout: _RoiLayout) -> str:
         """``formula`` (starting with "="), or #N/A when Settings leaves out-of-range values blank and the
@@ -789,6 +877,21 @@ class _Writer:
             return formula
         status = xl_rowcol_to_cell(r, layout.status_col)
         return f'=IF(AND(CLAMP_MODE="{CLAMP_BLANK}",{status}<>"{STATUS_LABELS[0]}"),NA(),{formula[1:]})'
+
+    def _kelvin(self, layout: _RoiLayout, values, params: MeasurementParameters, presets=None) -> np.ndarray:
+        """Object temperature (K) of ``values`` (one row each along the first axis) with the calibration of
+        each row's preset (``presets``, the ROI's own rows by default) when presets are joined."""
+        source = layout.source
+        if not layout.presets:
+            return object_temperature(source.report.calibration, params, values)
+        values = np.asarray(values, dtype=np.float64)
+        presets = np.asarray(layout.roi.preset if presets is None else presets)
+        out = np.full(values.shape, np.nan)
+        for preset in layout.presets:
+            rows = presets == preset
+            if rows.any():
+                out[rows] = object_temperature(source.calibration_for(preset).calibration, params, values[rows])
+        return out
 
     def _cached_temperatures(self, layout: _RoiLayout) -> dict[str, np.ndarray]:
         cal = layout.source.report.calibration if layout.source.report.verified else None
@@ -800,15 +903,16 @@ class _Writer:
         params = self._params(layout)
         a, b = _unit_affine(self.unit)
         for stat in roi.counts:
-            out[stat] = object_temperature(cal, params, roi.counts[stat]) * a + b
+            out[stat] = self._kelvin(layout, roi.counts[stat], params) * a + b
         present = np.isfinite(roi.status) & (roi.status >= 0)
+        presets = roi.preset[present] if roi.preset is not None else None
         if roi.mode == "pixels":
-            kelvin = object_temperature(cal, params, roi.block[present])
+            kelvin = self._kelvin(layout, roi.block[present], params, presets)
             out["mean"][present] = np.mean(kelvin, axis=1) * a + b
         elif roi.mode == "bins":
             bins = roi.block.shape[1] // 2
             n, m = roi.block[present, :bins], roi.block[present, bins:]
-            kelvin = object_temperature(cal, params, m)
+            kelvin = self._kelvin(layout, m, params, presets)
             with np.errstate(invalid="ignore", divide="ignore"):
                 out["mean"][present] = np.sum(n * kelvin, axis=1) / np.sum(n, axis=1) * a + b
         if "spread" in out:
@@ -824,8 +928,11 @@ class _Writer:
         if status >= 0:
             ws.write_string(r, layout.status_col, STATUS_LABELS[status] if layout.source.report.verified
                             else ("Saturated" if status == 3 else "Counts only"))
+        elif layout.source.shutter is not None and layout.source.shutter[i]:
+            ws.write_string(r, layout.status_col, SHUTTER)
         if not layout.source.report.verified:
             return  # temperatures cannot be reproduced; counts only
+        pre = self._pre_cell(layout, r)
         for stat, col in layout.data_cols.items():
             value = cached[stat][i]
             value = float(value) if np.isfinite(value) else "#N/A"
@@ -833,11 +940,11 @@ class _Writer:
                 mx, mn = xl_rowcol_to_cell(r, layout.data_cols["max"]), xl_rowcol_to_cell(r, layout.data_cols["min"])
                 ws.write_formula(r, col, f"=IFERROR({mx}-{mn},NA())", self.f_temp, value)
             elif stat == "mean" and roi.mode in ("pixels", "bins"):
-                formula = self._blankable(self._mean_formula(layout, r), r, layout)
+                formula = self._blankable(self._mean_formula(layout, r, pre), r, layout)
                 ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
             else:
                 ref = _cell("Counts", r, layout.count_cols[stat])
-                formula = self._blankable(self._scalar_formula(layout, ref), r, layout)
+                formula = self._blankable(self._scalar_formula(layout, ref, pre), r, layout)
                 ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
 
     # --- Counts / Pixels ------------------------------------------------------------------
@@ -862,34 +969,46 @@ class _Writer:
         radiance = self._radiance_note()
         if radiance:
             ws.write(2, 0, radiance, self.f_note)
+        if any(source.extra for source in self.data.sources):
+            ws.write(2, 6, "Presets joined: each ROI's row holds the counts of the preset in its Preset column, "
+                           "read from that preset's frame of the same cycle (Frame columns).", self.f_note)
         ws.write(3, 0, "Time (s)", self.f_head)
-        for s_index, source in enumerate(self.data.sources):
-            c = 1 + 2 * s_index
-            ws.merge_range(3, c, 3, c + 1, source.label, self.f_group)
+        for s_index, source in enumerate(self.data.sources, start=1):
+            c = self.count_source_cols[s_index]
+            ws.merge_range(3, c, 3, c + 1 + len(source.extra), source.label, self.f_group)
         for layout in self.layouts:
-            cols = sorted(layout.count_cols.values())
+            cols = sorted(list(layout.count_cols.values()) + ([layout.preset_col] if layout.preset_col else []))
             ws.merge_range(3, cols[0], 3, cols[-1], layout.title, self.f_group) if len(cols) > 1 \
                 else ws.write(3, cols[0], layout.title, self.f_group)
         ws.write(4, 0, "from ignition", self.f_head)
-        for s_index, source in enumerate(self.data.sources):
-            c = 1 + 2 * s_index
-            ws.write(4, c, "Frame", self.f_head)
+        for s_index, source in enumerate(self.data.sources, start=1):
+            c = self.count_source_cols[s_index]
+            own = source.info.get("preset", {}).get("preset")
+            ws.write(4, c, f"Frame (preset {own})" if source.extra else "Frame", self.f_head)
             ws.write(4, c + 1, "Camera clock", self.f_head)
+            for k, extra in enumerate(source.extra):
+                ws.write(4, c + 2 + k, f"Frame (preset {extra.preset})", self.f_head)
         for layout in self.layouts:
             for stat, col in layout.count_cols.items():
                 ws.write(4, col, "Pixels" if stat == "pixels" else
                          f"{STAT_LABELS[stat]} ({self._signal_word(layout.source)})", self.f_head)
+            if layout.preset_col is not None:
+                ws.write(4, layout.preset_col, "Preset", self.f_head)
         for i in range(self.rows):
             self._check(i)
             r = HEADER_ROWS + i
             ws.write_number(r, 0, float(self.times[i]), self.f_time)
-            for s_index, source in enumerate(self.data.sources):
+            for s_index, source in enumerate(self.data.sources, start=1):
+                c = self.count_source_cols[s_index]
                 frame = int(source.frames[i])
                 if frame >= 0:
-                    ws.write_number(r, 1 + 2 * s_index, frame + 1, self.f_int)
+                    ws.write_number(r, c, frame + 1, self.f_int)
                     stamp = source.clock[i]
                     if stamp is not None:
-                        ws.write_datetime(r, 2 + 2 * s_index, stamp.replace(tzinfo=None), self.f_clock)
+                        ws.write_datetime(r, c + 1, stamp.replace(tzinfo=None), self.f_clock)
+                for k, extra in enumerate(source.extra):
+                    if int(extra.frames[i]) >= 0:
+                        ws.write_number(r, c + 2 + k, int(extra.frames[i]) + 1, self.f_int)
             for layout in self.layouts:
                 roi = layout.roi
                 if roi.status[i] < 0:
@@ -899,10 +1018,15 @@ class _Writer:
                         ws.write_number(r, col, roi.pixels, self.f_int)
                     else:
                         ws.write_number(r, col, float(roi.counts[stat][i]), self.f_count)
+                if layout.preset_col is not None:
+                    ws.write_number(r, layout.preset_col, int(roi.preset[i]), self.f_int)
         ws.set_column(0, 0, 11)
-        for s_index in range(len(self.data.sources)):
-            ws.set_column(1 + 2 * s_index, 1 + 2 * s_index, 8)
-            ws.set_column(2 + 2 * s_index, 2 + 2 * s_index, 23)
+        for s_index, source in enumerate(self.data.sources, start=1):
+            c = self.count_source_cols[s_index]
+            ws.set_column(c, c, 8)
+            ws.set_column(c + 1, c + 1, 23)
+            if source.extra:
+                ws.set_column(c + 2, c + 1 + len(source.extra), 8)
         ws.freeze_panes(HEADER_ROWS, 1)
 
     def _pixels(self) -> None:
@@ -1047,9 +1171,10 @@ class _Writer:
                 c_cell = _cell("Counts", data_r, layout.count_cols[layout.main])
                 u_cell = xl_rowcol_to_cell(r, cols["use"])
                 s_cell = _cell("Data", data_r, layout.status_col)  # a clipped pixel biases the mean count
+                roi_k, src_k = self._const(layout, self._pre_cell(layout, data_r))
                 write(r, cols["fit"],
                                  f"=IF(AND({u_cell}=1,ISNUMBER({xl_rowcol_to_cell(r, cols['tc'])}),ISNUMBER({c_cell}),"
-                                 f"{c_cell}>={src}_CNTLO,{c_cell}<={src}_CNTHI,{s_cell}<>\"Saturated\","
+                                 f"{c_cell}>={src_k('CNTLO')},{c_cell}<={src_k('CNTHI')},{s_cell}<>\"Saturated\","
                                  f"{t_cell}>=MATCH_FROM,{t_cell}<=MATCH_TO),1,0)", self.f_int, int(inputs["fit"][i]))
                 data_col = layout.data_cols[layout.main]
                 ir = xl_rowcol_to_cell(r, cols["ir"])
@@ -1069,9 +1194,9 @@ class _Writer:
                 write(r, cols["dt"], f"=IFERROR({ir}-{tc},NA())", self.f_temp, "#N/A")
                 count_col = layout.count_cols[layout.main]
                 c_ref = _cell("Counts", data_r, count_col)
-                s_tc = f"({src}_R/(EXP({src}_B/({tc}+273.15))-{src}_F)-{src}_O)"
-                y = f"({name}_A*{c_ref}-{name}_C-{name}_SREFL)"
-                x = f"({s_tc}-{name}_SREFL)"
+                s_tc = f"({src_k('R')}/(EXP({src_k('B')}/({tc}+273.15))-{src_k('F')})-{src_k('O')})"
+                y = f"({name}_A*{c_ref}-{roi_k('C')}-{roi_k('SREFL')})"
+                x = f"({s_tc}-{roi_k('SREFL')})"
                 both = f"AND(ISNUMBER({c_ref}),ISNUMBER({tc}))"  # an IR and a TC sample
                 write(r, cols["eps"], f"=IF({both},IFERROR({y}/{x},NA()),NA())", self.f_eps, "#N/A")
                 write(r, cols["tcd"], f"=IFERROR(({tc}+273.15)*UNIT_A+UNIT_B,NA())", self.f_temp,
@@ -1141,6 +1266,11 @@ class _Writer:
             tc = self._tc_at(layout)
             cnt = np.asarray(layout.roi.counts[layout.main], dtype=np.float64)
             low, high = self._count_range(layout.source)
+            if layout.presets:  # each row's own preset's range
+                low, high = np.full(self.rows, low), np.full(self.rows, high)
+                for preset in layout.presets[1:]:
+                    rows = layout.roi.preset == preset
+                    low[rows], high[rows] = self._count_range(layout.source, preset)
             saturated = np.asarray(layout.roi.status) == 3  # as the Data sheet's Status column says
             with np.errstate(invalid="ignore"):
                 fit = ((use == 1) & np.isfinite(tc) & np.isfinite(cnt) & (cnt >= low) & (cnt <= high) & ~saturated
@@ -1168,9 +1298,10 @@ class _Writer:
             entry["probe"] = (math.nan, math.nan)
             if entry["rows"]:
                 c, t = inputs["cnt"][fit], inputs["tc"][fit]
+                presets = layout.roi.preset[fit] if layout.presets else None
 
-                def stats(e: float, cal=cal, p=p, c=c, t=t) -> tuple[float, float]:  # bound: kept past the loop
-                    d = object_temperature(cal, p.with_(emissivity=e), c) - KELVIN - t
+                def stats(e: float, layout=layout, p=p, c=c, t=t, presets=presets) -> tuple[float, float]:  # bound
+                    d = self._kelvin(layout, c, p.with_(emissivity=e), presets) - KELVIN - t
                     d = d[np.isfinite(d)]
                     return (float(np.sqrt(np.mean(d ** 2))), float(np.mean(d))) if d.size else (math.nan, math.nan)
 
@@ -1504,9 +1635,11 @@ class _Writer:
     def _t_expr(self, layout: _RoiLayout, eps: str) -> str:
         """Array of the ROI's IR temperatures (°C) at emissivity ``eps``: (A·c − C − S_r)/ε + S_r is the
         object signal, exactly K1·c − K2 of the Data formulas; #N/A outside the curve's domain."""
-        nm, src = layout.name, layout.src
-        v = f"(({nm}_A*{nm}_CNT-{nm}_C-{nm}_SREFL)/{eps}+{nm}_SREFL+{src}_O)"
-        return f"(IF(({v}>0)*({v}<{src}_SMAX),{src}_B/LN({src}_R/{v}+{src}_F),NA())-273.15)"
+        nm = layout.name
+        roi_k, src_k = self._const(layout, f"{nm}_PRE" if layout.presets else None)
+        v = f"(({nm}_A*{nm}_CNT-{roi_k('C')}-{roi_k('SREFL')})/{eps}+{roi_k('SREFL')}+{src_k('O')})"
+        return (f"(IF(({v}>0)*({v}<{src_k('SMAX')}),{src_k('B')}/LN({src_k('R')}/{v}+{src_k('F')}),NA())"
+                f"-273.15)")
 
     def _rms(self, layout: _RoiLayout, eps: str) -> str:
         """RMS of IR − TC over the Fit rows whose IR is defined (array formula body)."""
@@ -1629,6 +1762,8 @@ class _Writer:
             reached.append(float(self.times[hits[0]]) if hits.size else "not reached")
         status = layout.roi.status
         present = status >= 0
+        if layout.source.shutter is not None:  # their Status reads "Shutter in view": COUNTA counts them
+            present = present | layout.source.shutter
         percent = [float(100.0 * np.count_nonzero(status == code) / np.count_nonzero(present))
                    if present.any() else "–" for code in (1, 2, 3)]
         return {"initial": initial, "peak": peak, "peak_time": peak_time, "rise": rise,
@@ -1811,9 +1946,10 @@ class _Writer:
         rows_out = []
         for j, (layout, stat, k, row) in enumerate(entries):
             source = layout.source
-            cal = source.report.calibration
             p = source.file_parameters
-            p = p.with_(transmission=transmission_used(cal, p))
+            p = p.with_(transmission=transmission_used(source.report.calibration, p))  # the recording's τ
+            cal = (source.calibration_for(int(layout.roi.preset[row])).calibration if layout.presets
+                   else source.report.calibration)
             k1, k2 = coefficients(cal, p)
             clip = cal.limits.clip or (-BIG, BIG)
             sdk = float(layout.roi.validation[stat][k])
@@ -1894,12 +2030,18 @@ class _Writer:
             ws.write(r, 1, layout.roi.shape.name)
             ws.write(r, 2, STAT_LABELS[stat])
             ws.write_number(r, 3, float(self.times[row]), self.f_time)
-            ws.write_number(r, 4, int(source.frames[row]) + 1, self.f_int)
+            frame = int(source.frames[row])
+            if layout.presets:  # the frame of the preset this ROI took in that row
+                frame = next((int(extra.frames[row]) for extra in source.extra
+                              if extra.preset == int(layout.roi.preset[row])), frame)
+            ws.write_number(r, 4, frame + 1, self.f_int)
             ws.write_number(r, 5, sdk, self.f_calc)
             # a non-finite result would be written as "nan", which Excel rejects
             # as a corrupt file; the formula's own result there is #NUM! (LN ≤ 0)
             ws.write_formula(r, 6, formula, self.f_calc, _finite_or(cached, "#NUM!"))
             ws.write_formula(r, 7, f"=G{R}-F{R}", self.f_calc, _finite_or(difference, "#NUM!"))
+            if layout.presets:
+                note = f"preset {int(layout.roi.preset[row])}: {note}"
             if clamped or "approximation" in note:
                 ws.write_formula(r, 8, '=""', None, "")
             else:
@@ -1938,6 +2080,28 @@ class _Writer:
                                          f"{preset['rate']:.3f} per second. The camera cycles through its presets; "
                                          "every row reads a frame of this one, the nearest by the camera clock "
                                          "(time base: camera timestamps, whatever the setting below)."))
+            for extra in source.extra:
+                span = (f"{extra.calibrated[0] - KELVIN:.0f} to {extra.calibrated[1] - KELVIN:.0f} °C"
+                        if extra.calibrated else "not calibrated")
+                fields.append((f"Preset {extra.preset} joined",
+                               f"{span}: each row also reads this preset's frame of the same cycle (17 ms apart on "
+                               "the A8303sc), and each ROI takes, row by row, the lowest preset whose range holds "
+                               "it (Counts → Preset). " + extra.report.message))
+                if extra.report.fit_error_k is not None:
+                    fields.append((f"Preset {extra.preset}: fitted constants vs SDK (neutral), max |ΔT|",
+                                   f"{extra.report.fit_error_k:.2e} K"))
+                for label, error, pixels in extra.report.checks:
+                    fields.append((f"Preset {extra.preset} check: {label}", f"{error:.2e} K over {pixels} pixels"))
+            check = info.get("preset_check")
+            if check:
+                for line in check["notes"]:
+                    fields.append(("Presets compared", f"{line} ({check['cycles']} cycles compared)"))
+            for preset_q, message in info.get("preset_uncalibrated", ()):
+                fields.append((f"Preset {preset_q} not joined", f"its calibration could not be reproduced: {message}"))
+            if info.get("shutter_rows"):
+                fields.append(("Camera shutter", f"{info['shutter_rows']:,} rows: the camera's shutter covered the "
+                                                 "sensor (frame header FlagInFOV), so their frames show no scene. "
+                                                 f"Those rows hold no counts; their Status reads \"{SHUTTER}\"."))
             if source.report.verified and source.report.signal == "radiance":
                 fields.append(("Signal", "The counts columns hold the File SDK's radiance × 100,000, which is a "
                                          "quadratic of the counts (" + ", ".join(
@@ -2067,6 +2231,21 @@ class _Writer:
         if radiance:
             lines += [("", None), ("Cameras whose temperatures follow their radiance", self.f_h2),
                       (radiance + " In the formula above, read signal for counts.", self.f_wrap)]
+        joined = [source for source in self.data.sources if source.extra]
+        if joined:
+            names = ", ".join(f"{source.label} (presets {', '.join(str(p) for p in source.presets)})"
+                              for source in joined)
+            lines += [("", None), ("Presets joined", self.f_h2),
+                      (f"{names}: the camera cycles through presets (temperature ranges), one frame each. Each ROI "
+                       "takes, row by row, the counts of the lowest preset whose range holds it, so one curve runs "
+                       "across the ranges. Counts shows each row's preset and frames; every preset has its own "
+                       "constants on Settings (collapsed), and Validation checks rows of each preset.", self.f_wrap)]
+        shutter = sum(int(source.info.get("shutter_rows", 0)) for source in self.data.sources)
+        if shutter:
+            lines += [("", None), ("Camera shutter", self.f_h2),
+                      (f"In {shutter:,} rows the camera's shutter covered the sensor (no scene): their Status reads "
+                       f"\"{SHUTTER}\" and they have no temperatures (gaps in the charts). Source names the "
+                       "recordings.", self.f_wrap)]
         example = self._worked_example()
         if example:
             lines += [("", None), ("Worked example (first sample, initial settings)", self.f_h2),
@@ -2088,7 +2267,8 @@ class _Writer:
             if not present.size:
                 continue
             i = int(present[0])
-            cal = source.report.calibration
+            cal = (source.calibration_for(int(roi.preset[i])).calibration if layout.presets
+                   else source.report.calibration)
             p = self._params(layout)
             k1, k2 = coefficients(cal, p)
             c = float(counts[i])
