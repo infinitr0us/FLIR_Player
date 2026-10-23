@@ -73,6 +73,11 @@ def _cal(preset) -> Calibration:
     return Calibration(planck=PlanckConstants(curve.R * RADIANCE_SCALE, curve.B, curve.F, curve.O), atmosphere=ATMOSPHERE)
 
 
+def _block(sheet, row0, col0, row1, col1):
+    """Values of a sheet's rectangle (1-based, inclusive) in one COM call, retried while Excel is busy."""
+    return _com(lambda: sheet.Range(sheet.Cells(row0, col0), sheet.Cells(row1, col1)).Value)
+
+
 def _numbers(sheet, rows, cols):
     return [[sheet.cell(r, c).value for c in cols] for r in rows]
 
@@ -91,8 +96,8 @@ def test_excel_reproduces_a_joined_workbook(excel, tmp_path, options_kw) -> None
     book = _com(excel.Workbooks.Open, str(path.resolve()))
     try:
         _com(excel.CalculateFull)
-        data = book.Worksheets("Data")
-        after = [[data.Cells(r, c).Value for c in range(3, width + 1)] for r in range(6, 66)]
+        data = _com(book.Worksheets, "Data")
+        after = _block(data, 6, 3, 65, width)
         compared = 0
         for row_before, row_after in zip(before, after):
             for b, a in zip(row_before, row_after):
@@ -102,20 +107,22 @@ def test_excel_reproduces_a_joined_workbook(excel, tmp_path, options_kw) -> None
                 elif b == "#N/A":
                     assert a == XL_NA
         assert compared > 100
-        validation = book.Worksheets("Validation")
-        assert str(validation.Range("E4").Value).startswith("PASS"), validation.Range("E4").Value
+        validation = _com(book.Worksheets, "Validation")
+        verdict = _block(validation, 4, 5, 4, 5)
+        assert str(verdict).startswith("PASS"), verdict
         # TC Compare: each row's matching emissivity with its own preset's curve
-        tc = book.Worksheets("TC Compare")
-        head = [tc.Cells(9, c).Value for c in range(1, 60)]
+        tc = _com(book.Worksheets, "TC Compare")
+        head = list(_block(tc, 9, 1, 9, 59)[0])
         flame_eps = [c + 1 for c, h in enumerate(head) if h == "Matching emissivity"][1]  # Battery, Flame, Box
         flame_counts = next(i + 1 for i, h in enumerate(counts_head) if h == "Value (signal)" and i + 1 > pre_cols[0])
         counts = cached["Counts"]
         file = MeasurementParameters(emissivity=0.95, transmission=None, distance_m=3.3, humidity=0.3)
         tau = ATMOSPHERE.transmission(3.3, 0.3, 293.15)
         checked = 0
+        eps_column = [row[0] for row in _block(tc, 10, flame_eps, 69, flame_eps)]
         for k in range(60):
             value, preset = counts.cell(6 + k, flame_counts).value, counts.cell(6 + k, pre_cols[1]).value
-            excel_eps = tc.Cells(10 + k, flame_eps).Value
+            excel_eps = eps_column[k]
             if value is None:
                 assert excel_eps == XL_NA
                 continue
@@ -125,28 +132,31 @@ def test_excel_reproduces_a_joined_workbook(excel, tmp_path, options_kw) -> None
             checked += 1
         assert checked >= 50
         # Emissivity Match: Excel's array formulas give the results Python cached
-        match, cached_match = book.Worksheets("Emissivity Match"), cached["Emissivity Match"]
+        match, cached_match = _com(book.Worksheets, "Emissivity Match"), cached["Emissivity Match"]
         rows = [r for r in range(1, 60) if cached_match.cell(r, 1).value in ("Battery", "Flame", "Box")]
         assert len(rows) == 3
         for r in rows:
+            live = _block(match, r, 1, r, 10)[0]
             for c in (5, 7, 8, 9, 10):
                 b = cached_match.cell(r, c).value
                 if isinstance(b, float):
-                    assert match.Cells(r, c).Value == pytest.approx(b, abs=1e-6), (r, c)
+                    assert live[c - 1] == pytest.approx(b, abs=1e-6), (r, c)
         # an emissivity of the flame's own on Settings reaches the preset-2 constants
-        settings = book.Worksheets("Settings")
-        row = next(r for r in range(1, 80) if settings.Cells(r, 3).Value == "Flame")
-        settings.Cells(row, 6).Value = 0.8
+        settings = _com(book.Worksheets, "Settings")
+        names = [row[0] for row in _block(settings, 1, 3, 80, 3)]
+        row = names.index("Flame") + 1
+        _com(lambda: setattr(settings.Cells(row, 6), "Value", 0.8))
         _com(excel.Calculate)
-        flame_col = next(c for c in range(3, width + 1)
-                         if str(data.Cells(4, c).MergeArea.Cells(1, 1).Value).endswith("· Flame"))
+        titles = [c.value for c in cached["Data"][4]]
+        flame_col = next(i + 1 for i, t in enumerate(titles) if t and str(t).endswith("· Flame"))
+        flame_values = [row[0] for row in _block(data, 6, flame_col, 65, flame_col)]
         p = file.with_(transmission=tau, emissivity=0.8)
         for k in range(0, 60, 7):
             value, preset = counts.cell(6 + k, flame_counts).value, counts.cell(6 + k, pre_cols[1]).value
             if value is None:
                 continue
             expected = float(object_temperature(_cal(preset), p, value)) - 273.15
-            got = data.Cells(6 + k, flame_col).Value
+            got = flame_values[k]
             if got != XL_NA:
                 assert got == pytest.approx(expected, abs=1e-6)
     finally:
