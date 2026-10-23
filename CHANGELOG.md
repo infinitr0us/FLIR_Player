@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.10.0 — 2026-10-23
+
+Flame temperatures from the A8303sc, after the fire-safety engineers'
+feedback of 23 October: the thin line in the A8303 picture is the TC tree,
+with the 1 m TC at its lower end, and for flames they use their own
+emissivity, 0.95.
+
+### Presets joined
+
+- *Presets joined* in the player's *Preset* list and in the Excel export, the
+  default for a recording that cycles through presets (the A8303sc's 250-600,
+  500-1200 and 850-2000 °C). In temperature units the player takes each pixel
+  from the preset whose range holds it, from the frames of one cycle (17 ms
+  apart on the A8303sc); steps and playback follow the lowest preset's frames,
+  and the readouts measure the joined image. Counts show the lowest preset.
+- In the workbook each ROI takes, row by row, the counts of the lowest preset
+  whose range holds it; Counts shows each row's preset and each preset's
+  frame. Every preset keeps its own calibration constants on Settings, and
+  the Data, TC Compare and Emissivity Match formulas use the constants of
+  each row's preset, so emissivity and the other settings stay live and the
+  Validation sheet checks rows of every preset against the SDK.
+- A preset joins only if it agrees with the presets below it, compared on 24
+  cycles of the recording. On the 1006 test a, preset 3's counts carry an
+  offset (every cold frame reads about 1,205 °C, about 540 K above preset 2
+  where both measure, in FLIR's File SDK too): it is left out, and the Source
+  sheet and a notice in the player say why. The comparison reads the
+  recording's own parameters, so the player's settings do not change it.
+- A reference frame for *File operations* from the open recording follows
+  the presets shown: joined like the frames, and from the same cycle when the
+  choice changes.
+
+### Camera shutter
+
+- Frames whose header says the camera's shutter covered the sensor
+  (`FlagInFOV`, about 70 s every 30 minutes on the A8303sc fire tests) show no
+  scene. Their workbook rows keep the frame and clock but no counts, with the
+  status *Shutter in view*; the Source sheet counts them. The player says so
+  when it shows one, and *Fit Emissivity from TCs* leaves them out.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.9.1...v0.10.0)
+
 ## 0.9.1 — 2026-10-18
 
 A fix to the Validation sheet, found while exporting the fire-safety
