@@ -517,20 +517,34 @@ When the recording is opened again, the player reopens the last fit from its
 default results folder (`<recording>_tcmatch`, reading the TC file again), so a
 workbook can be filled from it in a later session; the setup dialog also offers
 the last run's search region, whose saved statistics make a rerun quick.
-Superframing recordings use the frames of one preset (the player's, else the
-lowest range), timed by the camera clock, and their workbook reads the same
-preset. Recordings without a factory calibration cannot be fitted.
+Superframing recordings use the frames of one preset (the player's, the
+lowest of presets joined, else the lowest range), timed by the camera clock,
+leaving out frames the camera's shutter covered. Recordings without a factory
+calibration cannot be fitted.
 
 ## Superframing cameras (A8303sc)
 
 The FLIR A8303sc records in *superframing*: it cycles through presets
 (temperature ranges, e.g. 250 to 600 °C, 500 to 1200 °C and 850 to 2000 °C),
-one frame each. Each preset sees only its own range.
+one frame each (17 ms apart on the A8303sc, a cycle every second). Each preset
+sees only its own range.
 
-- **Player:** a *Preset* choice under *Unit* (superframing recordings only)
-  shows and measures the frames of one preset, the lowest range to start with,
-  so the picture and the readouts no longer jump between ranges. A one-frame
-  step moves one preset cycle; *Every frame* shows the recording as stored.
+- **Player:** a *Preset* choice under *Unit* (superframing recordings only).
+  *Presets joined*, the start: in temperature units each pixel comes from the
+  preset whose range holds it, from the frames of one cycle, so the picture
+  runs from the battery to the flames; the readouts measure that picture, and
+  counts show the lowest preset. Or one preset's frames, or *Every frame* as
+  stored. A one-frame step moves one preset cycle.
+- **Presets that disagree:** a preset joins only if it agrees with the presets
+  below it, compared on 24 cycles of the recording (the share of pixels that
+  one preset reads inside its range and the other, 17 ms away, more than 100 K
+  colder). On the 1006 test a, preset 3 carried a count offset (every cold
+  frame read about 1,205 °C, in FLIR's File SDK too) and is left out; the
+  player's notice and the workbook's Source sheet say so.
+- **Camera shutter:** the A8303sc puts its shutter in front of the sensor for
+  about a minute every 30 minutes (frame header `FlagInFOV`). Those frames show
+  no scene: the player says so, the workbook leaves their rows without counts
+  (*Shutter in view*), and the TC fit leaves them out.
 - **Calibration:** this camera's counts do not follow FLIR's calibration curve.
   The File SDK turns them into radiance (a quadratic of the counts) and its
   temperatures follow `R / (exp(B/T) − 1)` of that radiance, with the object
@@ -540,10 +554,14 @@ one frame each. Each preset sees only its own range.
   workbook's counts columns then hold the SDK radiance × 100,000 ("signal"),
   and the Source sheet says so.
 - **Excel workbook:** *Preset* in the export dialog (the player's to start
-  with). Every row reads that preset's frame nearest its time by the camera
-  clock. Below its range such a preset's values are far off (a cold module
-  reads about 95 °C at the 250 °C preset), so these workbooks start with
-  *Out-of-range values: Leave them blank (#N/A)*, a gap in the charts.
+  with). Every row reads the preset's frame nearest its time by the camera
+  clock. With *Presets joined* the row also reads the higher presets' frames of
+  the same cycle, and each ROI takes the counts of the lowest preset whose
+  range holds it (Counts shows which); every preset has its own constants on
+  Settings, the formulas use those of each row's preset, and Validation checks
+  rows of every preset. Below its range a preset's values are far off (a cold
+  module reads about 95 °C at the 250 °C preset), so these workbooks start
+  with *Out-of-range values: Leave them blank (#N/A)*, a gap in the charts.
 - **Emissivity from TCs:** works on one preset, with the radiance calibration.
   A mid-wave camera without a flame filter sees hot gas as well as the battery,
   so the IR above a TC is often hotter than the TC itself; the fit then reports
