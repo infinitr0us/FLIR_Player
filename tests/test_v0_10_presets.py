@@ -70,16 +70,20 @@ class _Superframing:
         self.clamp_above = clamp_above  # K above a preset's range where the SDK clamps high (status 4)
         self.get_frame(0)
 
+    def where(self, index):
+        """(cycle, position in the cycle, preset) of frame ``index``."""
+        cycle, member = divmod(index, len(self.presets))
+        return cycle, member, self.presets[member]
+
     def get_preset(self, index):
-        return self.presets[index % len(self.presets)]
+        return self.where(index)[2]
 
     def reset_object_parameters(self):
         self.object_parameters = NS(**sdk_values(FILE_PARAMS), atmospheric_transmission=1.0)
 
     def counts_for(self, index):
-        preset = self.get_preset(index)
+        cycle, _member, preset = self.where(index)
         _range, curve, (a2, a1, a0) = PRESETS[preset]
-        cycle = index // len(self.presets)
         flag = cycle in self.shutter or index in self.covered
         scene = np.full((self.height, self.width), 290.0) if flag else self.scene(cycle)
         radiance = curve.signal(scene)
@@ -89,8 +93,7 @@ class _Superframing:
     def get_frame(self, index):
         fnv = self.fnv
         self.index = index
-        cycle, member = divmod(index, len(self.presets))
-        preset = self.get_preset(index)
+        cycle, member, preset = self.where(index)
         time = datetime(2026, 10, 6, 10, 47, 59) + timedelta(seconds=cycle + 0.017 * member)
         self.frame_info = _Info(time, preset, cycle in self.shutter or index in self.covered)
         counts = self.counts_for(index)
@@ -487,3 +490,62 @@ def test_a_temporal_refetch_keeps_the_merged_clip_mask(ats, monkeypatch) -> None
         np.testing.assert_array_equal(first.clip_mask, again.clip_mask)
     src.set_preset(1)  # preset 1 alone clamps the hottest pixels: the mask is not empty by construction
     assert src.read_frame(2).clip_mask is not None
+
+
+class _Dropped(_Superframing):
+    """Cycle 1 lost its preset-2 frame (dropped): frame 2 is cycle 1's preset 1, frame 3 cycle 2's."""
+
+    def __init__(self, **kwargs):
+        self.frames = None
+        super().__init__(**kwargs)
+
+    def where(self, index):
+        if self.frames is None:
+            k = len(self.presets)
+            self.frames = [(c, m, p) for c in range(self.num_frames // k) for m, p in enumerate(self.presets)
+                           if (c, p) != (1, 2)]
+            self.num_frames = len(self.frames)
+        return self.frames[index]
+
+
+def test_a_reference_cycle_without_the_preset_is_refused(ats, monkeypatch) -> None:
+    """Review round 4: no preset-2 frame in the reference's cycle: refuse, never another cycle's frame."""
+    pytest.importorskip("fnv")
+    fake = _Dropped(size=8)
+    src = _player(ats, monkeypatch, fake)
+    src.set_unit("temperature_factory_k")
+    src.load_reference(ats, 2, "subtract")  # cycle 1's preset-1 frame
+    with pytest.raises(ValueError, match="dropped"):
+        src.set_preset(2)
+    assert src.preset == (1, 2) and src._reference_spec[1] == 2  # the choice and the reference are kept
+    np.testing.assert_array_equal(src.read_frame(2).data, 0.0)
+
+
+def test_the_reference_label_follows_a_preset_change(qapp, ats, monkeypatch) -> None:
+    """Review round 4: the inspector names the frame the reference now reads."""
+    pytest.importorskip("fnv")
+    from conftest import wait_until
+    from flir_player import source as source_module
+    from flir_player.main_window import MainWindow
+
+    fake = _Superframing(size=8)
+    fake.rois = []
+    fake.can_change_object_parameters = True
+    fake.has_nuc = fake.has_bp = False
+    monkeypatch.setattr(source_module.fnv.file, "ImagerFile", lambda _path: fake)
+    window = MainWindow()
+    window.show()
+    window.open_path(ats)
+    try:
+        assert wait_until(qapp, lambda: window.current_packet is not None and not window._busy)
+        labels = []
+        window.decoder.reference_ready.connect(labels.append)
+        window.decoder.request_reference({"path": str(ats), "frame_index": 0, "op": "subtract"}, 0, 101)
+        assert wait_until(qapp, lambda: labels and not window._busy)
+        assert labels[-1].endswith("frame 1")
+        window.decoder.request_preset(2, 0, 102)
+        assert wait_until(qapp, lambda: len(labels) >= 2 and not window._busy)
+        assert labels[-1].endswith("frame 2")  # preset 2's frame of the reference's cycle
+    finally:
+        window.close()
+        qapp.processEvents()

@@ -602,7 +602,11 @@ class FlirVideoSource:
         stamps = {f: self._timestamp_for_frame(f) for f in candidates}
         if at is None or any(stamp is None for stamp in stamps.values()):
             return min(candidates, key=lambda f: abs(f - index))
-        return min(candidates, key=lambda f: abs((stamps[f] - at).total_seconds()))
+        best = min(candidates, key=lambda f: abs((stamps[f] - at).total_seconds()))
+        if abs((stamps[best] - at).total_seconds()) > MAX_CYCLE_GAP_S:  # a dropped frame: another cycle's
+            raise ValueError(f"Frame {index + 1}'s cycle has no frame of preset {self._base} (dropped): choose "
+                             "another reference frame")
+        return best
 
     def preset_last_frame(self, preset: int) -> int:
         """The last frame of ``preset`` (playback ends there)."""
