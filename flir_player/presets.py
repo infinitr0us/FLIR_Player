@@ -183,10 +183,13 @@ class _Tally:
             self.histogram += np.histogram(d, bins=_EDGES)[0]
 
     def median(self) -> float | None:
+        """The median difference to within a bin: the mean of the two middle ranks' bins, as ``np.median``."""
         if self.both < MIN_PIXELS:
             return None
-        k = int(np.searchsorted(np.cumsum(self.histogram), self.both / 2.0))
-        return float((_EDGES[k] + _EDGES[k + 1]) / 2.0)
+        cumulative = np.cumsum(self.histogram)
+        centres = (_EDGES[:-1] + _EDGES[1:]) / 2.0
+        ranks = ((self.both + 1) // 2, self.both // 2 + 1)  # 1-based; the same rank when the count is odd
+        return float(np.mean([centres[int(np.searchsorted(cumulative, rank))] for rank in ranks]))
 
 
 def _frame_time(im: Any) -> datetime | None:

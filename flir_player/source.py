@@ -542,11 +542,17 @@ class FlirVideoSource:
         unknown = [q for q in wanted if int(q) not in available]
         if unknown:
             raise ValueError(f"Preset {unknown[0]} is not one this recording cycles through")
+        previous = self._preset
         if len(wanted) > 1:
             self._preset = by_range([int(q) for q in wanted], {i: (p.min_k, p.max_k) if p.min_k is not None else None
                                                                for i, p in available.items()})
         else:
             self._preset = int(wanted[0]) if wanted else None
+        try:  # a reference from this recording follows the presets shown (joined or not), as after a unit change
+            self._reload_reference()
+        except Exception:
+            self._preset = previous
+            raise
         self._invalidate_processing()
 
     def _preset_of(self, index: int) -> int:

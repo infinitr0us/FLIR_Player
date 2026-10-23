@@ -446,6 +446,23 @@ def test_a_reference_from_the_recording_is_joined_too(ats, monkeypatch) -> None:
     src.load_reference(ats, 0, "subtract")
     src.set_unit("temperature_factory_k")
     np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+    src.set_preset(1)  # review round 2: the reference follows the presets shown
+    np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+    src.set_preset((1, 2))
+    np.testing.assert_array_equal(src.read_frame(0).data, 0.0)
+
+
+def test_the_median_difference_takes_both_middle_values() -> None:
+    """Review round 2: half the pixels agree, half read 700 K hotter: the median is 350 K, an offset."""
+    from flir_player.presets import PairCheck, _Tally
+
+    tally = _Tally()
+    lower = (np.full(1000, 1200.0), np.zeros(1000, dtype=np.int8))
+    upper = (np.r_[np.full(500, 1200.0), np.full(500, 1900.0)], np.zeros(1000, dtype=np.int8))
+    tally.add(lower, upper, (773.15, 1473.15), (1123.15, 2273.15))
+    assert tally.median() == pytest.approx(350.0, abs=5.0)
+    pair = PairCheck(2, 3, tally.informative, tally.contradicting, tally.both, tally.median())
+    assert pair.contradicting == 0 and pair.offset and not pair.agrees
 
 
 def test_a_temporal_refetch_keeps_the_merged_clip_mask(ats, monkeypatch) -> None:
@@ -455,7 +472,7 @@ def test_a_temporal_refetch_keeps_the_merged_clip_mask(ats, monkeypatch) -> None
 
     src = _player(ats, monkeypatch, _Superframing(size=40, clamp_above=150.0))
     src.set_unit("temperature_factory_k")
-    src.set_processing(ProcessingState(temporal=("mean", 2)))
+    src.set_processing(ProcessingState(temporal=("average", 2)))
     first = src.read_frame(2)
     again = src.read_frame(2)
     np.testing.assert_array_equal(first.data, again.data)
