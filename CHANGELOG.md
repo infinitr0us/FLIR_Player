@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 — 2026-11-10
 
 Fixes from a review of everything added from 0.6.0 to 0.10.0 (the TC fit, the
-Excel export and workbook, the clocks, presets and cell zones).
+Excel export and workbook, the clocks, presets and cell zones), and a way to
+correct the logger's time 0 in the export dialog.
 
 ### Excel workbook
 
@@ -53,6 +54,8 @@ Excel export and workbook, the clocks, presets and cell zones).
   later than that was searched an hour off. Those places are also tried
   before the whole recording when the first one holds too little of the TC
   data to match.
+
+[Full comparison](https://github.com/infinitr0us/FLIR_Player/compare/v0.10.0...v0.10.1)
 
 ## 0.10.0 — 2026-10-23
 
