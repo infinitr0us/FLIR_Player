@@ -230,6 +230,9 @@ class SourceSpec:
     # superframing: the preset whose frames are read (None = the lowest range), or presets to join (a tuple:
     # each area takes, row by row, the lowest of them whose range holds it; see presets.py)
     preset: Preset = None
+    # (width, height) of the image the ROIs were saved for (an ROI set's ``size``); None: drawn on this recording
+    # or not recorded. Another size is refused: the same pixel positions are other places there
+    roi_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,11 +283,15 @@ class TcPrefill:
     # difference at that frame (None: placed on the workbook's own axis already).
     frame: int | None = None
     fps: float | None = None
+    # The export's From and To when they were placed with the readings (derived from the logger's span on that
+    # frame-number time): only a bound still equal to its entry here moves with the axis. A bound typed by
+    # hand is seconds from ignition on the workbook's own axis and stays.
+    bounds: tuple[float | None, float | None] = (None, None)
 
     def rebased(self, delta: float) -> "TcPrefill":
         """The same logger data ``delta`` seconds later on the workbook's axis."""
         return dataclass_replace(
-            self, offset_s=self.offset_s + delta, frame=None, fps=None,
+            self, offset_s=self.offset_s + delta, frame=None, fps=None, bounds=(None, None),
             window=None if self.window is None else (self.window[0] + delta, self.window[1] + delta),
             roi_use=tuple((roi, tuple((a + delta, b + delta) for a, b in runs)) for roi, runs in self.roi_use))
 
@@ -983,6 +990,11 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
             n = int(im.num_frames)
             if not 0 <= spec.ignition_frame < n:
                 raise ValueError(f"{spec.path.name}: ignition frame {spec.ignition_frame + 1} is outside the recording")
+            here = (int(im.width), int(im.height))
+            if spec.roi_size is not None and tuple(int(v) for v in spec.roi_size) != here:
+                raise ValueError(f"{spec.path.name}: its ROI set was saved for a {spec.roi_size[0]} × "
+                                 f"{spec.roi_size[1]} image, but the recording is {here[0]} × {here[1]}; choose "
+                                 "the ROI set saved for this recording")
             if superframing(im):  # rows read one preset's frames (they would alternate presets otherwise)
                 ranges = preset_ranges(im)
                 if is_joined(spec.preset):
@@ -1063,21 +1075,22 @@ def run_export(dest: str | Path, specs: list[SourceSpec], options: ExportOptions
                 ignition = _stamp(opened[0], specs[0].ignition_frame, repair)
             if zero and ignition and prefill.fps and prefill.fps > 0:
                 delta = prefill.frame / prefill.fps - (ignition - zero).total_seconds()
-                # the dialog's From/To were placed the same way: they move too, and where they are the TC
-                # readings' span (rounded to its 0.1 s) they become that span exactly
+                # From/To the dialog placed the same way (``prefill.bounds``) move too, and where they are the
+                # TC readings' span (rounded to its 0.1 s) they become that span exactly; a bound typed by
+                # hand is on this axis already and stays
                 times = [t for t in prefill.times if math.isfinite(t)]
                 span = (min(times), max(times)) if times else (math.nan, math.nan)
 
-                def moved(bound, logger_s):
-                    if bound is None:
-                        return None
+                def moved(bound, placed, logger_s):
+                    if bound is None or placed is None or abs(bound - placed) > 1e-6:
+                        return bound
                     if abs(bound - (logger_s + prefill.offset_s)) <= 0.051:
                         return logger_s + prefill.offset_s + delta
                     return bound + delta
 
                 options = dataclass_replace(options, tc_prefill=prefill.rebased(delta),
-                                            start_s=moved(options.start_s, span[0]),
-                                            end_s=moved(options.end_s, span[1]))
+                                            start_s=moved(options.start_s, prefill.bounds[0], span[0]),
+                                            end_s=moved(options.end_s, prefill.bounds[1], span[1]))
         times = timeline(spans, options, rates[0])
         total = times.size * len(specs) + 1
         done = 0

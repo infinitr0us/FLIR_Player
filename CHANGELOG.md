@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a review of everything added from 0.6.0 to 0.10.0 (the TC fit, the
+Excel export and workbook, the clocks, presets and cell zones).
+
+### Excel workbook
+
+- An area measured by its mean signal takes its Status from its mean. With
+  *Max and min* (or the median, the 95th percentile) those values were greyed
+  and left blank by that Status too, so a coldest pixel far below the camera's
+  range showed as OK. Each is now greyed, and left blank under *Leave them
+  blank (#N/A)*, by its own count; the spread is blank when either extreme is.
+  Spots and areas of pixel temperatures are unchanged.
+- Emissivity Match scores every candidate on the same rows: an emissivity that
+  leaves some Fit rows without a temperature (hot surroundings, or a very low
+  candidate) is not scored (#N/A) instead of winning on the rows it can
+  explain, and the error over all TCs is given only where every included TC
+  has one. *Rows used* shows the rows scored.
+- Presets joined: each row's constants are picked exactly. A preset whose
+  curve has a largest valid signal, joined above one that has none, got a
+  limit of 0, and its rows showed #N/A in Excel (no A8303sc preset so far has
+  such a curve).
+- *Add recording*: an ROI set saved for another image size is refused when the
+  export starts; its ROIs measured other places without a word.
+- With *Fill TC Compare* on a recording that cycles through presets, a From or
+  To typed by hand stays where typed. Only the range the dialog took from the
+  logger's span moves onto the camera clock with the TC readings (a typed
+  From 0 could lose the row at t = 0).
+- *Logger time 0* in the export dialog (TC Compare from a TC file): *By the
+  camera and logger clocks*, as before, or *At the ignition frame*, for a
+  clock that is off. The ignition frame is then logger time 0, and the TC
+  readings and the Use column follow it (a correction made in the workbook's
+  logger time offset left Use where the clocks had put it). The dialog says
+  how far the frame is from the clocks and keeps the choice for the recording
+  and its TC file.
+
+### TC fit
+
+- A TC is looked up by its name before any number: a column headed "2" is
+  itself wherever it stands (its readings could go into the workbook under
+  another TC's header), and names that differ only in capitals are told apart.
+  A validity window given for a name that fits more than one TC is refused.
+- Where no emissivity gives any temperature (object parameters that leave no
+  signal of the surface), an event has no fit and its TC no emissivity; it was
+  reported as 0.02.
+- *Near the camera and logger clocks*: when no TC matches within 2 minutes of
+  where the clocks put logger time 0, the fit tries the same place whole hours
+  earlier and later before giving up, and says which it took. The clocks
+  differ by whole hours (time zones), so they place logger time 0 only by
+  taking it within half an hour of the recording's start; a camera started
+  later than that was searched an hour off. Those places are also tried
+  before the whole recording when the first one holds too little of the TC
+  data to match.
+
 ## 0.10.0 — 2026-10-23
 
 Flame temperatures from the A8303sc, after the fire-safety engineers'

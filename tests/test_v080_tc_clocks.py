@@ -248,7 +248,7 @@ def test_a700_note_and_actual_zone_prefix(qapp, make_dialog, lab_file, tmp_path)
     dialog = make_dialog(meta=metadata(tmp_path, camera_model="FLIR A700"), rois=zones("Module"))
     load(qapp, dialog, lab_file)
     assert dict(dialog.options().tc_prefill.roi_tc) == {"Module 3": "T1", "Module 6": "T2", "Module 9": "T3"}
-    assert "A700" in dialog.tc_label.text() and "moved by hand" in dialog.tc_label.text()
+    assert "A700" in dialog.tc_label.text() and "At the ignition frame" in dialog.tc_label.text()
     assert dialog.ignition_spin.value() == 124  # no hidden 40 s correction
 
 

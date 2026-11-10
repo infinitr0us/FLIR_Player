@@ -62,6 +62,11 @@ def _words(text: str) -> str:
 _TIME_RATIOS = (1.0, 60.0, 3600.0, 1 / 60.0, 1 / 3600.0)  # one time column against another in s, min or h
 
 
+class AmbiguousChannel(KeyError):
+    """A text that names more than one TC channel and none exactly: names alike but for capitals, or several
+    that start with it."""
+
+
 @dataclass(frozen=True)
 class TcTable:
     """Logger data: ``values[row, channel]`` in °C at ``times[row]`` seconds."""
@@ -89,21 +94,34 @@ class TcTable:
         return float(np.median(steps)) if steps.size else 1.0
 
     def index(self, key: str | int) -> int:
-        """Channel index from a 1-based number, an exact name, or a unique name prefix."""
-        if isinstance(key, (int, np.integer)):
+        """Channel index from a 1-based number (an int), or from text: a channel's exact name, else the only
+        name that is the same but for capitals, else a 1-based number, else a unique name prefix.
+
+        A name comes before a number, so a channel headed "2" is itself wherever its column is, and "t1" beside
+        "T1" is not taken for it.
+        """
+        if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
             if not 1 <= int(key) <= len(self.names):
                 raise KeyError(f"No TC channel {key} (1 to {len(self.names)})")
             return int(key) - 1
         text = str(key).strip()
+        if text in self.names:
+            return self.names.index(text)
+        alike = [k for k, name in enumerate(self.names) if name.casefold() == text.casefold()]
+        if len(alike) == 1:
+            return alike[0]
+        if alike:
+            raise AmbiguousChannel(f"More than one TC channel is named like {text!r} "
+                                   f"({', '.join(self.names[k] for k in alike)})")
         if text.isdigit():
             return self.index(int(text))
-        for k, name in enumerate(self.names):
-            if name.casefold() == text.casefold():
-                return k
         matches = [k for k, name in enumerate(self.names) if name.casefold().startswith(text.casefold())]
         if len(matches) == 1:
             return matches[0]
-        raise KeyError(f"No single TC channel named {text!r} (channels: {', '.join(self.names)})")
+        if matches:
+            raise AmbiguousChannel(f"{text!r} starts the names of more than one TC channel "
+                                   f"({', '.join(self.names[k] for k in matches)})")
+        raise KeyError(f"No TC channel named {text!r} (channels: {', '.join(self.names)})")
 
 
 # --- reading ---------------------------------------------------------------------------

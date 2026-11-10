@@ -625,7 +625,7 @@ class DecoderThread(QThread):
             specs.append(SourceSpec(path=path, rois=tuple(entry["rois"]),
                                     ignition_frame=int(entry["ignition_frame"]),
                                     label=str(entry.get("label", "")), parameters=parameters,
-                                    preset=entry.get("preset")))
+                                    preset=entry.get("preset"), roi_size=entry.get("roi_size")))
         try:
             message = run_export(
                 payload["dest"], specs, payload["options"],

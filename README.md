@@ -400,7 +400,9 @@ one box, so cell zones can be re-split after loading.
 
 Options for many ROIs (they start this way above 8 areas, such as cell zones):
 *Area means from the mean signal* stores no per-pixel columns (an area's mean
-is then the temperature of its mean counts, the same for an even area), and
+is then the temperature of its mean counts, the same for an even area; its
+Status is the mean's, and its max, min and percentiles are greyed or left
+blank by their own counts), and
 *Max and min* can be left out. Excel reads every formula when it opens a
 workbook, so fewer columns, a shorter time range or a longer interval open
 faster.
@@ -457,8 +459,11 @@ heater end, using the zones' names. Edit *TCs and zones* to change those pairs;
 unknown or repeated names must be corrected before TC Compare can be filled.
 Use = 1 marks valid TC readings at least 50 °C with no flame jump on the TC;
 no TC pixel or emissivity fit is needed. Check the TC and zone curves for a
-time shift, especially with the A700's slow clock; time 0 remains editable.
-The recording's TC file and the pairs are remembered when you press Export.
+time shift, especially with the A700's slow clock. If they are shifted, set
+*Logger time 0* to *At the ignition frame* and give the frame where the
+logger's time 0 really is: the TC readings and Use then follow that frame, and
+the dialog says how far it is from the clocks. The recording's TC file, the
+pairs and that choice are remembered when you press Export.
 You can still untick *Fill TC Compare* and paste the logger data yourself.
 
 Without *Camera distance*, zones are equally wide along the module. TCs on the top face can read the
@@ -494,7 +499,11 @@ What it does (`flir_player/tcmatch.py`, also a command line:
    has a clock, so *Near the camera and logger clocks* (the default) searches
    only within 2 minutes of where the clocks put logger time 0. Whole hours
    between the clocks are set aside, because cameras often keep UTC or a time
-   zone without daylight saving. A match more than 2 minutes from the clocks
+   zone without daylight saving; the clocks then place logger time 0 within
+   half an hour of the recording's start, and when no TC matches there the
+   fit tries the same place whole hours earlier and later (a camera started
+   long after the logger) and says which it took. A match more than 2 minutes
+   from the clocks
    is reported, as is a match at the edge of that window or a given frame far
    from them. *Anywhere in the recording* searches every offset.
 2. **Events.** Stretches where IR and TC can be compared are chosen by rules

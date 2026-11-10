@@ -757,11 +757,15 @@ class _Writer:
     @staticmethod
     def _pick(layout: _RoiLayout, name: str, pre: str | None) -> str:
         """The constant ``name`` (a ROI_ or SRC_ name) for the preset in ``pre`` (a cell, or a range in an array
-        formula): ``name`` itself unless presets are joined. Picked arithmetically, base + (X_q − base)·(pre = q),
-        so a constant of another preset never brings its error into the result (they are all finite)."""
+        formula): ``name`` itself unless presets are joined. Picked arithmetically, with weights of 0 and 1 that
+        exclude each other, X·(1 − Σ(pre = q)) + Σ X_q·(pre = q): array formulas take it, a constant of another
+        preset never brings its error into the result (they are all finite), and the pick is exact (a difference
+        from the base would lose a constant beside a huge one, such as the "no limit" 1e300 of SMAX)."""
         if not layout.presets or pre is None:
             return name
-        return "(" + name + "".join(f"+({name}P{q}-{name})*({pre}={q})" for q in layout.presets[1:]) + ")"
+        others = layout.presets[1:]
+        return ("(" + name + "*(1" + "".join(f"-({pre}={q})" for q in others) + ")"
+                + "".join(f"+{name}P{q}*({pre}={q})" for q in others) + ")")
 
     def _const(self, layout: _RoiLayout, pre: str | None):
         """(ROI constant, source constant) lookups for the preset in ``pre``."""
@@ -817,9 +821,11 @@ class _Writer:
         ws.write(1, 0, "Time is seconds from each recording's ignition frame. Grey italic = outside the "
                        "calibrated range (extrapolated); red = saturated sensor. #N/A = no data.", self.f_note)
         if any(layout.roi.mode == "mean" for layout in self.layouts):
+            own = any(self._own_range(layout, stat) for layout in self.layouts for stat in layout.data_cols)
             ws.write(2, 0, "Area means are the temperature of each area's mean signal (mean counts), not the mean "
-                           "of its pixels' temperatures; the two agree where the area's temperature is even.",
-                     self.f_note)
+                           "of its pixels' temperatures; the two agree where the area's temperature is even."
+                     + (" Status describes the mean; Max, Min and percentiles are greyed (or left blank) by "
+                        "their own counts." if own else ""), self.f_note)
         ws.write(3, 0, "Time (s)", self.f_head)
         ws.write(3, 1, "Time (min)", self.f_head)
         for layout in self.layouts:
@@ -842,18 +848,29 @@ class _Writer:
             ws.write_formula(r, 1, f"=A{r + 1}/60", self.f_min, float(self.times[i]) / 60.0)
             for layout in self.layouts:
                 self._data_row(ws, layout, i, r, cached[layout.number])
-        # formats: temperatures by status
+        # formats: temperatures by status; a statistic with its own range (_own_range) by its own count
         for layout in self.layouts:
             status = xl_col_to_name(layout.status_col)
-            for col in layout.data_cols.values():
+            top = HEADER_ROWS + 1  # Excel row of the first sample: the rules' references are relative to it
+            pre = (f"'Counts'!${xl_col_to_name(layout.preset_col)}{top}" if layout.preset_col is not None else None)
+
+            def outside(stat: str, layout=layout, top=top, pre=pre) -> str:
+                count = f"'Counts'!${xl_col_to_name(layout.count_cols[stat])}{top}"
+                return f"AND(ISNUMBER({count}),{self._outside(layout, count, pre)})"
+
+            for stat, col in layout.data_cols.items():
                 area = (HEADER_ROWS, col, self.last, col)
                 ws.conditional_format(*area, {"type": "formula",
                                               "criteria": f'=${status}{HEADER_ROWS + 1}="Saturated"',
                                               "format": self.f_red})
-                ws.conditional_format(*area, {"type": "formula",
-                                              "criteria": f'=OR(${status}{HEADER_ROWS + 1}="Below range",'
-                                                          f'${status}{HEADER_ROWS + 1}="Above range")',
-                                              "format": self.f_grey})
+                if self._own_range(layout, stat):
+                    grey = self._direct("=" + outside(stat))
+                elif stat == "spread" and self._own_range(layout, "max"):
+                    grey = self._direct(f"=OR({outside('max')},{outside('min')})")
+                else:
+                    grey = (f'=OR(${status}{HEADER_ROWS + 1}="Below range",'
+                            f'${status}{HEADER_ROWS + 1}="Above range")')
+                ws.conditional_format(*area, {"type": "formula", "criteria": grey, "format": self.f_grey})
         ws.set_column(0, 1, 11)
         ws.set_column(2, self.data_width, 12)
         ws.freeze_panes(HEADER_ROWS, 2)
@@ -870,13 +887,41 @@ class _Writer:
                 self.wb.define_name(f"{layout.name}_PRE", "=" + _range("Counts", HEADER_ROWS, layout.preset_col,
                                                                         self.last, layout.preset_col))
 
-    def _blankable(self, formula: str, r: int, layout: _RoiLayout) -> str:
+    @staticmethod
+    def _own_range(layout: _RoiLayout, stat: str) -> bool:
+        """True for a statistic that is in or out of the calibrated range by its own count, whatever the row's
+        Status says: the max, min and percentiles of an area measured by its mean signal. That area's Status
+        is its mean's (``excel_export.roi_status``), and one pixel's count converts on its own."""
+        return layout.roi.mode == "mean" and stat != "mean" and stat in layout.count_cols
+
+    def _count_bounds(self, layout: _RoiLayout) -> tuple[np.ndarray, np.ndarray]:
+        """The calibrated range in counts for every row (its own preset's, with presets joined)."""
+        low, high = self._count_range(layout.source)
+        low, high = np.full(self.rows, low), np.full(self.rows, high)
+        for preset in layout.presets[1:]:
+            rows = layout.roi.preset == preset
+            low[rows], high[rows] = self._count_range(layout.source, preset)
+        return low, high
+
+    def _outside(self, layout: _RoiLayout, count: str, pre: str | None) -> str:
+        """Formula text: the count in cell ``count`` lies outside the calibrated range (of the preset in ``pre``)."""
+        _roi_k, src_k = self._const(layout, pre)
+        return f"OR({count}<{src_k('CNTLO')},{count}>{src_k('CNTHI')})"
+
+    def _blankable(self, formula: str, r: int, layout: _RoiLayout, count: str | None = None,
+                   pre: str | None = None) -> str:
         """``formula`` (starting with "="), or #N/A when Settings leaves out-of-range values blank and the
-        row's status is not OK; unchanged in a workbook without that option."""
+        row's status is not OK; unchanged in a workbook without that option. With ``count`` (the count cell of
+        a statistic with its own range, ``_own_range``) the value is out of range when that count is, or a
+        pixel of the area is clipped."""
         if not self.blank_option:
             return formula
         status = xl_rowcol_to_cell(r, layout.status_col)
-        return f'=IF(AND(CLAMP_MODE="{CLAMP_BLANK}",{status}<>"{STATUS_LABELS[0]}"),NA(),{formula[1:]})'
+        if count is None:
+            out = f'{status}<>"{STATUS_LABELS[0]}"'
+        else:
+            out = f'OR({status}="{STATUS_LABELS[3]}",{self._outside(layout, count, pre)})'
+        return f'=IF(AND(CLAMP_MODE="{CLAMP_BLANK}",{out}),NA(),{formula[1:]})'
 
     def _kelvin(self, layout: _RoiLayout, values, params: MeasurementParameters, presets=None) -> np.ndarray:
         """Object temperature (K) of ``values`` (one row each along the first axis) with the calibration of
@@ -915,11 +960,18 @@ class _Writer:
             kelvin = self._kelvin(layout, m, params, presets)
             with np.errstate(invalid="ignore", divide="ignore"):
                 out["mean"][present] = np.sum(n * kelvin, axis=1) / np.sum(n, axis=1) * a + b
-        if "spread" in out:
-            out["spread"] = (out["max"] - out["min"])
-        if self.clamp_default == CLAMP_BLANK:  # as Data starts: out-of-range rows blank, for Summary too
+        if self.clamp_default == CLAMP_BLANK:  # as Data starts: out-of-range values blank, for Summary too
+            low, high = self._count_bounds(layout)
             for stat in out:
-                out[stat] = np.where(roi.status == 0, out[stat], np.nan)
+                if stat == "spread":
+                    continue
+                shown = roi.status == 0
+                if self._own_range(layout, stat):  # by its own count; a clipped pixel blanks the row
+                    with np.errstate(invalid="ignore"):
+                        shown = (roi.status != 3) & (roi.counts[stat] >= low) & (roi.counts[stat] <= high)
+                out[stat] = np.where(shown, out[stat], np.nan)
+        if "spread" in out:  # of the extremes as shown: blank when either is
+            out["spread"] = (out["max"] - out["min"])
         return out
 
     def _data_row(self, ws, layout: _RoiLayout, i: int, r: int, cached: dict) -> None:
@@ -944,7 +996,8 @@ class _Writer:
                 ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
             else:
                 ref = _cell("Counts", r, layout.count_cols[stat])
-                formula = self._blankable(self._scalar_formula(layout, ref, pre), r, layout)
+                own = ref if self._own_range(layout, stat) else None
+                formula = self._blankable(self._scalar_formula(layout, ref, pre), r, layout, own, pre)
                 ws.write_formula(r, col, self._direct(formula), self.f_temp, value)
 
     # --- Counts / Pixels ------------------------------------------------------------------
@@ -1265,12 +1318,7 @@ class _Writer:
             use = np.ones(self.rows, dtype=np.int8) if use is None else use
             tc = self._tc_at(layout)
             cnt = np.asarray(layout.roi.counts[layout.main], dtype=np.float64)
-            low, high = self._count_range(layout.source)
-            if layout.presets:  # each row's own preset's range
-                low, high = np.full(self.rows, low), np.full(self.rows, high)
-                for preset in layout.presets[1:]:
-                    rows = layout.roi.preset == preset
-                    low[rows], high[rows] = self._count_range(layout.source, preset)
+            low, high = self._count_bounds(layout)  # each row's own preset's range
             saturated = np.asarray(layout.roi.status) == 3  # as the Data sheet's Status column says
             with np.errstate(invalid="ignore"):
                 fit = ((use == 1) & np.isfinite(tc) & np.isfinite(cnt) & (cnt >= low) & (cnt <= high) & ~saturated
@@ -1291,8 +1339,10 @@ class _Writer:
             fit = inputs["fit"] == 1
             cal = layout.source.report.calibration
             p = self._params(layout)
+            # "scored": the Fit rows the highest candidate gives a temperature (the pairs table's Rows used);
+            # "scored_own": those 1.00 does, for the ROI's own value
             entry = {"rows": int(fit.sum()), "include": layout.roi.shape.name not in exclude,
-                     "eps_now": p.emissivity, "err": [math.nan] * len(eps)}
+                     "eps_now": p.emissivity, "err": [math.nan] * len(eps), "scored": 0, "scored_own": 0}
             entry["err_now"] = entry["bias_now"] = entry["own"] = math.nan
             entry["grid"] = [math.nan] * len(OWN_GRID)
             entry["probe"] = (math.nan, math.nan)
@@ -1300,24 +1350,43 @@ class _Writer:
                 c, t = inputs["cnt"][fit], inputs["tc"][fit]
                 presets = layout.roi.preset[fit] if layout.presets else None
 
-                def stats(e: float, layout=layout, p=p, c=c, t=t, presets=presets) -> tuple[float, float]:  # bound
+                def stats(e: float, layout=layout, p=p, c=c, t=t, presets=presets) -> tuple[float, float, int]:
+                    """(RMS, mean, rows) of IR − TC over the Fit rows that have a temperature at emissivity e."""
                     d = self._kelvin(layout, c, p.with_(emissivity=e), presets) - KELVIN - t
                     d = d[np.isfinite(d)]
-                    return (float(np.sqrt(np.mean(d ** 2))), float(np.mean(d))) if d.size else (math.nan, math.nan)
+                    if not d.size:
+                        return math.nan, math.nan, 0
+                    return float(np.sqrt(np.mean(d ** 2))), float(np.mean(d)), int(d.size)
 
-                entry["err_now"], entry["bias_now"] = stats(p.emissivity)
+                def scored(e: float, need: int, stats=stats) -> float:
+                    """The RMS at e when it covers every row the best-covered emissivity does, else NaN: an
+                    emissivity that leaves rows without a temperature must not win on the rest (the rows with
+                    a temperature only grow with the emissivity, so the highest one covers the most)."""
+                    rms, _mean, n = stats(e)
+                    return rms if n and n == need else math.nan
+
+                entry["scored"] = stats(eps[-1])[2] if eps else 0
+                entry["scored_own"] = stats(OWN_GRID[-1])[2]
                 if entry["include"]:
-                    entry["err"] = [stats(e)[0] for e in eps]
-                entry["grid"] = [stats(e)[0] for e in OWN_GRID]
+                    entry["err"] = [scored(e, entry["scored"]) for e in eps]
+                if entry["scored"]:  # the sheet shows "–" for an ROI without rows scored (its Rows used is 0)
+                    entry["err_now"], entry["bias_now"], _n = stats(p.emissivity)
+                    entry["grid"] = [scored(e, entry["scored_own"]) for e in OWN_GRID]
                 finite = [k for k, v in enumerate(entry["grid"]) if math.isfinite(v)]
                 if finite:
                     entry["own"] = OWN_GRID[min(finite, key=lambda k: entry["grid"][k])]
                 entry["stats"] = stats
+                entry["scored_at"] = lambda e, entry=entry, scored=scored: scored(e, entry["scored"])
             rows[layout.number] = entry
-        combined = []
-        for k in range(len(eps)):
-            errs = [rows[l.number]["err"][k] for l in layouts if math.isfinite(rows[l.number]["err"][k])]
-            combined.append(float(np.sqrt(np.mean(np.square(errs)))) if errs else math.nan)
+        # "All TCs": every included ROI with rows scored takes part at every candidate; one whose ROI has no
+        # score there (it leaves that ROI's rows without a temperature) is not scored, so no TC drops out of it
+        parts = [l for l in layouts if rows[l.number]["include"] and rows[l.number]["scored"]]
+
+        def together(errs: list[float]) -> float:
+            return (float(np.sqrt(np.mean(np.square(errs)))) if errs and all(math.isfinite(e) for e in errs)
+                    else math.nan)
+
+        combined = [together([rows[l.number]["err"][k] for l in parts]) for k in range(len(eps))]
         finite = [k for k, v in enumerate(combined) if math.isfinite(v)]
         best = min(finite, key=lambda k: combined[k]) if finite else None
         now = [rows[l.number]["err_now"] for l in layouts
@@ -1328,18 +1397,16 @@ class _Writer:
         for layout in layouts:
             entry = rows[layout.number]
             entry["bias_best"] = (entry["stats"](eps[best])[1] if best is not None and entry["include"]
-                                  and entry["rows"] else math.nan)
+                                  and entry["scored"] else math.nan)
         if best is not None:
             for side, delta in enumerate((-PROBE, PROBE)):
                 errs = []
-                for layout in layouts:
+                for layout in parts:
                     entry = rows[layout.number]
-                    if entry["include"] and entry["rows"]:
-                        value = entry["stats"](eps[best] + delta)[0]
-                        entry["probe"] = tuple(value if k == side else entry["probe"][k] for k in range(2))
-                        if math.isfinite(value):
-                            errs.append(value)
-                probes[side] = float(np.sqrt(np.mean(np.square(errs)))) if errs else math.nan
+                    value = entry["scored_at"](eps[best] + delta)
+                    entry["probe"] = tuple(value if k == side else entry["probe"][k] for k in range(2))
+                    errs.append(value)
+                probes[side] = together(errs)
         return {"rows": rows, "combined": combined, "best": best,
                 "now": float(np.sqrt(np.mean(np.square(now)))) if now else math.nan, "own": own,
                 "probes": probes}
@@ -1353,8 +1420,9 @@ class _Writer:
         ref = self._match_reference(layouts, eps)
         ws.write(0, 0, "Emissivity match: one emissivity for every TC zone", self.f_title)
         ws.write(1, 0, "The emissivity between the limits below at which the IR of the ROIs with a TC agrees best "
-                       "with their TCs. Error = root mean square of IR − TC (K); every TC counts the same.",
-                 self.f_note)
+                       "with their TCs. Error = root mean square of IR − TC (K); every TC counts the same. "
+                       "Every emissivity is scored on the same rows: one that leaves some of them without a "
+                       "temperature is not scored.", self.f_note)
         ws.write(2, 0, "Rows counted: Use = 1 on TC Compare (yellow), IR and TC both present, the ROI's mean "
                        "signal inside the camera's calibrated range, inside the window. Pick each ROI's TC on "
                        "Settings.", self.f_note)
@@ -1386,9 +1454,13 @@ class _Writer:
         # pairs table, the candidate table and the chart, so hiding them hides nothing else
         h0 = max(last_c + 2, chart_row + CHART_ROWS + 1)
         g0, g1 = h0 + 4, h0 + 3 + len(OWN_GRID)
+        n0 = g1 + 1  # rows scored per ROI: at the highest candidate (n0) and at 1.00 (n0 + 1)
         grid_eps = _range(M, g0, cc, g1, cc)
         eps_range = _range(M, c0, cc, last_c, cc)
         all_range = _range(M, c0, cc + 1, last_c, cc + 1)
+        # the ROIs that take part in "All TCs": included, with rows scored
+        self.wb.define_name("MATCH_PARTS", "=SUMPRODUCT((" + _range(M, p0, 3, p0 + max(n, 1) - 1, 3) + '="Yes")*('
+                            + _range(M, p0, 4, p0 + max(n, 1) - 1, 4) + ">0))")
         self.wb.define_name("MATCH_EPS", "=" + eps_range)
         self.wb.define_name("MATCH_ALL", "=" + all_range)
         self._name("MATCH_BEST", M, 5, 6)
@@ -1458,7 +1530,8 @@ class _Writer:
             mapped = self._roi_tc.get(layout.roi.shape.name)
             ws.write_formula(r, 2, f'=IF({nm}_TC="","no TC",{nm}_TC)', None, mapped or "no TC")
             ws.write(r, 3, "Yes" if e["include"] else "No", self.f_input)
-            ws.write_formula(r, 4, f"=SUM({nm}_FITR)", self.f_int, e["rows"])
+            # the Fit rows the candidates are scored on: those the highest one gives a temperature
+            ws.write_formula(r, 4, f"=N({_abs(M, n0, cc + 2 + k)})", self.f_int, e["scored"])
             ws.write_formula(r, 5, f"={nm}_EPS", self.f_eps, e["eps_now"])
             ws.write_array_formula(r, 6, r, 6, f'{{=IF(N(E{R})=0,"–",IFERROR({self._rms(layout, f"{nm}_EPS")},"–"))}}',
                                    self.f_k, e["err_now"] if math.isfinite(e["err_now"]) else "–")
@@ -1494,9 +1567,7 @@ class _Writer:
             ws.write_formula(r, cc, candidate, self.f_eps, value)
             row_cells = _range(M, r, cc + 2, r, cc + 1 + max(n, 1))
             combined = ref["combined"][j] if j < len(eps) and math.isfinite(ref["combined"][j]) else "#N/A"
-            ws.write_array_formula(r, cc + 1, r, cc + 1,
-                                   f"{{=IFERROR(SQRT(SUM(IFERROR({row_cells}^2,0))/COUNT({row_cells})),NA())}}",
-                                   self.f_k, combined)
+            ws.write_array_formula(r, cc + 1, r, cc + 1, self._together(row_cells), self.f_k, combined)
             for k, layout in enumerate(layouts):
                 pr = p0 + k + 1  # Excel row of the ROI in the pairs table
                 e_cell = f"${letter}{R}"
@@ -1504,11 +1575,12 @@ class _Writer:
                 ws.write_array_formula(
                     r, cc + 2 + k, r, cc + 2 + k,
                     f'{{=IF(OR(NOT(ISNUMBER({e_cell})),$D${pr}<>"Yes",N($E${pr})=0),NA(),'
-                    f'IFERROR({self._rms(layout, e_cell)},NA()))}}', self.f_k, err if math.isfinite(err) else "#N/A")
+                    f'IFERROR({self._rms(layout, e_cell, _abs(M, n0, cc + 2 + k))},NA()))}}', self.f_k,
+                    err if math.isfinite(err) else "#N/A")
         area = (c0, cc, last_c, cc + 1 + max(n, 1))
         ws.conditional_format(*area, {"type": "formula", "criteria": f"=ISNA({letter}{c0 + 1})",
                                       "format": self.f_hide})
-        self._match_helpers(ws, layouts, ref, eps, p0, cc, h0, g0)
+        self._match_helpers(ws, layouts, ref, eps, p0, cc, h0, g0, n0)
         best_col = xl_col_to_name(cc + 1)
         ws.conditional_format(c0, cc + 1, last_c, cc + 1, {
             "type": "formula", "criteria": f"=AND(ISNUMBER({best_col}{c0 + 1}),{best_col}{c0 + 1}=MATCH_ALL_MIN)",
@@ -1577,9 +1649,10 @@ class _Writer:
             return near_high if math.isfinite(minus) and minus < error else NOTE_HIGH + side
         return "Inside the limits."
 
-    def _match_helpers(self, ws, layouts, ref, eps, p0, cc, h0, g0) -> None:
+    def _match_helpers(self, ws, layouts, ref, eps, p0, cc, h0, g0, n0) -> None:
         """Hidden rows under the candidate table: the error at the best value ± PROBE (which side of a limit the
-        best match lies), and every ROI's error on OWN_GRID (its own value)."""
+        best match lies), every ROI's error on OWN_GRID (its own value), and the rows each ROI is scored on (the
+        Fit rows with a temperature at the highest candidate, and at 1.00 for its own value)."""
         M = MATCH
         n = len(layouts)
         ws.set_row(h0, None, None, {"hidden": True})
@@ -1607,9 +1680,8 @@ class _Writer:
                              eps[best] + delta if best is not None else "#N/A")
             row_cells = _range(M, r, cc + 2, r, cc + 1 + max(n, 1))
             value = ref["probes"][side]
-            ws.write_array_formula(r, cc + 1, r, cc + 1,
-                                   f"{{=IFERROR(SQRT(SUM(IFERROR({row_cells}^2,0))/COUNT({row_cells})),NA())}}",
-                                   self.f_k, value if math.isfinite(value) else "#N/A")
+            ws.write_array_formula(r, cc + 1, r, cc + 1, self._together(row_cells), self.f_k,
+                                   value if math.isfinite(value) else "#N/A")
             self._name("MATCH_MINUS" if side == 0 else "MATCH_PLUS", M, r, cc + 1)
             e_cell = f"${xl_col_to_name(cc)}{r + 1}"
             for k, layout in enumerate(layouts):
@@ -1618,7 +1690,8 @@ class _Writer:
                 ws.write_array_formula(
                     r, cc + 2 + k, r, cc + 2 + k,
                     f'{{=IF(OR(NOT(ISNUMBER({e_cell})),$D${pr}<>"Yes",N($E${pr})=0),NA(),'
-                    f'IFERROR({self._rms(layout, e_cell)},NA()))}}', self.f_k, err if math.isfinite(err) else "#N/A")
+                    f'IFERROR({self._rms(layout, e_cell, _abs(M, n0, cc + 2 + k))},NA()))}}', self.f_k,
+                    err if math.isfinite(err) else "#N/A")
         for j, value in enumerate(OWN_GRID):
             r = g0 + j
             ws.set_row(r, None, None, {"hidden": True})
@@ -1629,8 +1702,20 @@ class _Writer:
                 err = ref["rows"][layout.number]["grid"][j]
                 ws.write_array_formula(
                     r, cc + 2 + k, r, cc + 2 + k,
-                    f'{{=IF(N($E${pr})=0,NA(),IFERROR({self._rms(layout, e_cell)},NA()))}}', self.f_k,
-                    err if math.isfinite(err) else "#N/A")
+                    f'{{=IF(N($E${pr})=0,NA(),IFERROR({self._rms(layout, e_cell, _abs(M, n0 + 1, cc + 2 + k))},'
+                    f'NA()))}}', self.f_k, err if math.isfinite(err) else "#N/A")
+        # the rows every candidate must cover: the rows with a temperature only grow with the emissivity, so
+        # the highest candidate (and 1.00 on the own-value grid) covers the most
+        top_own = f"${xl_col_to_name(cc)}${g0 + len(OWN_GRID)}"  # the grid's last cell, 1.00
+        for row, label, at, key in ((n0, "Rows scored (a temperature at the highest emissivity)", "MATCH_HI", "scored"),
+                                    (n0 + 1, "Rows scored for the own value (a temperature at 1.00)", top_own,
+                                     "scored_own")):
+            ws.set_row(row, None, None, {"hidden": True})
+            ws.write(row, cc, label, self.f_note)
+            for k, layout in enumerate(layouts):
+                ws.write_array_formula(row, cc + 2 + k, row, cc + 2 + k,
+                                       f"{{=IFERROR({self._scored(layout, at)},0)}}", self.f_int,
+                                       ref["rows"][layout.number][key])
 
     def _t_expr(self, layout: _RoiLayout, eps: str) -> str:
         """Array of the ROI's IR temperatures (°C) at emissivity ``eps``: (A·c − C − S_r)/ε + S_r is the
@@ -1641,12 +1726,28 @@ class _Writer:
         return (f"(IF(({v}>0)*({v}<{src_k('SMAX')}),{src_k('B')}/LN({src_k('R')}/{v}+{src_k('F')}),NA())"
                 f"-273.15)")
 
-    def _rms(self, layout: _RoiLayout, eps: str) -> str:
-        """RMS of IR − TC over the Fit rows whose IR is defined (array formula body)."""
+    @staticmethod
+    def _together(row_cells: str) -> str:
+        """Array formula: the error over all TCs from one candidate's per-ROI errors in ``row_cells``; #N/A unless
+        every ROI that takes part (MATCH_PARTS) has an error there, so candidates compare over the same TCs."""
+        return (f"{{=IFERROR(IF(COUNT({row_cells})<MATCH_PARTS,NA(),"
+                f"SQRT(SUM(IFERROR({row_cells}^2,0))/COUNT({row_cells}))),NA())}}")
+
+    def _scored(self, layout: _RoiLayout, eps: str) -> str:
+        """The Fit rows whose IR has a temperature at emissivity ``eps`` (array formula body)."""
+        nm = layout.name
+        return f"SUM(IF({nm}_FITR=1,IF(ISERROR({self._t_expr(layout, eps)}-{nm}_TCR),0,1),0))"
+
+    def _rms(self, layout: _RoiLayout, eps: str, need: str | None = None) -> str:
+        """RMS of IR − TC over the Fit rows whose IR is defined (array formula body). With ``need`` (a cell
+        holding the rows the best-covered candidate has a temperature for) it is #N/A unless ``eps`` covers as
+        many: candidates are compared over the same rows, as ``tcmatch.fit_eps`` compares them."""
         nm = layout.name
         sq = f"({self._t_expr(layout, eps)}-{nm}_TCR)^2"
-        return (f"SQRT(SUM(IF({nm}_FITR=1,IFERROR({sq},0),0))/"
-                f"SUM(IF({nm}_FITR=1,IF(ISERROR({sq}),0,1),0)))")
+        total = f"SUM(IF({nm}_FITR=1,IFERROR({sq},0),0))"
+        if need is None:
+            return f"SQRT({total}/{self._scored(layout, eps)})"
+        return f"IF({self._scored(layout, eps)}<>{need},NA(),SQRT({total}/{need}))"
 
     def _bias(self, layout: _RoiLayout, eps: str) -> str:
         nm = layout.name

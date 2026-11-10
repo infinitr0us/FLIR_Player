@@ -244,7 +244,8 @@ def test_a_frame_timed_tc_sheet_moves_onto_the_clock(tmp_path, ats) -> None:
     pytest.importorskip("fnv")
     prefill = TcPrefill(times=(0.0, 1.0, 2.0), columns=((20.0, 21.0, 22.0),), names=("T1",),
                         roi_tc=(("Cell 1", "T1"),), offset_s=-30.0, window=(-30.0, -28.0),
-                        roi_use=(("Cell 1", ((-30.0, -29.0),)),), frame=80, fps=2.0)
+                        roi_use=(("Cell 1", ((-30.0, -29.0),)),), frame=80, fps=2.0,
+                        bounds=(10.0, 20.0))  # From/To as the dialog derived them (typed ones stay: review 2026-11-10)
     options = ExportOptions(step_s=1.0, start_s=10.0, end_s=20.0, tc_prefill=prefill)
     book = _export(tmp_path, ats, _A8303Like(clock_gap=4.0), preset=1, ignition=80, options=options)
     offset = next(row[1] for row in book["TC Compare"].iter_rows(values_only=True)
@@ -262,10 +263,10 @@ def test_rounded_tc_bounds_keep_their_end_seconds_on_the_clock(tmp_path, ats) ->
     fps = 1.874015748  # 80 / fps = 42.689076 s, while frame 80 is at clock second 44: delta = -1.310924 s
     offset = 44.0 - 80 / fps
     times = tuple(float(t) for t in range(10))
+    bounds = (round(times[0] + offset, 1), round(times[-1] + offset, 1))
     prefill = TcPrefill(times=times, columns=(tuple(20.0 + t for t in times),), names=("T1",),
-                        roi_tc=(("Cell 1", "T1"),), offset_s=offset, frame=80, fps=fps)
-    options = ExportOptions(step_s=1.0, start_s=round(times[0] + offset, 1), end_s=round(times[-1] + offset, 1),
-                            tc_prefill=prefill)
+                        roi_tc=(("Cell 1", "T1"),), offset_s=offset, frame=80, fps=fps, bounds=bounds)
+    options = ExportOptions(step_s=1.0, start_s=bounds[0], end_s=bounds[1], tc_prefill=prefill)
     book = _export(tmp_path, ats, _A8303Like(clock_gap=4.0), preset=1, ignition=80, options=options)
     rows = [row[0] for row in book["Data"].iter_rows(min_row=6, values_only=True) if row[0] is not None]
     assert (rows[0], rows[-1], len(rows)) == (0, 9, 10)

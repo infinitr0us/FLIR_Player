@@ -78,7 +78,8 @@ from .radiometry import (
 )
 from .presets import shutter_in_view
 from .sdktime import TimestampRepair, recording_rate, superframing
-from .tcdata import ChannelFlags, TcTable, failure_flags, read_tc_table, resample, window_mask
+from .tcdata import (AmbiguousChannel, ChannelFlags, TcTable, failure_flags, read_tc_table, resample,
+                     window_mask)
 
 Progress = Callable[[int, int], None]
 Abort = Callable[[], bool]
@@ -553,6 +554,12 @@ class ClockEstimate:
     lag_s: float  # recording seconds of logger time 0
     hours: int  # whole hours set aside between the clocks (time zones)
     note: str  # how it was found, for the summary
+    # the other whole hours that also put the log inside the recording, nearest this one first: the clocks
+    # cannot tell them apart when logger time 0 is more than half an hour from the recording's start
+    others: tuple["ClockEstimate", ...] = ()
+
+
+CLOCK_ALTERNATIVES = 4  # whole hours beside the clocks' estimate a fit tries when nothing matches near it
 
 
 def clock_estimate(logger_zero: datetime | None, recording_start: datetime | None, tc_times: np.ndarray,
@@ -563,7 +570,9 @@ def clock_estimate(logger_zero: datetime | None, recording_start: datetime | Non
     Whole hours between the clocks are set aside: cameras keep UTC (the A700) or a zone without daylight
     saving (the T650), the logger PC local time. Of the offsets whole hours apart, the one closest to
     recording time 0 that puts at least half the log (or half the recording, when that is shorter)
-    inside the recording is taken.
+    inside the recording is taken: logger time 0 is taken to lie within half an hour of the recording's
+    start. Where it does not (a camera started late, the second part of a split recording), the right
+    offset is one of ``others``, which a fit tries when nothing matches near this one (``analyse``).
     """
     times = np.asarray(tc_times, dtype=np.float64)
     times = times[np.isfinite(times)]
@@ -572,19 +581,24 @@ def clock_estimate(logger_zero: datetime | None, recording_start: datetime | Non
     base = (logger_zero.replace(tzinfo=None) - recording_start.replace(tzinfo=None)).total_seconds()
     t0, t1 = float(times.min()), float(times.max())
     need = 0.5 * min(t1 - t0, duration_s)
-    best: tuple[float, int] | None = None
+    fitting: list[tuple[float, int]] = []
     for hours in range(-48, 49):
         lag = base + 3600.0 * hours
         overlap = min(lag + t1, duration_s) - max(lag + t0, 0.0)
-        if overlap > 0 and overlap >= need and (best is None or abs(lag) < abs(best[0])):
-            best = (lag, hours)
-    if best is None:
+        if overlap > 0 and overlap >= need:
+            fitting.append((lag, hours))
+    if not fitting:
         return None
-    lag, hours = best
-    note = ((f"{logger_note}; " if logger_note else "")
-            + f"the recording's first frame {recording_start:%Y-%m-%d %H:%M:%S}"
-            + (f"; {abs(hours)} h of time-zone difference between the clocks set aside" if hours else ""))
-    return ClockEstimate(lag_s=float(lag), hours=hours, note=note)
+    lag, hours = min(fitting, key=lambda item: abs(item[0]))
+
+    def estimate(lag_: float, hours_: int, others=()) -> ClockEstimate:
+        note = ((f"{logger_note}; " if logger_note else "")
+                + f"the recording's first frame {recording_start:%Y-%m-%d %H:%M:%S}"
+                + (f"; {abs(hours_)} h of time-zone difference between the clocks set aside" if hours_ else ""))
+        return ClockEstimate(lag_s=float(lag_), hours=hours_, note=note, others=tuple(others))
+
+    nearby = sorted((item for item in fitting if item[1] != hours), key=lambda item: abs(item[1] - hours))
+    return estimate(lag, hours, [estimate(*item) for item in nearby[:CLOCK_ALTERNATIVES]])
 
 
 def clock_relation(clock_s: float, match_s: float) -> str:
@@ -636,7 +650,8 @@ def prepare_channels(table: TcTable, options: MatchOptions, step: float) -> tupl
     first = math.ceil(table.times[0] / step - 1e-9)
     last = math.floor(table.times[-1] / step + 1e-9)
     grid = np.arange(first, last + 1) * step
-    keys = options.channels or tuple(str(k + 1) for k in range(len(table.names)))
+    # no choice: every column by its number (an int never names a channel headed with digits)
+    keys = options.channels or tuple(range(1, len(table.names) + 1))
     channels = []
     for key in keys:
         index = table.index(key)
@@ -697,6 +712,10 @@ def _windows_for(valid: Mapping[str, Sequence[tuple[float, float]]], table: TcTa
         try:
             if table.index(key) == index:
                 return tuple(windows)
+        except AmbiguousChannel as exc:
+            # not skipped like a name the table lacks: without its window a TC would be used over all its readings
+            raise ValueError(f"The validity window given for {key!r} names more than one TC: {exc.args[0]}. "
+                             "Give the TC's exact name.") from exc
         except KeyError:
             continue
     return ()
@@ -1047,15 +1066,19 @@ def _fixed_pixel(pixels: Mapping[str, tuple[int, int]], name: str):
 
 
 def resolve_pixels(pixels: Mapping[str, tuple[int, int]], names: Sequence[str]) -> dict[str, tuple[int, int]]:
-    """Given pixels keyed by the TC table's channel names. A key names a channel by its name (any case), then by
-    its number (1 = the first column read), then by a start that only that channel's name has, all against the
-    whole table, whichever channels are chosen ("T1" fixes T1 and never T10); a key naming none is dropped."""
+    """Given pixels keyed by the TC table's channel names. A key names a channel by its name (exactly, else the
+    only one alike but for capitals), then by its number (1 = the first column read), then by a start that only
+    that channel's name has, all against the whole table, whichever channels are chosen ("T1" fixes T1 and never
+    T10); a key naming none is dropped."""
     out: dict[str, tuple[int, int]] = {}
     folded = [n.casefold() for n in names]
     keys = [(str(key), value) for key, value in pixels.items()]
 
-    def by_name(key: str) -> int | None:
-        return folded.index(key.casefold()) if key.casefold() in folded else None
+    def by_name(key: str) -> int | None:  # the exact name, else the only one alike but for capitals
+        if key in names:
+            return list(names).index(key)
+        alike = [k for k, name in enumerate(folded) if name == key.casefold()]
+        return alike[0] if len(alike) == 1 else None
 
     def by_number(key: str) -> int | None:
         text = key.strip()
@@ -1264,14 +1287,20 @@ def fit_eps(calibration: Calibration, params: MeasurementParameters, counts: np.
         valid += good.sum(axis=1)
     # a candidate is compared over every second the best-covered ones explain: one that leaves seconds without a
     # temperature (below what its reflected part alone gives) must not win on the rest
+    finite = matching[np.isfinite(matching)]
+    pct = np.percentile(finite, [50, 10, 90]) if finite.size else (math.nan,) * 3
+    if not valid.max() > 0:
+        # no emissivity gives any of these seconds a temperature (object parameters that leave no signal of the
+        # surface, e.g. a window or an atmosphere hotter than the scene): no fit, not the first candidate
+        return EpsFit(n=n, eps_ls=eps_ls, eps=math.nan, rmse_k=math.nan, bias_k=math.nan,
+                      matching_median=float(pct[0]), matching_p10=float(pct[1]), matching_p90=float(pct[2]),
+                      at_bound=False)
     with np.errstate(invalid="ignore", divide="ignore"):
         rmse = np.where((valid > 0) & (valid == valid.max()), np.sqrt(total / np.maximum(valid, 1)), math.inf)
     k = int(np.argmin(rmse))
     eps = float(grid[k])
     k1, k2 = coefficients(calibration, params.with_(emissivity=eps))
     t_best = calibration.planck.temperature(k1 * counts - k2) - KELVIN
-    finite = matching[np.isfinite(matching)]
-    pct = np.percentile(finite, [50, 10, 90]) if finite.size else (math.nan,) * 3
     return EpsFit(n=n, eps_ls=eps_ls, eps=eps, rmse_k=float(rmse[k]), bias_k=float(np.nanmean(t_best - tc_c)),
                   matching_median=float(pct[0]), matching_p10=float(pct[1]), matching_p90=float(pct[2]),
                   at_bound=eps >= float(grid[-1]))
@@ -1481,17 +1510,44 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
                     else "the clocks put the logger's data outside this recording")
     search = options  # the clock window narrows the search only; the result records the options as given
     early: list[str] = []
+    location = None
     if options.clock_window_s is not None and options.lag_s is None and options.lag_range is None:
+        # Near the clocks: within the window of their estimate. Whole hours between the clocks were set aside by
+        # taking logger time 0 within half an hour of the recording's start; where it lies further off, the same
+        # clocks put it a whole hour earlier or later (``by_clocks.others``). Those places are tried, nearest
+        # first, when the estimate's window finds no TC or holds too little of the TC data to match. Only when
+        # no such window can match at all (or there is no clock) is the whole recording searched, with a warning.
         window = float(options.clock_window_s)
-        span = (by_clocks.lag_s - window, by_clocks.lag_s + window) if by_clocks is not None else None
-        if span is not None and _overlapping(samples, grid, channels, options, span):
-            search = dataclass_replace(options, lag_range=span)
-        else:
+        places = [by_clocks, *by_clocks.others] if by_clocks is not None else []
+        spans = [(place, (place.lag_s - window, place.lag_s + window)) for place in places]
+        usable = [(place, span) for place, span in spans if _overlapping(samples, grid, channels, options, span)]
+        if not usable:
             why = no_clock if by_clocks is None else (
                 f"within {window:g} s of the clocks' {by_clocks.lag_s:.0f} s too little of the TC data falls on "
                 "the recording's frames to match")
             early.append(f"No time match near the clocks: {why}, so the whole recording was searched.")
-    location = locate(samples, grid, channels, search, progress=progress, abort=abort)
+        for place, span in usable:
+            _check(abort)
+            narrowed = dataclass_replace(options, lag_range=span)
+            tried = locate(samples, grid, channels, narrowed, progress=progress, abort=abort)
+            if location is None:  # reported when no place matches: the nearest one that could be searched
+                location, search = tried, narrowed
+            if any(m.found for m in tried.channels):
+                if place is not by_clocks:
+                    apart = abs(place.hours - by_clocks.hours)
+                    where = "later" if place.lag_s > by_clocks.lag_s else "earlier"
+                    first = ("No TC was found" if usable[0][0] is by_clocks else
+                             "Too little of the TC data falls on the recording's frames to match")
+                    early.append(
+                        f"{first} within {window:.0f} s of {by_clocks.lag_s:.0f} s, where the camera and logger "
+                        "clocks put logger time 0 if it lies within half an hour of the recording's start. "
+                        f"{apart} h {where}, at {place.lag_s:.0f} s, the TCs match, so that place was taken (the "
+                        "clocks differ by whole hours, and cannot tell those from a logger time 0 further from the "
+                        "start). Check the match in the figure.")
+                location, search, by_clocks = tried, narrowed, place
+                break
+    if location is None:
+        location = locate(samples, grid, channels, search, progress=progress, abort=abort)
     step = samples.step
     lag_bins = int(round(location.lag_s / step))
     grid_bins = np.rint(grid / step).astype(np.int64)
@@ -1545,8 +1601,10 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
                         f = fit_eps(cal, params, other.counts[rows][ok], ch.values[rows][ok])
                         per_pixel.append(f.eps)
                         per_pixel_ls.append(f.eps_ls)
-            # an event whose seconds no emissivity explains still counts against its TC's trust
-            physical = rows.size >= 3 and not (fit.eps_ls > PHYSICAL_EPS_MAX or share > 0.5)
+            # an event whose seconds no emissivity explains still counts against its TC's trust; so does one
+            # without a fit at all (no candidate gives a temperature)
+            physical = (rows.size >= 3 and math.isfinite(fit.eps)
+                        and not (fit.eps_ls > PHYSICAL_EPS_MAX or share > 0.5))
             er = EventResult(channel=ch.name, start_s=event.start_s, end_s=event.end_s, samples=total,
                              excluded_bound=int(event.excluded_bound.size),
                              tc_min_c=float(np.nanmin(ch.values[every])), tc_max_c=float(np.nanmax(ch.values[every])),
@@ -1636,8 +1694,9 @@ def analyse(samples: Samples, table: TcTable, options: MatchOptions, *, progress
         elif search is not options:
             if not any(m.found for m in location.channels):
                 # no fallback to the whole recording: on a cell-by-cell fire the TC shapes fit at many offsets
+                hours = " (nor whole hours earlier or later)" if by_clocks.others else ""
                 warnings.append(f"No TC was found within {float(options.clock_window_s):.0f} s of where the camera "
-                                f"and logger clocks put logger time 0 ({at}). If a clock may be wrong, run again "
+                                f"and logger clocks put logger time 0 ({at}){hours}. If a clock may be wrong, run again "
                                 "with \"Anywhere in the recording\", or give the frame of logger time 0 (e.g. from "
                                 "a sync event).")
             elif abs(gap) >= float(options.clock_window_s) - 2 * step:
@@ -1930,8 +1989,8 @@ def clock_prefill(table: TcTable, *, lag_s: float, fps: float, frame: int,
     columns = tuple(tuple(float(v) for v in table.values[:, table.names.index(name)]) for name in names)
     roi_use = []
     if pairs:
-        # Numbered keys select exact columns even when channel names differ only in case.
-        chosen = dataclass_replace(options, channels=tuple(str(table.names.index(name) + 1) for name in pairs))
+        # exact names: each selects its own column, also beside one that differs only in capitals
+        chosen = dataclass_replace(options, channels=tuple(pairs))
         step = table.interval
         grid, channels = prepare_channels(table, chosen, step)
         half = step / 2

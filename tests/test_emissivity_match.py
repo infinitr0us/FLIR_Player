@@ -557,4 +557,5 @@ def test_r2_hidden_helper_rows_never_cover_the_pairs_table_or_the_chart(tmp_path
     visible = range(1, p0 + n + 1 + CHART_ROWS)
     assert not any(ws.row_dimensions[r].hidden for r in visible)
     hidden = [r for r in range(1, ws.max_row + 1) if ws.row_dimensions[r].hidden]
-    assert hidden and min(hidden) > p0 + n + CHART_ROWS and len(hidden) == 4 + 96
+    # 4 probe rows, the 96 own-value rows, and the 2 rows of the rows scored (review 2026-11-10)
+    assert hidden and min(hidden) > p0 + n + CHART_ROWS and len(hidden) == 4 + 96 + 2

@@ -49,6 +49,7 @@ _SHEETS = (("tc", "TC Compare"), ("summary", "Summary"), ("charts", "Charts"),
 _TC_FILE_KEY = "excel/tc_files"  # JSON: recording -> its TC file (a file of another test must not time this one)
 _TC_FILES_KEPT = 50
 _TC_PAIRS_KEY = "excel/tc_pairs"
+_TC_ZERO_KEY = "excel/tc_zero"  # JSON: recording -> the frame (0-based) chosen as logger time 0, against the clocks
 
 
 def _tc_files() -> dict[str, str]:
@@ -78,6 +79,32 @@ def remember_tc_file(recording, tc_file) -> None:
     files.pop(key, None)
     files[key] = str(tc_file)
     app_settings().setValue(_TC_FILE_KEY, json.dumps(dict(list(files.items())[-_TC_FILES_KEPT:])))
+
+
+def _tc_zeros() -> dict[str, int]:
+    try:
+        zeros = json.loads(app_settings().value(_TC_ZERO_KEY, "", type=str) or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(zeros, dict):
+        return {}
+    return {str(k): v for k, v in zeros.items() if isinstance(v, int) and not isinstance(v, bool)}
+
+
+def remembered_tc_zero(recording) -> int | None:
+    """The frame (0-based) last chosen as logger time 0 for ``recording`` instead of the clocks' (None: the clocks)."""
+    return _tc_zeros().get(_recording_key(recording))
+
+
+def remember_tc_zero(recording, frame: int | None) -> None:
+    """Keep ``frame`` as the recording's logger time 0 (None: forget it, the clocks place it again)."""
+    zeros = _tc_zeros()
+    key = _recording_key(recording)
+    if zeros.pop(key, None) is None and frame is None:
+        return
+    if frame is not None:
+        zeros[key] = int(frame)
+    app_settings().setValue(_TC_ZERO_KEY, json.dumps(dict(list(zeros.items())[-_TC_FILES_KEPT:])))
 
 
 _JOINED = -2  # the preset list's data for the presets joined (a tuple does not round-trip through Qt)
@@ -174,6 +201,10 @@ class ExcelExportDialog(FramelessDialog):
         self._tc_error = "Choose the logger's export of the TC readings."
         self._tc_auto_pairs = ""
         self._tc_cached = None
+        self._tc_placed = None  # (ignition frame, From, To) as last derived from the logger's span
+        # logger time 0 chosen by frame for this recording and its remembered TC file (applied once it is read)
+        self._tc_zero_pending = remembered_tc_zero(metadata.path)
+        self._tc_zero_wanted = "clock"
         layout = self.body
         # Panels scroll on small screens; output, estimate and buttons stay put.
         scroll = QScrollArea()
@@ -390,6 +421,15 @@ class ExcelExportDialog(FramelessDialog):
         self.tc_pairs_edit.setToolTip("TC name = ROI name, separated by commas or semicolons. "
                                      "Use the exact names in the TC file and ROI list, including capitals.")
         tc_form.addRow("TCs and zones", self.tc_pairs_edit)
+        self.tc_zero_combo = ChevronComboBox()
+        self.tc_zero_combo.addItem("By the camera and logger clocks", "clock")
+        self.tc_zero_combo.addItem("At the ignition frame", "frame")
+        self.tc_zero_combo.setToolTip(
+            "Where the logger's time 0 is in the recording. By the clocks: where the camera's and the logger's "
+            "clocks put it. At the ignition frame: the ignition frame in the table above is logger time 0, for a "
+            "clock that is off (show the frame in the player, then Ignition = current frame). The TC readings and "
+            "the Use column follow.")
+        tc_form.addRow("Logger time 0", self.tc_zero_combo)
         self.tc_label = QLabel()
         self.tc_label.setObjectName("FieldLabel")
         self.tc_label.setWordWrap(True)
@@ -445,7 +485,11 @@ class ExcelExportDialog(FramelessDialog):
         self.tc_file_edit.editingFinished.connect(self._tc_file_edited)
         self.tc_sheet_combo.currentTextChanged.connect(lambda sheet: self._load_tc(sheet=sheet))
         self.tc_pairs_edit.textChanged.connect(self._update)
+        self.tc_zero_combo.currentIndexChanged.connect(self._tc_zero_changed)
+        # the remembered frame applies only to the read started now, with the dialog as it opened
+        self._tc_zero_ignition = self.ignition_spin.value()
         self._tc_source_changed()
+        self._tc_zero_request = self._tc_request if self._tc_reading else None
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry().height() if screen is not None else 900
         fixed = sum(self.body.itemAt(i).sizeHint().height() for i in range(self.body.count())
@@ -506,7 +550,9 @@ class ExcelExportDialog(FramelessDialog):
         if not roi_set.rois:
             MessageDialog.warning(self, "Add recording", "The ROI set contains no ROIs.")
             return
-        entry = {"path": recording, "rois": roi_set.rois, "ignition": roi_set.ignition_frame or 0}
+        # the size goes with the ROIs: the export refuses a set saved for another image size
+        entry = {"path": recording, "rois": roi_set.rois, "ignition": roi_set.ignition_frame or 0,
+                 "size": roi_set.size}
         self._others.append(entry)
         self._add_row(recording, recording.stem, len(roi_set.rois), ignition=entry["ignition"])
         self._update()
@@ -546,6 +592,10 @@ class ExcelExportDialog(FramelessDialog):
         self._tc_reading = False
         self._tc_read_path = ""
         self._tc_error = "Choose the logger's export of the TC readings."
+        # another file has another logger time 0: a frame chosen (or remembered) for the last one does not carry over
+        self._tc_zero_pending = None
+        self._tc_zero_wanted = "clock"
+        self._show_zero_mode()
         self.tc_sheet_combo.blockSignals(True)
         self.tc_sheet_combo.clear()
         self.tc_sheet_combo.blockSignals(False)
@@ -602,14 +652,62 @@ class ExcelExportDialog(FramelessDialog):
                 zone_names = tuple(roi.name for roi in self.rois if roi.kind == "quad")
                 self._tc_auto_pairs = saved if not errors else _default_tc_pairs(table.names, roi_names, zone_names)
                 self.tc_pairs_edit.setText(self._tc_auto_pairs)
-            if (self._tc_clock is not None and self.tc_source_combo.currentData() == "file"
-                    and self.tc_check.isChecked()
-                    and (self.metadata.presets or self.time_base_combo.currentData() == "frames")
-                    and self.metadata.nominal_fps > 0):
-                fps = self.metadata.nominal_fps
-                frame = min(max(round(self._tc_clock.lag_s * fps), 0), self.metadata.num_frames - 1)
-                self._time_from_logger(table, self._tc_clock.lag_s, fps, frame)
+            pending, self._tc_zero_pending = self._tc_zero_pending, None
+            if (pending is not None and request == self._tc_zero_request and self._tc_clock is not None
+                    and 0 <= pending < self.metadata.num_frames
+                    and self._same_file(self._tc_read_path, remembered_tc_file(self.metadata.path))
+                    and self.tc_source_combo.currentData() == "file" and self.tc_check.isChecked()
+                    and self.ignition_spin.value() == self._tc_zero_ignition):
+                # the frame chosen against the clocks the last time this recording was exported with this file;
+                # not once the user has changed the file, the source, the ignition frame or unticked the filling
+                self._tc_zero_wanted = "frame"
+                self.ignition_spin.setValue(pending + 1)
+            self._show_zero_mode()
+            self._place_tc()
         self._update()
+
+    @staticmethod
+    def _same_file(first: str, second: str) -> bool:
+        if not first or not second:
+            return False
+        try:
+            return Path(first).expanduser().resolve() == Path(second).expanduser().resolve()
+        except OSError:
+            return False
+
+    def _zero_by_frame(self) -> bool:
+        """True when logger time 0 is the ignition frame: chosen so, or no clock to place it."""
+        return self._tc_clock is None or self.tc_zero_combo.currentData() == "frame"
+
+    def _show_zero_mode(self) -> None:
+        """The list shows what is in force: without a clock only the ignition frame can be logger time 0."""
+        shown = "frame" if self._tc_table is not None and self._tc_clock is None else self._tc_zero_wanted
+        self.tc_zero_combo.blockSignals(True)
+        self.tc_zero_combo.setCurrentIndex(self.tc_zero_combo.findData(shown))
+        self.tc_zero_combo.blockSignals(False)
+        self.tc_zero_combo.setEnabled(self._tc_clock is not None)
+
+    def _tc_zero_changed(self) -> None:
+        self._tc_zero_wanted = str(self.tc_zero_combo.currentData())
+        self._place_tc()
+        self._update()
+
+    def _place_tc(self) -> None:
+        """Time 0 and From/To for the TC file read: by the clocks (time 0 goes to the frame they give), or from
+        the ignition frame chosen as logger time 0."""
+        table = self._tc_table
+        if (table is None or self._tc_clock is None or self.tc_source_combo.currentData() != "file"
+                or not self.tc_check.isChecked()
+                or not (self.metadata.presets or self.time_base_combo.currentData() == "frames")
+                or not self.metadata.nominal_fps > 0):
+            return
+        fps = self.metadata.nominal_fps
+        if self._zero_by_frame():
+            frame = self.ignition_spin.value() - 1
+            self._time_from_logger(table, frame / fps, fps, frame)
+        else:
+            frame = min(max(round(self._tc_clock.lag_s * fps), 0), self.metadata.num_frames - 1)
+            self._time_from_logger(table, self._tc_clock.lag_s, fps, frame)
 
     def _chosen_preset(self):
         """The preset list's choice for the export: a preset, the presets joined (a tuple), or None."""
@@ -634,6 +732,17 @@ class ExcelExportDialog(FramelessDialog):
         fps = self.metadata.nominal_fps if not self.metadata.presets else 0.0
         minutes, seconds = divmod(round(abs(clock.lag_s)), 60)
         sign = "minus " if clock.lag_s < 0 else ""
+        if self._zero_by_frame():  # chosen against the clocks: say where they would have put it
+            ignition = self.ignition_spin.value()
+            text = f"Logger time 0 is the ignition frame (frame {ignition:,}), as chosen."
+            if fps > 0:
+                gap = clock.lag_s - (ignition - 1) / fps
+                text += (f" The clocks put it at frame {round(clock.lag_s * fps) + 1:,}, "
+                         + ("the same frame." if abs(gap) <= 0.5 / fps + 1e-9 else
+                            f"{abs(gap):,.1f} s {'later' if gap > 0 else 'earlier'}."))
+            else:
+                text += f" The clocks put it {sign}{minutes} min {seconds} s into the recording."
+            return text
         frame_text = f"frame {round(clock.lag_s * fps) + 1:,} (" if fps > 0 else ""
         text = (f"Clocks: logger time 0 at {frame_text}{sign}{minutes} min {seconds} s into the recording"
                 + (")." if fps > 0 else "."))
@@ -678,6 +787,7 @@ class ExcelExportDialog(FramelessDialog):
         offset = float(lag_s - frame / fps)  # workbook time = logger time + offset
         first, last = -frame / fps, (self.metadata.num_frames - 1 - frame) / fps
         times = table.times[np.isfinite(table.times)]
+        self._tc_placed = None
         if not times.size:
             return
         # the spins keep 0.1 s: the logger's seconds rounded (4805.996 is 4806.0), inside the recording
@@ -688,6 +798,18 @@ class ExcelExportDialog(FramelessDialog):
         self.start_spin.setValue(start)
         self.end_check.setChecked(True)
         self.end_spin.setValue(end)
+        self._tc_placed = (frame, self.start_spin.value(), self.end_spin.value())
+
+    def _placed_bounds(self, frame: int) -> tuple[float | None, float | None]:
+        """From and To where they are still as derived from the logger's span for ignition frame ``frame``
+        (``TcPrefill.bounds``): those move with the readings onto a superframing recording's clock; bounds typed
+        by hand stay as typed."""
+        placed = self._tc_placed
+        if placed is None or placed[0] != frame:
+            return (None, None)
+        start = placed[1] if self.start_check.isChecked() and self.start_spin.value() == placed[1] else None
+        end = placed[2] if self.end_check.isChecked() and self.end_spin.value() == placed[2] else None
+        return (start, end)
 
     def _tc_usable(self) -> str:
         """Why the selected source cannot fill TC Compare now ("" when it can)."""
@@ -736,17 +858,23 @@ class ExcelExportDialog(FramelessDialog):
             pairs, _errors = self._file_pairs()
             fps = self.metadata.nominal_fps
             frame = self.ignition_spin.value() - 1
-            lag = self._tc_clock.lag_s if self._tc_clock is not None else frame / fps
-            key = (self._tc_request, tuple(pairs.items()), lag, fps, frame)
+            by_frame = self._zero_by_frame()
+            lag = frame / fps if by_frame else self._tc_clock.lag_s
+            bounds = self._placed_bounds(frame)
+            key = (self._tc_request, tuple(pairs.items()), lag, fps, frame, by_frame, bounds)
             if self._tc_cached is None or self._tc_cached[0] != key:
                 prefill = clock_prefill(self._tc_table, lag_s=lag, fps=fps, frame=frame, pairs=pairs)
-                if self._tc_clock is None:  # logger time 0 is the ignition frame itself: nothing to move
+                if by_frame:  # logger time 0 is the ignition frame itself: nothing to move
                     prefill = dataclasses.replace(prefill, frame=None, fps=None)
+                else:
+                    prefill = dataclasses.replace(prefill, bounds=bounds)
                 self._tc_cached = (key, prefill)
             return self._tc_cached[1]
 
-        return tc_prefill(self.tc_run.result, self.tc_run.table, rois=self.rois,
-                          frame=self.ignition_spin.value() - 1, size=(self.metadata.width, self.metadata.height))
+        frame = self.ignition_spin.value() - 1
+        prefill = tc_prefill(self.tc_run.result, self.tc_run.table, rois=self.rois, frame=frame,
+                             size=(self.metadata.width, self.metadata.height))
+        return dataclasses.replace(prefill, bounds=self._placed_bounds(frame))
 
     def options(self) -> ExportOptions:
         extra = tuple(name for name, check in (("median", self.median_check), ("p95", self.p95_check))
@@ -787,13 +915,14 @@ class ExcelExportDialog(FramelessDialog):
                     parts.append("TC Compare will not be filled.")
             elif not self.tc_check.isChecked():
                 parts.append("Unticked: paste the logger data on TC Compare yourself.")
-            if "A700" in self.metadata.camera_model:
-                parts.append("The A700 clock can run slow. The TC and zone curves on TC Compare show any shift; "
-                             "time 0 can be moved by hand.")
-            elif "A8303" in self.metadata.camera_model:
+            fix = ("The TC and zone curves on TC Compare show any shift; to correct it, set Logger time 0 to "
+                   "\"At the ignition frame\" and give that frame.")
+            by_clocks = self._tc_table is not None and not self._zero_by_frame()
+            if "A700" in self.metadata.camera_model and by_clocks:
+                parts.append(f"The A700 clock can run slow. {fix}")
+            elif "A8303" in self.metadata.camera_model and by_clocks:
                 parts.append("The A8303 clock and the logger's can differ by a minute or more (the A8303 ran 76 s "
-                             "ahead on the 1006 test a). The TC and zone curves on TC Compare show any shift; its "
-                             "logger time offset can be changed there.")
+                             f"ahead on the 1006 test a). {fix}")
             self.tc_label.setText(" ".join(parts))
             self.tc_label.setToolTip(self._tc_clock.note if self._tc_clock is not None else
                                      self._tc_table.clock_note if self._tc_table is not None else "")
@@ -874,6 +1003,8 @@ class ExcelExportDialog(FramelessDialog):
         if self.tc_source_combo.currentData() == "file" and self.tc_prefill() is not None:
             remember_tc_file(self.metadata.path, Path(self._tc_read_path).expanduser().resolve())
             app_settings().setValue(_TC_PAIRS_KEY, self.tc_pairs_edit.text().strip())
+            chosen = self._tc_clock is not None and self._zero_by_frame()  # against the clocks: kept for next time
+            remember_tc_zero(self.metadata.path, self.ignition_spin.value() - 1 if chosen else None)
         super().accept()
 
     def done(self, result: int) -> None:
@@ -889,7 +1020,7 @@ class ExcelExportDialog(FramelessDialog):
                     "preset": self._chosen_preset()}]
         for k, other in enumerate(self._others, start=1):
             sources.append({"path": str(other["path"]), "label": labels[k], "rois": other["rois"],
-                            "ignition_frame": ignitions[k], "current": False})
+                            "ignition_frame": ignitions[k], "current": False, "roi_size": other.get("size")})
         return {
             "kind": "excel",
             "dest": str(self._dest()),
