@@ -354,7 +354,9 @@ def test_zone_prefill_pairs_tcs_with_their_zones_and_marks_their_fitted_rows() -
         runs = dict(prefill.roi_use)[roi]
         expected = [(a - 0.5 + prefill.offset_s, b + 0.5 + prefill.offset_s)
                     for e in channels[tc].events if e.used for a, b in e.fitted]
-        assert list(runs) == pytest.approx(expected)
+        # flat: pytest.approx takes no nested sequences (a TypeError from pytest 9.2 on)
+        assert len(runs) == len(expected)
+        assert [v for run in runs for v in run] == pytest.approx([v for run in expected for v in run])
     prefill.check(100_000, 10)
     # the default prefill (spots and boxes at the TC pixels) excludes its spots from the common value
     default = tcmatch.tc_prefill(result, table)
